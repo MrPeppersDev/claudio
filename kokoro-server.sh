@@ -11,8 +11,12 @@
 
 set -euo pipefail
 
-STATE_DIR="$HOME/.claude/claudio"
-KOKORO_DIR="$STATE_DIR/kokoro"
+# Split state (pid, log) from repo (venv, server.py). The repo can live
+# anywhere — we derive KOKORO_DIR from this script's own location — while
+# state defaults to ~/.claude/claudio and can be moved via CLAUDIO_STATE_DIR.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="${CLAUDIO_STATE_DIR:-$HOME/.claude/claudio}"
+KOKORO_DIR="$SCRIPT_DIR/kokoro"
 PID_FILE="$STATE_DIR/kokoro-server.pid"
 LOG_FILE="$STATE_DIR/kokoro-server.log"
 PYTHON="$KOKORO_DIR/venv/bin/python"

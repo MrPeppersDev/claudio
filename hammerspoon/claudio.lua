@@ -13,10 +13,16 @@
 local M = {}
 
 local HOME = os.getenv("HOME")
-local STATE_DIR = HOME .. "/.claude/claudio"
+-- CLAUDIO_DIR = repo (scripts, venv, model files). Defaults to the install
+-- location that install.sh created, but overridable so the repo can live
+-- anywhere. STATE_DIR = runtime files (state, job.pid). Users who set
+-- either env var in a LaunchAgent or before launching Hammerspoon get the
+-- override; plain Dock launches pick up the defaults.
+local CLAUDIO_DIR = os.getenv("CLAUDIO_DIR") or (HOME .. "/.claude/claudio")
+local STATE_DIR = os.getenv("CLAUDIO_STATE_DIR") or CLAUDIO_DIR
 local STATE_FILE = STATE_DIR .. "/state"
-local PLAY_SCRIPT = STATE_DIR .. "/play-last.sh"
-local SERVER_SCRIPT = STATE_DIR .. "/kokoro-server.sh"
+local PLAY_SCRIPT = CLAUDIO_DIR .. "/play-last.sh"
+local SERVER_SCRIPT = CLAUDIO_DIR .. "/kokoro-server.sh"
 
 local menubar = nil
 local watcher = nil

@@ -114,6 +114,12 @@ hs.hotkey.bind({}, "F13", function() claudio.toggle() end)
   Default `3.0` / `2500` / `1.0`. A small presence bump helps consonant intelligibility
   survive the 1.33× afplay time-stretch. Set `KOKORO_EQ_GAIN_DB=0` to disable.
   All three participate in the cache key, so toggling them auto-invalidates stale entries.
+- `CLAUDIO_STATE_DIR` — where runtime state (lock, logs, cache, session map) lives.
+  Default `~/.claude/claudio`. Shell scripts derive their own location from `$BASH_SOURCE`,
+  so the repo can be cloned anywhere; only state has a conventional default.
+- `CLAUDIO_DIR` — Lua-side override pointing at the repo (for Hammerspoon to find
+  `play-last.sh` / `kokoro-server.sh`). Default `~/.claude/claudio`. Set it in a
+  LaunchAgent or before launching Hammerspoon from a shell if the repo lives elsewhere.
 
 ## Pronunciation dictionary
 

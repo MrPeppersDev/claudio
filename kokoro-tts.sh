@@ -42,7 +42,7 @@ else
   LANG_CODE="$KOKORO_LANG"
 fi
 
-STATE_DIR="$HOME/.claude/claudio"
+STATE_DIR="${CLAUDIO_STATE_DIR:-$HOME/.claude/claudio}"
 STATE_FILE="$STATE_DIR/state"
 LOG_FILE="$STATE_DIR/tts.log"
 
