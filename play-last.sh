@@ -58,20 +58,49 @@ write_state() {
   printf 'state=%s\npreview=%s\nts=%s\n' "$state" "$preview" "$(date +%s)" > "$STATE_FILE"
 }
 
+# Returns 0 if $1 is a live play-last.sh process. Guards against PID recycling:
+# between one invocation writing its PID to the lock file and the next reading
+# it, the kernel may have reassigned that PID to an unrelated program. `ps -o
+# command=` gives us the full argv; we look for our own script name.
+is_our_process() {
+  local pid="$1" cmd
+  cmd=$(ps -o command= -p "$pid" 2>/dev/null || true)
+  [ -n "$cmd" ] && [[ "$cmd" == *play-last.sh* ]]
+}
+
+# Recursively collect descendants of $1 (inclusive of $1) into $DESCENDANTS.
+# Needed because SIGTERM on a bash parent does not reliably propagate to
+# grandchildren like afplay, and pkill -P only walks one level.
+collect_descendants() {
+  local parent="$1" kid
+  DESCENDANTS="$DESCENDANTS $parent"
+  for kid in $(pgrep -P "$parent" 2>/dev/null || true); do
+    collect_descendants "$kid"
+  done
+}
+
 # --- Toggle: stop any in-flight job ---
 if [ -f "$LOCK_FILE" ]; then
   OLD_PID=$(cat "$LOCK_FILE" 2>/dev/null || true)
-  if [ -n "${OLD_PID:-}" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-    # Kill the whole tree: owner shell + all descendants (curl, afplay, …)
-    pkill -TERM -P "$OLD_PID" 2>/dev/null || true
-    kill -TERM "$OLD_PID" 2>/dev/null || true
-    # Nuke any afplay the wrapper may have detached — belt & suspenders
-    pkill -9 afplay 2>/dev/null || true
+  if [ -n "${OLD_PID:-}" ] && kill -0 "$OLD_PID" 2>/dev/null && is_our_process "$OLD_PID"; then
+    # Walk the whole descendant tree first so we can target every level
+    # (bash wrapper → curl/python → afplay) without pkill -9'ing every
+    # afplay on the system.
+    DESCENDANTS=""
+    collect_descendants "$OLD_PID"
+    # shellcheck disable=SC2086 # word-split on purpose
+    kill -TERM $DESCENDANTS 2>/dev/null || true
+    sleep 0.1
+    # shellcheck disable=SC2086
+    kill -KILL $DESCENDANTS 2>/dev/null || true
     rm -f "$LOCK_FILE"
     write_state idle
-    log "stopped pid=$OLD_PID"
+    log "stopped pid=$OLD_PID tree=$(printf '%s' "$DESCENDANTS" | wc -w | tr -d ' ')"
     exit 0
   fi
+  # Stale lock: PID dead or reassigned to an unrelated process. Clear it and
+  # fall through to start a new job rather than exiting.
+  [ -n "${OLD_PID:-}" ] && log "stale lock pid=$OLD_PID (not ours) — clearing"
   rm -f "$LOCK_FILE"
 fi
 
