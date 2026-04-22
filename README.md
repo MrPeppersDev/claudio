@@ -69,7 +69,9 @@ cd ~/.claude/claudio
 Install does:
 1. Symlinks `hammerspoon/claudio.lua` and the claudetop plugin to their
    runtime locations.
-2. Creates a Python 3.12 venv and installs `kokoro-onnx`, `soundfile`, `scipy`.
+2. Creates a Python venv (prefers 3.12; accepts anything ≥ 3.10) and
+   installs `kokoro-onnx`, `soundfile`, `scipy`. Override the interpreter
+   with `CLAUDIO_PYTHON=/path/to/python3` if auto-detection picks wrong.
 3. Downloads Kokoro v1.0 model weights + voices (~340 MB one-time).
 
 Then add to your Hammerspoon `init.lua`:
