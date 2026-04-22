@@ -151,5 +151,22 @@ runs it automatically at the end of a fresh install.
   that map so F13 reads the Claude message from the *focused* pane rather
   than the globally-most-recent one.
 
+## License
+
+Claudio is licensed under the [Apache License 2.0](LICENSE).
+
+### Upstream attribution
+
+Claudio is a wrapper — the TTS capability comes entirely from upstream work
+that is fetched at install time, not vendored here:
+
+- **[kokoro-onnx]** (Apache-2.0) — ONNX inference wrapper.
+- **[Kokoro-82M]** — the model weights and voice embeddings, published under
+  the terms described in its model card. Review those terms before
+  redistributing the downloaded weights; Claudio only fetches them to the
+  user's machine, never ships them.
+
 [upstream]: https://github.com/thewh1teagle/kokoro-onnx/releases
 [voices]: https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md
+[kokoro-onnx]: https://github.com/thewh1teagle/kokoro-onnx
+[Kokoro-82M]: https://huggingface.co/hexgrad/Kokoro-82M
