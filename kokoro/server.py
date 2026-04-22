@@ -36,6 +36,25 @@ VOICES_PATH = os.path.join(HERE, "voices-v1.0.bin")
 HOST = os.environ.get("KOKORO_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KOKORO_PORT", "8880"))
 
+# Bind-safety guard: the server has no auth. Binding to anything other than
+# loopback would expose an unauthenticated TTS endpoint to the LAN (CPU burn,
+# voice enumeration, at worst an OS-level vuln in onnxruntime). Refuse by
+# default; force a deliberate opt-in via KOKORO_ALLOW_REMOTE=1 for anyone
+# who really wants that (e.g., docker-bridge testing).
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", ""}
+if HOST not in _LOOPBACK_HOSTS and os.environ.get("KOKORO_ALLOW_REMOTE") != "1":
+    sys.stderr.write(
+        f"[kokoro] refusing to bind {HOST!r}: no auth on this server.\n"
+        f"[kokoro] loopback hosts: {sorted(_LOOPBACK_HOSTS)}.\n"
+        f"[kokoro] set KOKORO_ALLOW_REMOTE=1 to acknowledge and proceed anyway.\n"
+    )
+    sys.exit(2)
+if HOST not in _LOOPBACK_HOSTS:
+    sys.stderr.write(
+        f"[kokoro] WARNING: bound to {HOST} (non-loopback). "
+        f"No auth — anyone reachable on this interface can call /speak.\n"
+    )
+
 # Kokoro-82M's hard per-call cap is 510 phonemes — the voice style array has
 # shape (510, ...), and _create_audio indexes voice[len(tokens)] after
 # truncating phonemes to 510 chars, so a 510-token call hits IndexError.
