@@ -1,7 +1,7 @@
 #!/bin/bash
 # kokoro-server.sh — start / stop / status controller for the local Kokoro
-# TTS HTTP server. Invoked by Hammerspoon when the user hot-swaps backends,
-# so only the currently selected backend is consuming resources.
+# TTS HTTP server. play-last.sh starts it lazily on the first synth; the
+# Hammerspoon menu offers a manual stop to release RAM.
 #
 # Usage: kokoro-server.sh {start|stop|restart|status}
 #
@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-STATE_DIR="$HOME/.claude/speechify"
+STATE_DIR="$HOME/.claude/claudio"
 KOKORO_DIR="$STATE_DIR/kokoro"
 PID_FILE="$STATE_DIR/kokoro-server.pid"
 LOG_FILE="$STATE_DIR/kokoro-server.log"

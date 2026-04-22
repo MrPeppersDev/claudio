@@ -1,6 +1,6 @@
 #!/bin/bash
 # claudetop plugin — writes iterm_session_id -> transcript_path on each render.
-# Consumed by play-last.sh so the Speechify menu-bar / hotkey play the message
+# Consumed by play-last.sh so the Claudio menu-bar / hotkey play the message
 # from the *focused* iTerm pane, not whichever Claude session was last active.
 #
 # Key format: iTerm sets ITERM_SESSION_ID like "w0t0p0:UUID". AppleScript's
@@ -18,7 +18,7 @@ TRANSCRIPT=$(printf '%s' "$JSON" | jq -r '.transcript_path // empty' 2>/dev/null
 SID="${ITERM_SESSION_ID:-}"
 [ -z "$SID" ] && exit 0
 
-MAP_DIR="$HOME/.claude/speechify/sessions"
+MAP_DIR="$HOME/.claude/claudio/sessions"
 mkdir -p "$MAP_DIR"
 
 write_key() {

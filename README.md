@@ -50,22 +50,22 @@ What Claudio adds on top:
 │   ├── kokoro-v1.0.onnx       # (gitignored, 310 MB, pulled at install)
 │   └── voices-v1.0.bin        # (gitignored, 27 MB, pulled at install)
 ├── hammerspoon/
-│   └── speechify.lua          # menubar dropdown, F13 hotkey, selection capture
+│   └── claudio.lua            # menubar dropdown, F13 hotkey, selection capture
 ├── claudetop.d/
-│   └── speechify-session-map  # statusline plugin: iTerm session → transcript
+│   └── claudio-session-map    # statusline plugin: iTerm session → transcript
 └── install.sh                 # bootstrap for a new machine
 ```
 
 ## Install
 
 ```bash
-git clone <repo> ~/.claude/speechify
-cd ~/.claude/speechify
+git clone <repo> ~/.claude/claudio
+cd ~/.claude/claudio
 ./install.sh
 ```
 
 Install does:
-1. Symlinks `hammerspoon/speechify.lua` and the claudetop plugin to their
+1. Symlinks `hammerspoon/claudio.lua` and the claudetop plugin to their
    runtime locations.
 2. Creates a Python 3.12 venv and installs `kokoro-onnx`, `soundfile`, `scipy`.
 3. Downloads Kokoro v1.0 model weights + voices (~340 MB one-time).
@@ -73,9 +73,9 @@ Install does:
 Then add to your Hammerspoon `init.lua`:
 
 ```lua
-local speechify = require("speechify")
-speechify.start()
-hs.hotkey.bind({}, "F13", function() speechify.toggle() end)
+local claudio = require("claudio")
+claudio.start()
+hs.hotkey.bind({}, "F13", function() claudio.toggle() end)
 ```
 
 ## Usage
@@ -116,7 +116,7 @@ the next invocation — no reload needed.
 - **Lazy server start:** `play-last.sh` calls `kokoro-server.sh start` before
   each synth. Idempotent: ~0.05 s no-op when already healthy, up to ~8 s on
   cold boot.
-- **Selection capture** (`speechify.lua`): Accessibility API → simulated
+- **Selection capture** (`claudio.lua`): Accessibility API → simulated
   Cmd+C → iTerm copy-on-select fallback. Three paths in order of preference.
 - **Session-scoped transcripts:** the `claudetop.d` statusline plugin writes
   `iterm_session_id → transcript_path` on each render; `play-last.sh` uses

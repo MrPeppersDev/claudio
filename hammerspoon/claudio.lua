@@ -1,6 +1,6 @@
--- speechify.lua — menu bar dropdown for Kokoro TTS.
+-- claudio.lua — menu bar dropdown for Kokoro TTS.
 --
--- State source: ~/.claude/speechify/state (written by play-last.sh / kokoro-tts.sh).
+-- State source: ~/.claude/claudio/state (written by play-last.sh / kokoro-tts.sh).
 --   state=<idle|synth|play>
 --   preview=<first 80 chars of the message being read>
 --   ts=<unix seconds>
@@ -13,7 +13,7 @@
 local M = {}
 
 local HOME = os.getenv("HOME")
-local STATE_DIR = HOME .. "/.claude/speechify"
+local STATE_DIR = HOME .. "/.claude/claudio"
 local STATE_FILE = STATE_DIR .. "/state"
 local PLAY_SCRIPT = STATE_DIR .. "/play-last.sh"
 local SERVER_SCRIPT = STATE_DIR .. "/kokoro-server.sh"

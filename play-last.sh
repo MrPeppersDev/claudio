@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-STATE_DIR="$HOME/.claude/speechify"
+STATE_DIR="$HOME/.claude/claudio"
 LOCK_FILE="$STATE_DIR/job.pid"
 STATE_FILE="$STATE_DIR/state"
 LOG_FILE="$STATE_DIR/play.log"
@@ -135,7 +135,7 @@ fi
 
 if [ -z "${LATEST:-}" ] || [ ! -r "$LATEST" ]; then
   log "ERROR: no transcript found under $PROJECTS_DIR"
-  osascript -e 'display notification "No Claude transcript found" with title "Speechify"'
+  osascript -e 'display notification "No Claude transcript found" with title "Claudio"'
   exit 1
 fi
 
@@ -154,7 +154,7 @@ TEXT=$(jq -rs '
 
 if [ -z "${TEXT:-}" ] || [ "$TEXT" = "null" ]; then
   log "ERROR: no assistant text found in $LATEST"
-  osascript -e 'display notification "No assistant text to play" with title "Speechify"'
+  osascript -e 'display notification "No assistant text to play" with title "Claudio"'
   exit 1
 fi
 

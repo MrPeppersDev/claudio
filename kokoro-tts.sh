@@ -32,7 +32,7 @@ else
   LANG_CODE="$KOKORO_LANG"
 fi
 
-STATE_DIR="$HOME/.claude/speechify"
+STATE_DIR="$HOME/.claude/claudio"
 STATE_FILE="$STATE_DIR/state"
 AUDIO_FILE="$STATE_DIR/last.wav"
 LOG_FILE="$STATE_DIR/tts.log"

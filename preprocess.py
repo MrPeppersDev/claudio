@@ -3,7 +3,7 @@
 preprocess.py — text transformations applied before TTS synthesis.
 
 Reads stdin, writes transformed text to stdout. Applied by play-last.sh
-so both Speechify and Kokoro backends benefit uniformly.
+feeding kokoro-tts.sh.
 
 Transformations, in order:
   1. Markdown stripping (code blocks, links, emphasis, etc.)
