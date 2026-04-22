@@ -108,6 +108,10 @@ hs.hotkey.bind({}, "F13", function() claudio.toggle() end)
 - `KOKORO_CACHE_DIR` — per-sentence WAV cache. Default `~/.claude/claudio/cache`.
 - `KOKORO_CACHE_MAX_MB` — cache cap, mtime-LRU pruned. Default `200`.
 - `KOKORO_NO_PLAY` — synth-to-cache and skip playback (used by `warm-cache.sh`).
+- `KOKORO_EQ_GAIN_DB` / `KOKORO_EQ_FREQ` / `KOKORO_EQ_Q` — server-side peaking EQ.
+  Default `3.0` / `2500` / `1.0`. A small presence bump helps consonant intelligibility
+  survive the 1.33× afplay time-stretch. Set `KOKORO_EQ_GAIN_DB=0` to disable.
+  All three participate in the cache key, so toggling them auto-invalidates stale entries.
 
 ## Pronunciation dictionary
 

@@ -19,6 +19,9 @@
 #   KOKORO_CACHE_DIR   per-sentence WAV cache (default: ~/.claude/claudio/cache)
 #   KOKORO_CACHE_MAX_MB cache size cap, mtime-LRU pruned (default: 200)
 #   KOKORO_NO_PLAY     if "1", synth+cache but skip playback (warm-cache.sh)
+#   KOKORO_EQ_GAIN_DB  peaking-EQ gain (default: 3.0; 0 disables)
+#   KOKORO_EQ_FREQ     EQ center frequency, Hz (default: 2500)
+#   KOKORO_EQ_Q        EQ Q factor (default: 1.0)
 #
 # Owned by play-last.sh via job.pid; writes state={synth,play} to the state
 # file; afplay runs in foreground so the parent's pkill -P tears everything
@@ -48,15 +51,22 @@ mkdir -p "$STATE_DIR"
 EARCON="${KOKORO_EARCON:-/System/Library/Sounds/Pop.aiff}"
 CACHE_DIR="${KOKORO_CACHE_DIR:-$STATE_DIR/cache}"
 CACHE_MAX_MB="${KOKORO_CACHE_MAX_MB:-200}"
+EQ_GAIN_DB="${KOKORO_EQ_GAIN_DB:-3.0}"
+EQ_FREQ="${KOKORO_EQ_FREQ:-2500}"
+EQ_Q="${KOKORO_EQ_Q:-1.0}"
 mkdir -p "$CACHE_DIR"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
 
-# Hash key for a sentence: voice|synth_speed|lang|text. Any change in those
-# produces different audio, so they all go into the key. Null bytes between
-# fields prevent "ab|c" colliding with "a|bc".
+# Hash key for a sentence: voice|synth_speed|lang|eq_gain|eq_freq|eq_q|text.
+# Any change in those produces different audio, so they all go into the key.
+# Null bytes between fields prevent "ab|c" colliding with "a|bc". Including
+# EQ fields means toggling KOKORO_EQ_GAIN_DB invalidates stale cache
+# automatically instead of silently mixing pre/post-EQ audio.
 sentence_hash() {
-  printf '%s\0%s\0%s\0%s' "$VOICE" "$SYNTH_SPEED" "$LANG_CODE" "$1" \
+  printf '%s\0%s\0%s\0%s\0%s\0%s\0%s' \
+    "$VOICE" "$SYNTH_SPEED" "$LANG_CODE" \
+    "$EQ_GAIN_DB" "$EQ_FREQ" "$EQ_Q" "$1" \
     | shasum -a 256 | awk '{print $1}'
 }
 
@@ -171,7 +181,11 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
         --arg voice "$VOICE" \
         --arg lang "$LANG_CODE" \
         --argjson speed "$SYNTH_SPEED" \
-        '{text: $text, voice: $voice, speed: $speed, lang: $lang}')
+        --argjson eq_gain_db "$EQ_GAIN_DB" \
+        --argjson eq_freq "$EQ_FREQ" \
+        --argjson eq_q "$EQ_Q" \
+        '{text: $text, voice: $voice, speed: $speed, lang: $lang,
+          eq_gain_db: $eq_gain_db, eq_freq: $eq_freq, eq_q: $eq_q}')
       HTTP_CODE=$(curl -sS -o "$cache_wav.tmp" -w '%{http_code}' \
         --max-time 120 \
         -X POST "$URL/speak" \

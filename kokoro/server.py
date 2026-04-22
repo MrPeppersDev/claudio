@@ -17,6 +17,7 @@ calls skip the ~500ms load cost entirely.
 """
 import io
 import json
+import math
 import os
 import sys
 import time
@@ -25,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import numpy as np
 from kokoro_onnx import Kokoro
+from scipy.signal import lfilter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(HERE, "kokoro-v1.0.onnx")
@@ -77,6 +79,35 @@ def resolve_voice(spec: str):
     return blend.astype(np.float32)
 
 
+def peaking_eq(samples: np.ndarray, fs: int, f0: float, gain_db: float, q: float) -> np.ndarray:
+    """
+    Apply a peaking (parametric) EQ biquad at f0 with the given gain and Q.
+    Formulas from the Audio EQ Cookbook (Robert Bristow-Johnson). A small
+    presence bump (~3 dB at 2.5 kHz, Q ~ 1) helps consonants survive the
+    1.33x afplay time-stretch that happens downstream.
+
+    gain_db == 0 is treated as a no-op to avoid the numerical round-trip.
+    """
+    if gain_db == 0.0:
+        return samples
+    A = 10.0 ** (gain_db / 40.0)
+    w0 = 2.0 * math.pi * f0 / fs
+    cos_w0 = math.cos(w0)
+    sin_w0 = math.sin(w0)
+    alpha = sin_w0 / (2.0 * q)
+
+    b0 = 1.0 + alpha * A
+    b1 = -2.0 * cos_w0
+    b2 = 1.0 - alpha * A
+    a0 = 1.0 + alpha / A
+    a1 = -2.0 * cos_w0
+    a2 = 1.0 - alpha / A
+
+    b = np.array([b0 / a0, b1 / a0, b2 / a0], dtype=np.float64)
+    a = np.array([1.0, a1 / a0, a2 / a0], dtype=np.float64)
+    return lfilter(b, a, samples).astype(samples.dtype)
+
+
 def samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
     pcm = np.clip(samples, -1.0, 1.0)
     pcm = (pcm * 32767.0).astype(np.int16)
@@ -125,6 +156,12 @@ class Handler(BaseHTTPRequestHandler):
         voice_spec = payload.get("voice") or "af_bella"
         speed = float(payload.get("speed") or 1.0)
         lang = payload.get("lang") or "en-gb"
+        # EQ params are per-request (not env) so the client's cache key
+        # can include them and toggling EQ auto-invalidates stale cache
+        # entries instead of silently mixing pre/post-EQ audio.
+        eq_gain_db = float(payload.get("eq_gain_db") or 0.0)
+        eq_freq = float(payload.get("eq_freq") or 2500.0)
+        eq_q = float(payload.get("eq_q") or 1.0)
 
         if not text:
             self._json(400, {"error": "text required"})
@@ -143,11 +180,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": f"synth failed: {e}"})
             return
         t1 = time.time()
-        wav = samples_to_wav(samples, sr)
+        samples = peaking_eq(samples, sr, eq_freq, eq_gain_db, eq_q)
         t2 = time.time()
+        wav = samples_to_wav(samples, sr)
+        t3 = time.time()
         sys.stderr.write(
             f"[kokoro] synth chars={len(text)} voice={voice_spec} speed={speed} "
-            f"synth={t1-t0:.2f}s encode={t2-t1:.2f}s bytes={len(wav)}\n"
+            f"eq={eq_gain_db}dB@{eq_freq}Hz synth={t1-t0:.2f}s "
+            f"eq_time={t2-t1:.3f}s encode={t3-t2:.2f}s bytes={len(wav)}\n"
         )
 
         self.send_response(200)
