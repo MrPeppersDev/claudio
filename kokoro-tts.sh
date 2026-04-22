@@ -71,8 +71,10 @@ sentence_hash() {
 }
 
 # Evict cache entries by mtime (oldest first) until total size is under cap.
-# macOS stat: -f '%m %z %N' → mtime size path. Called once per invocation;
-# usually a fast no-op because the cache grows slowly.
+# macOS stat: -f '%m %z %N' → mtime size path. Only called when misses>0
+# (see end of synth loop): a pure cache-hit invocation can't have grown the
+# cache, so we skip the stat-every-file scan — the hot path that matters
+# once the cache has thousands of entries.
 prune_cache() {
   local max_bytes=$((CACHE_MAX_MB * 1024 * 1024))
   local total
@@ -141,7 +143,6 @@ printf '%s' "$TEXT" | awk -v RS=$'\x1e' -v dir="$WORK_DIR" '
 SEG_COUNT=$(find "$WORK_DIR" -maxdepth 1 -name 'seg-*.txt' | wc -l | tr -d ' ')
 log "kokoro synthesize: voice=$VOICE target=${SPEED}x synth=${SYNTH_SPEED}x playback=${PLAYBACK_RATE}x lang=$LANG_CODE chars=${#TEXT} segments=$SEG_COUNT"
 write_state synth
-prune_cache
 
 have_earcon=0
 [ -r "$EARCON" ] && have_earcon=1
@@ -243,6 +244,13 @@ done
 if [ -n "$prev_pid" ]; then
   wait "$prev_pid" 2>/dev/null || true
   prev_pid=""
+fi
+# Prune only when we actually added bytes. On a pure cache-hit run (the
+# common case for stock phrases once warm) the cache can't have grown, so
+# we skip the stat-every-file scan entirely. At thousands of cached WAVs
+# that's the difference between F13 feeling instant and F13 pausing.
+if [ "$misses" -gt 0 ]; then
+  prune_cache
 fi
 log "cache: hits=$hits misses=$misses"
 log "done"
