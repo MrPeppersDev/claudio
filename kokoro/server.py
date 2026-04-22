@@ -51,6 +51,43 @@ VOICES = set(KOKORO.get_voices())
 print(f"[kokoro] loaded in {time.time()-t0:.2f}s ({len(VOICES)} voices)", flush=True)
 
 
+# Input bounds for /speak. Picked to cover realistic TTS use without inviting
+# "oops, I DoS'd my own machine" floats. Chosen values are intentionally
+# generous — anything outside them is almost certainly a client bug.
+MAX_TEXT_CHARS = 50_000
+SPEED_RANGE = (0.25, 4.0)
+EQ_GAIN_DB_RANGE = (-24.0, 24.0)
+EQ_FREQ_RANGE = (20.0, 20_000.0)
+EQ_Q_RANGE = (0.1, 20.0)
+
+
+class ValidationError(ValueError):
+    """Raised when a /speak payload field is out of range or malformed."""
+
+
+def _parse_float(value, *, field: str, default: float) -> float:
+    """
+    Return ``value`` as a finite float, falling back to ``default`` when it
+    comes in as None/empty. Rejects NaN, +/-Inf, and unparseable strings with
+    a clear ValidationError so the handler can 400.
+    """
+    if value is None or value == "":
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise ValidationError(f"{field}: not a number ({value!r})")
+    if not math.isfinite(parsed):
+        raise ValidationError(f"{field}: must be finite (got {value!r})")
+    return parsed
+
+
+def _check_range(value: float, *, field: str, lo: float, hi: float) -> float:
+    if not (lo <= value <= hi):
+        raise ValidationError(f"{field}: {value} out of range [{lo}, {hi}]")
+    return value
+
+
 def resolve_voice(spec: str):
     """
     Parse a voice spec and return either a voice name (str) or a blended
@@ -267,17 +304,38 @@ class Handler(BaseHTTPRequestHandler):
 
         text = (payload.get("text") or "").strip()
         voice_spec = payload.get("voice") or "af_bella"
-        speed = float(payload.get("speed") or 1.0)
         lang = payload.get("lang") or "en-gb"
-        # EQ params are per-request (not env) so the client's cache key
-        # can include them and toggling EQ auto-invalidates stale cache
-        # entries instead of silently mixing pre/post-EQ audio.
-        eq_gain_db = float(payload.get("eq_gain_db") or 0.0)
-        eq_freq = float(payload.get("eq_freq") or 2500.0)
-        eq_q = float(payload.get("eq_q") or 1.0)
 
         if not text:
             self._json(400, {"error": "text required"})
+            return
+        if len(text) > MAX_TEXT_CHARS:
+            self._json(400, {"error": f"text: {len(text)} chars exceeds "
+                                      f"{MAX_TEXT_CHARS}"})
+            return
+
+        # EQ params are per-request (not env) so the client's cache key
+        # can include them and toggling EQ auto-invalidates stale cache
+        # entries instead of silently mixing pre/post-EQ audio.
+        try:
+            speed = _check_range(
+                _parse_float(payload.get("speed"), field="speed", default=1.0),
+                field="speed", lo=SPEED_RANGE[0], hi=SPEED_RANGE[1],
+            )
+            eq_gain_db = _check_range(
+                _parse_float(payload.get("eq_gain_db"), field="eq_gain_db", default=0.0),
+                field="eq_gain_db", lo=EQ_GAIN_DB_RANGE[0], hi=EQ_GAIN_DB_RANGE[1],
+            )
+            eq_freq = _check_range(
+                _parse_float(payload.get("eq_freq"), field="eq_freq", default=2500.0),
+                field="eq_freq", lo=EQ_FREQ_RANGE[0], hi=EQ_FREQ_RANGE[1],
+            )
+            eq_q = _check_range(
+                _parse_float(payload.get("eq_q"), field="eq_q", default=1.0),
+                field="eq_q", lo=EQ_Q_RANGE[0], hi=EQ_Q_RANGE[1],
+            )
+        except ValidationError as e:
+            self._json(400, {"error": str(e)})
             return
 
         try:
