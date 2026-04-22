@@ -68,6 +68,11 @@ MAX_PHONEMES_PER_CALL = 500
 # a bug or a client trying to force a multi-GB allocation.
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB
 
+# Supported phonemizer languages. Kokoro itself accepts more, but we ship with
+# just the English variants — widening this set requires testing each addition
+# for pronunciation quality.
+SUPPORTED_LANGS = frozenset({"en-us", "en-gb"})
+
 print(f"[kokoro] loading model from {MODEL_PATH}", flush=True)
 t0 = time.time()
 KOKORO = Kokoro(MODEL_PATH, VOICES_PATH)
@@ -373,6 +378,11 @@ class Handler(BaseHTTPRequestHandler):
             )
         except ValidationError as e:
             self._json(400, {"error": str(e)})
+            return
+
+        if lang not in SUPPORTED_LANGS:
+            self._json(400, {"error": f"unsupported lang {lang!r}; "
+                                      f"supported: {sorted(SUPPORTED_LANGS)}"})
             return
 
         try:
