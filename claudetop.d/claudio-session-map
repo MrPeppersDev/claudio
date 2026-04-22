@@ -21,11 +21,21 @@ SID="${ITERM_SESSION_ID:-}"
 MAP_DIR="$HOME/.claude/claudio/sessions"
 mkdir -p "$MAP_DIR"
 
+# Whitelist-based sanitization so the writer here and the reader in
+# play-last.sh stay in lockstep. Any character outside [A-Za-z0-9_-] becomes
+# '_' (consecutive runs are squashed) and the result is capped at 128 chars
+# to keep filenames sane. Typical iTerm session IDs (`w0t0p0:UUID`, plain
+# UUIDs) map to identical results under the prior `tr ':/ ' '___'` rule, so
+# existing map entries still resolve until the 2-day GC sweeps them.
+sanitize_sid() {
+  printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9_-' '_' | tr -s '_' | cut -c1-128
+}
+
 write_key() {
   local key="$1"
-  # Sanitize for filesystem: replace colon/slash/space.
   local safe
-  safe=$(printf '%s' "$key" | tr ':/ ' '___')
+  safe=$(sanitize_sid "$key")
+  [ -z "$safe" ] && return 0
   printf 'transcript_path=%s\nts=%s\n' "$TRANSCRIPT" "$(date +%s)" > "$MAP_DIR/$safe"
 }
 

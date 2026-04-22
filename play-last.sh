@@ -141,12 +141,20 @@ if [ -n "$TEXT_FILE" ]; then
   exit 0
 fi
 
+# Whitelist-based sanitization. Must stay in lockstep with the
+# `sanitize_sid` function in claudetop.d/claudio-session-map — they write,
+# we read, and any drift silently loses the lookup.
+sanitize_sid() {
+  printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9_-' '_' | tr -s '_' | cut -c1-128
+}
+
 # --- Resolve transcript for the requested iTerm session, if any ---
 LATEST=""
 if [ -n "$REQUESTED_SID" ]; then
   # Try both raw id and UUID-after-colon (claudetop plugin writes both keys).
   for candidate in "$REQUESTED_SID" "${REQUESTED_SID##*:}"; do
-    safe=$(printf '%s' "$candidate" | tr ':/ ' '___')
+    safe=$(sanitize_sid "$candidate")
+    [ -z "$safe" ] && continue
     map_file="$SESSION_MAP_DIR/$safe"
     if [ -f "$map_file" ]; then
       mapped=$(grep -E '^transcript_path=' "$map_file" | head -1 | sed 's/^transcript_path=//')
