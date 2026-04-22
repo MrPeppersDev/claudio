@@ -80,9 +80,15 @@ hs.hotkey.bind({}, "F13", function() claudio.toggle() end)
 
 ## Usage
 
-- **F13** — toggle playback of selection (if any) or last Claude message.
+- **F13** — highlight text in any app, then press F13 to read it aloud.
+  Press F13 again to stop.
 - **Menu bar icon** — dropdown with Play/Stop and manual server stop.
   `▸` idle, `⟳` synth, `▶` playing.
+
+> **Note:** F13 with no selection currently shows a reminder rather than
+> reading the latest assistant message. Full-message playback will come
+> back once we can summarize server-side — raw multi-paragraph responses
+> are rarely what you actually want to hear.
 
 ## Env vars
 

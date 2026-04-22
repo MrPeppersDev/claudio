@@ -173,10 +173,10 @@ function M.toggle()
       if f then f:write(selection); f:close() end
       runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
     else
-      local args = { PLAY_SCRIPT }
-      local sid = focusedItermSessionId()
-      if sid then table.insert(args, "--session"); table.insert(args, sid) end
-      runPlayScript(args)
+      -- Selection-only mode. Full-message playback is disabled until we can
+      -- summarize server-side; otherwise F13 reads multi-paragraph responses
+      -- verbatim, which is rarely what you actually want.
+      hs.alert.show("Claudio: highlight text to play")
     end
   end)
 end
