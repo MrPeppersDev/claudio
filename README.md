@@ -73,6 +73,10 @@ Install does:
    installs `kokoro-onnx`, `soundfile`, `scipy`. Override the interpreter
    with `CLAUDIO_PYTHON=/path/to/python3` if auto-detection picks wrong.
 3. Downloads Kokoro v1.0 model weights + voices (~340 MB one-time).
+4. Pre-warms the sentence cache with every line in `common-phrases.txt`
+   (~15 s; skipped non-fatally on failure).
+5. Prints follow-up instructions — reload Hammerspoon and add the
+   `require("claudio")` / F13 binding snippet below to your `init.lua`.
 
 Then add to your Hammerspoon `init.lua`:
 
