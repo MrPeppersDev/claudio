@@ -1,0 +1,60 @@
+# common-phrases.txt — stock utterances that show up often enough in
+# assistant responses that pre-caching them is worthwhile. warm-cache.sh
+# feeds each non-blank, non-comment line through the synth pipeline with
+# playback disabled, so when the real message uses the phrase it's a
+# cache hit and the first-sentence synth cost disappears.
+#
+# Keep entries to a single sentence. Match ending punctuation to how
+# the phrase usually lands in prose (otherwise the hash won't match).
+# Cache entries for unused phrases are evicted by the normal mtime LRU,
+# so an over-eager list just costs a bit of disk until it's pruned.
+
+# --- Openers / acknowledgements
+Let me check that.
+Let me look into that.
+Let me take a look.
+Here's what I found.
+Here's what I see.
+Here's the issue.
+On it.
+Got it.
+Sure.
+Sure thing.
+Absolutely.
+Understood.
+Makes sense.
+
+# --- Status / progress
+Done.
+All done.
+That's done.
+Finished.
+Good to go.
+Ready.
+That worked.
+That's working now.
+
+# --- Correctness / acknowledgement
+That's correct.
+That's right.
+Exactly.
+Good question.
+
+# --- Transitions
+A couple of things.
+One more thing.
+Quick note.
+One caveat.
+Worth noting.
+
+# --- Apologies / corrections
+My mistake.
+Sorry about that.
+You're right.
+Good catch.
+
+# --- Hedges (used often enough to be worth caching)
+That depends.
+It depends.
+Not quite.
+Almost.

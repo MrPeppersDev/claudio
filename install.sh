@@ -10,7 +10,8 @@
 #      and  claudetop.d/claudio-session-map → ~/.claude/claudetop.d/…
 #   3. Creates the Python 3.12 venv and installs kokoro dependencies.
 #   4. Downloads the Kokoro model weights + voices (one-time, ~340 MB).
-#   5. Prints next steps (Hammerspoon reload).
+#   5. Warms the cache with common phrases so the first F13 isn't cold.
+#   6. Prints next steps (Hammerspoon reload).
 
 set -euo pipefail
 
@@ -52,7 +53,14 @@ echo "installing deps into venv..."
 # --- 3. Model weights ---
 bash "$REPO/kokoro/download-model.sh"
 
-# --- 4. Next steps ---
+# --- 4. Pre-warm cache with common phrases ---
+# Boots the server (lazy start), synthesizes ~40 stock phrases into the
+# cache. ~15s one-time cost; the payoff is that "Let me check that.",
+# "Done.", etc. are instant cache hits the first time they come up.
+echo "warming phrase cache..."
+bash "$REPO/warm-cache.sh" || echo "WARN: cache warm failed (non-fatal)"
+
+# --- 5. Next steps ---
 echo ""
 echo "Install complete."
 echo ""

@@ -39,10 +39,12 @@ What Claudio adds on top:
 ```
 .
 ├── play-last.sh               # top-level orchestrator; owns the job lock
-├── preprocess.py              # markdown + pronunciation layer (shared)
+├── preprocess.py              # markdown + pronunciation + sentence split
 ├── pronunciations.txt         # FROM|TO dictionary for tech jargon
+├── common-phrases.txt         # stock utterances for cache pre-warm
 ├── kokoro-tts.sh              # backend wrapper (HTTP → server → afplay)
 ├── kokoro-server.sh           # start/stop/status for the local Python server
+├── warm-cache.sh              # pre-synthesize common-phrases.txt into cache
 ├── kokoro/
 │   ├── server.py              # stdlib http.server wrapping kokoro-onnx
 │   ├── requirements.txt
@@ -101,6 +103,11 @@ hs.hotkey.bind({}, "F13", function() claudio.toggle() end)
   more work to afplay's phase vocoder; higher push it to the model.
 - `KOKORO_LANG` — override auto-detected phoneme language (`en-us` / `en-gb`).
 - `KOKORO_URL` — server base URL. Default `http://127.0.0.1:8880`.
+- `KOKORO_EARCON` — WAV/AIFF played at structural boundaries (where a code
+  block was stripped). Default `/System/Library/Sounds/Pop.aiff`.
+- `KOKORO_CACHE_DIR` — per-sentence WAV cache. Default `~/.claude/claudio/cache`.
+- `KOKORO_CACHE_MAX_MB` — cache cap, mtime-LRU pruned. Default `200`.
+- `KOKORO_NO_PLAY` — synth-to-cache and skip playback (used by `warm-cache.sh`).
 
 ## Pronunciation dictionary
 
@@ -108,6 +115,15 @@ Edit `pronunciations.txt`. Format: `FROM|TO`, one per line, `#` for comments.
 Matching is case-sensitive and word-boundary respecting. Longer/more-specific
 entries should come first (plurals before singulars). Changes take effect on
 the next invocation — no reload needed.
+
+## Cache pre-warming
+
+`./warm-cache.sh` synthesizes every line in `common-phrases.txt` into the
+sentence cache with playback disabled. Stock utterances ("Let me check
+that.", "Done.") then hit on first real use instead of paying a cold
+synth. Run it after changing `KOKORO_VOICE` to warm the new voice's cache
+(cache keys include voice, so each voice needs its own warm). `install.sh`
+runs it automatically at the end of a fresh install.
 
 ## Resource footprint
 

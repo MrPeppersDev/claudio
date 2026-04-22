@@ -18,6 +18,7 @@
 #                      (default: /System/Library/Sounds/Pop.aiff)
 #   KOKORO_CACHE_DIR   per-sentence WAV cache (default: ~/.claude/claudio/cache)
 #   KOKORO_CACHE_MAX_MB cache size cap, mtime-LRU pruned (default: 200)
+#   KOKORO_NO_PLAY     if "1", synth+cache but skip playback (warm-cache.sh)
 #
 # Owned by play-last.sh via job.pid; writes state={synth,play} to the state
 # file; afplay runs in foreground so the parent's pkill -P tears everything
@@ -188,6 +189,15 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
       fi
       mv "$cache_wav.tmp" "$cache_wav"
       misses=$((misses + 1))
+    fi
+
+    # KOKORO_NO_PLAY: used by warm-cache.sh to fill the cache during idle
+    # time. Everything up to this point still runs (split, hash, synth-on-
+    # miss) so the cache ends up in the exact state a real playback would
+    # leave it in. We just skip the afplay handoff.
+    if [ "${KOKORO_NO_PLAY:-0}" = "1" ]; then
+      seg_has_audio=1
+      continue
     fi
 
     # Gate on previous afplay before starting this one. The waiting happens
