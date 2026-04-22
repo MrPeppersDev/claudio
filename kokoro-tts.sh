@@ -113,9 +113,15 @@ PLAYBACK_RATE=$(awk -v s="$SPEED" -v ss="$SYNTH_SPEED" 'BEGIN{print s/ss}')
 # sentences; a short reply with no code and one sentence produces a single
 # segment/single sentence and behaves like the original single-shot path.
 WORK_DIR=$(mktemp -d "$STATE_DIR/segments.XXXXXX")
-PLAYLIST="$WORK_DIR/playlist.txt"
-: > "$PLAYLIST"
-trap 'rm -rf "$WORK_DIR"' EXIT
+prev_pid=""
+cleanup() {
+  # Kill dangling background afplay on any exit path (error, signal, done).
+  # Parent (play-last.sh) also reaps us via pkill -P for explicit stops;
+  # this covers the synth-failure path where set -e trips.
+  [ -n "$prev_pid" ] && kill "$prev_pid" 2>/dev/null || true
+  rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
 
 printf '%s' "$TEXT" | awk -v RS=$'\x1e' -v dir="$WORK_DIR" '
   { out = sprintf("%s/seg-%04d.txt", dir, NR); printf "%s", $0 > out; close(out) }
@@ -126,8 +132,18 @@ log "kokoro synthesize: voice=$VOICE target=${SPEED}x synth=${SYNTH_SPEED}x play
 write_state synth
 prune_cache
 
+have_earcon=0
+[ -r "$EARCON" ] && have_earcon=1
+
+# Interleaved synth + playback. Each iteration resolves its sentence's WAV
+# (cache hit = instant; miss = one curl to the local server) then hands off
+# to afplay in the background. The next iteration's synth runs concurrently
+# with the current afplay, so server round-trip cost is masked behind the
+# previous sentence's audible playback. Cold first sentence still pays the
+# full synth+start cost; everything after is pipelined.
 hits=0
 misses=0
+playing=0
 first_seg=1
 for seg_txt in "$WORK_DIR"/seg-*.txt; do
   seg_id=$(basename "$seg_txt" .txt)
@@ -140,7 +156,6 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
   seg_has_audio=0
   for sent_txt in "$sent_dir"/*.txt; do
     sent_text=$(cat "$sent_txt")
-    # Skip whitespace-only sentences — same rationale as empty segments.
     if [ -z "${sent_text//[[:space:]]/}" ]; then
       continue
     fi
@@ -175,25 +190,35 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
       misses=$((misses + 1))
     fi
 
-    if [ "$seg_has_audio" -eq 0 ] && [ "$first_seg" -eq 0 ]; then
-      printf 'EARCON\n' >> "$PLAYLIST"
+    # Gate on previous afplay before starting this one. The waiting happens
+    # *after* we resolved the current WAV, so synth cost overlaps with prior
+    # playback rather than adding to the gap between sentences.
+    if [ -n "$prev_pid" ]; then
+      wait "$prev_pid" 2>/dev/null || true
+      prev_pid=""
     fi
-    printf '%s\n' "$cache_wav" >> "$PLAYLIST"
+
+    # Earcon fires synchronously at segment boundaries. Keep it blocking so
+    # the listener hears the "clunk" distinctly before the next sentence.
+    if [ "$seg_has_audio" -eq 0 ] && [ "$first_seg" -eq 0 ] && [ "$have_earcon" -eq 1 ]; then
+      afplay "$EARCON"
+    fi
+
+    if [ "$playing" -eq 0 ]; then
+      write_state play
+      playing=1
+    fi
+
+    afplay -q 1 -r "$PLAYBACK_RATE" "$cache_wav" &
+    prev_pid=$!
     seg_has_audio=1
   done
   [ "$seg_has_audio" -eq 1 ] && first_seg=0
 done
 
+if [ -n "$prev_pid" ]; then
+  wait "$prev_pid" 2>/dev/null || true
+  prev_pid=""
+fi
 log "cache: hits=$hits misses=$misses"
-write_state play
-
-have_earcon=0
-[ -r "$EARCON" ] && have_earcon=1
-while IFS= read -r line; do
-  if [ "$line" = "EARCON" ]; then
-    [ "$have_earcon" -eq 1 ] && afplay "$EARCON"
-  else
-    afplay -q 1 -r "$PLAYBACK_RATE" "$line"
-  fi
-done < "$PLAYLIST"
 log "done"
