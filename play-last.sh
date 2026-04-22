@@ -121,6 +121,10 @@ if [ -n "$TEXT_FILE" ]; then
     exit 1
   fi
   TEXT=$(cat "$TEXT_FILE")
+  # Unlink immediately — claudio.lua writes selections here, and selection
+  # text can contain secrets or PII. We've already copied it into $TEXT; the
+  # file has no further purpose and shouldn't persist between runs.
+  rm -f "$TEXT_FILE"
   if [ -z "${TEXT:-}" ]; then
     log "ERROR: text file is empty: $TEXT_FILE"
     exit 1
