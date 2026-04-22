@@ -19,5 +19,15 @@ kokoro/venv/
 kokoro/kokoro-v1.0.onnx
 kokoro/voices-v1.0.bin
 
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+
+# Editor / IDE
+.idea/
+.vscode/
+
 # macOS
 .DS_Store
