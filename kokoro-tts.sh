@@ -14,6 +14,8 @@
 #                      (default: 1.5; see split-speed note below)
 #   KOKORO_URL         server base URL (default: http://127.0.0.1:8880)
 #   KOKORO_LANG        phoneme lang (auto: bm_/bf_ → en-gb, else en-us)
+#   KOKORO_EARCON      WAV/AIFF played at structural boundaries
+#                      (default: /System/Library/Sounds/Pop.aiff)
 #
 # Owned by play-last.sh via job.pid; writes state={synth,play} to the state
 # file; afplay runs in foreground so the parent's pkill -P tears everything
@@ -36,10 +38,11 @@ fi
 
 STATE_DIR="$HOME/.claude/claudio"
 STATE_FILE="$STATE_DIR/state"
-AUDIO_FILE="$STATE_DIR/last.wav"
 LOG_FILE="$STATE_DIR/tts.log"
 
 mkdir -p "$STATE_DIR"
+
+EARCON="${KOKORO_EARCON:-/System/Library/Sounds/Pop.aiff}"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
 
@@ -70,35 +73,61 @@ SYNTH_CAP="${KOKORO_SYNTH_CAP:-1.5}"
 SYNTH_SPEED=$(awk -v s="$SPEED" -v c="$SYNTH_CAP" 'BEGIN{print (s>c?c:s)}')
 PLAYBACK_RATE=$(awk -v s="$SPEED" -v ss="$SYNTH_SPEED" 'BEGIN{print s/ss}')
 
-REQ_BODY=$(jq -cn \
-  --arg text "$TEXT" \
-  --arg voice "$VOICE" \
-  --arg lang "$LANG_CODE" \
-  --argjson speed "$SYNTH_SPEED" \
-  '{text: $text, voice: $voice, speed: $speed, lang: $lang}')
+# Split on preprocess.py's earcon sentinel (ASCII 0x1E) into per-segment
+# text files. Most messages have no sentinel — the loop degenerates to one
+# pass and behaves exactly like the previous single-shot path.
+SEG_DIR=$(mktemp -d "$STATE_DIR/segments.XXXXXX")
+trap 'rm -rf "$SEG_DIR"' EXIT
 
-log "kokoro synthesize: voice=$VOICE target=${SPEED}x synth=${SYNTH_SPEED}x playback=${PLAYBACK_RATE}x lang=$LANG_CODE chars=${#TEXT}"
+printf '%s' "$TEXT" | awk -v RS=$'\x1e' -v dir="$SEG_DIR" '
+  { out = sprintf("%s/%04d.txt", dir, NR); printf "%s", $0 > out; close(out) }
+'
+
+SEG_COUNT=$(find "$SEG_DIR" -name '*.txt' | wc -l | tr -d ' ')
+log "kokoro synthesize: voice=$VOICE target=${SPEED}x synth=${SYNTH_SPEED}x playback=${PLAYBACK_RATE}x lang=$LANG_CODE chars=${#TEXT} segments=$SEG_COUNT"
 write_state synth
 
-HTTP_CODE=$(curl -sS -o "$AUDIO_FILE" -w '%{http_code}' \
-  --max-time 120 \
-  -X POST "$URL/speak" \
-  -H "Content-Type: application/json" \
-  -d "$REQ_BODY") || {
-  log "ERROR: curl failed — is kokoro-server running at $URL?"
-  rm -f "$AUDIO_FILE"
-  exit 4
-}
+for seg_txt in "$SEG_DIR"/*.txt; do
+  seg_text=$(cat "$seg_txt")
+  # Skip whitespace-only segments: they come from sentinels at edges or
+  # with only blank lines between adjacent elisions. The earcon boundary
+  # is implicit from the missing .wav on the playback pass.
+  if [ -z "${seg_text//[[:space:]]/}" ]; then
+    continue
+  fi
+  seg_wav="${seg_txt%.txt}.wav"
+  REQ_BODY=$(jq -cn \
+    --arg text "$seg_text" \
+    --arg voice "$VOICE" \
+    --arg lang "$LANG_CODE" \
+    --argjson speed "$SYNTH_SPEED" \
+    '{text: $text, voice: $voice, speed: $speed, lang: $lang}')
+  HTTP_CODE=$(curl -sS -o "$seg_wav" -w '%{http_code}' \
+    --max-time 120 \
+    -X POST "$URL/speak" \
+    -H "Content-Type: application/json" \
+    -d "$REQ_BODY") || {
+    log "ERROR: curl failed — is kokoro-server running at $URL?"
+    exit 4
+  }
+  if [ "$HTTP_CODE" != "200" ]; then
+    ERR=$(cat "$seg_wav" 2>/dev/null || true)
+    log "HTTP $HTTP_CODE: $ERR"
+    exit 4
+  fi
+done
 
-if [ "$HTTP_CODE" != "200" ]; then
-  ERR=$(cat "$AUDIO_FILE" 2>/dev/null || true)
-  log "HTTP $HTTP_CODE: $ERR"
-  rm -f "$AUDIO_FILE"
-  exit 4
-fi
-
-log "playing $(wc -c < "$AUDIO_FILE" | tr -d ' ') bytes"
 write_state play
-
-afplay -q 1 -r "$PLAYBACK_RATE" "$AUDIO_FILE"
+have_earcon=0
+[ -r "$EARCON" ] && have_earcon=1
+first=1
+for seg_txt in "$SEG_DIR"/*.txt; do
+  seg_wav="${seg_txt%.txt}.wav"
+  [ -f "$seg_wav" ] || continue
+  if [ "$first" -eq 0 ] && [ "$have_earcon" -eq 1 ]; then
+    afplay "$EARCON"
+  fi
+  afplay -q 1 -r "$PLAYBACK_RATE" "$seg_wav"
+  first=0
+done
 log "done"

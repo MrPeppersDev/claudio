@@ -24,11 +24,17 @@ HERE = Path(__file__).resolve().parent
 # e.g. fenced code must go before anything that might see inside it, and
 # images must go before links (image syntax is a superset of link syntax).
 
+# Sentinel for structural elisions. kokoro-tts.sh splits on this and plays
+# an earcon at each boundary, so the listener hears "...prose, THOK, prose..."
+# where a code block used to be. ASCII 0x1E (record separator) — guaranteed
+# not to appear in normal text; survives shell pipes and JSON encoding fine.
+EARCON_SENTINEL = "\x1e"
+
 _MD_TRANSFORMS = [
-    # Fenced code blocks — dropped entirely. Silence is fine; users who
+    # Fenced code blocks — dropped with an earcon sentinel. Users who
     # actually want code read aloud can pass it through selection.
-    (re.compile(r"```.*?```", re.DOTALL), ""),
-    (re.compile(r"~~~.*?~~~", re.DOTALL), ""),
+    (re.compile(r"```.*?```", re.DOTALL), EARCON_SENTINEL),
+    (re.compile(r"~~~.*?~~~", re.DOTALL), EARCON_SENTINEL),
 
     # Images — drop (alt text is usually redundant with surrounding prose).
     (re.compile(r"!\[[^\]]*\]\([^)]*\)"), ""),
@@ -82,6 +88,12 @@ _MD_TRANSFORMS = [
     # Collapse runs of 3+ blank lines to 2 (avoids long dead-air after
     # large code-block removals).
     (re.compile(r"\n{3,}"), "\n\n"),
+
+    # Collapse adjacent sentinels (two code blocks with only whitespace
+    # between them) to one. kokoro-tts.sh would play them as one earcon
+    # anyway — but keeping the input clean means per-segment synth logs
+    # stay readable.
+    (re.compile(r"\x1e(\s*\x1e)+"), EARCON_SENTINEL),
 ]
 
 
