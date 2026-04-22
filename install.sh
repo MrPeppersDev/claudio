@@ -23,11 +23,46 @@ mkdir -p "$HOME/.hammerspoon" "$HOME/.claude/claudetop.d"
 
 link() {
   local src="$1" dest="$2"
-  if [ -e "$dest" ] && [ ! -L "$dest" ]; then
-    echo "WARN: $dest exists and is not a symlink — leaving alone"
-    return
+
+  # Existing symlink. Two sub-cases: already points where we want (no-op),
+  # or points somewhere stale (fine to overwrite — it's cheap and by-design
+  # reversible since we haven't touched the real file).
+  if [ -L "$dest" ]; then
+    local current
+    current=$(readlink "$dest")
+    if [ "$current" = "$src" ]; then
+      echo "ok $dest -> $src (already linked)"
+      return 0
+    fi
+    ln -sfn "$src" "$dest"
+    echo "relinked $dest: $current -> $src"
+    return 0
   fi
-  ln -sfn "$src" "$dest"
+
+  # Existing regular file. The previous behavior printed WARN and silently
+  # skipped, so installs appeared to succeed while Hammerspoon / claudetop
+  # kept loading a stale copy. Back up and link, so the user keeps their
+  # file but gets a working install.
+  if [ -f "$dest" ]; then
+    local bak="$dest.bak.$(date +%s)"
+    mv "$dest" "$bak"
+    ln -s "$src" "$dest"
+    echo "linked $dest -> $src (old file backed up to $bak)"
+    return 0
+  fi
+
+  # Anything else at the path — directory, socket, FIFO — is surprising and
+  # we shouldn't auto-clobber. Abort with enough context for the user to
+  # decide what to do.
+  if [ -e "$dest" ]; then
+    echo "ERROR: $dest exists and is neither a file nor a symlink:"
+    ls -ld "$dest"
+    echo "       resolve manually, then re-run install.sh"
+    exit 1
+  fi
+
+  # Fresh install — nothing at the destination.
+  ln -s "$src" "$dest"
   echo "linked $dest -> $src"
 }
 link "$REPO/hammerspoon/claudio.lua"             "$HOME/.hammerspoon/claudio.lua"
