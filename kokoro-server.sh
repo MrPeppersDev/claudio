@@ -1,0 +1,130 @@
+#!/bin/bash
+# kokoro-server.sh — start / stop / status controller for the local Kokoro
+# TTS HTTP server. Invoked by Hammerspoon when the user hot-swaps backends,
+# so only the currently selected backend is consuming resources.
+#
+# Usage: kokoro-server.sh {start|stop|restart|status}
+#
+# Start is idempotent: no-op if a healthy server is already listening on :8880.
+# Stop kills the recorded PID (and any stragglers on :8880) and clears the
+# state file.
+
+set -euo pipefail
+
+STATE_DIR="$HOME/.claude/speechify"
+KOKORO_DIR="$STATE_DIR/kokoro"
+PID_FILE="$STATE_DIR/kokoro-server.pid"
+LOG_FILE="$STATE_DIR/kokoro-server.log"
+PYTHON="$KOKORO_DIR/venv/bin/python"
+SERVER_PY="$KOKORO_DIR/server.py"
+PORT="${KOKORO_PORT:-8880}"
+
+mkdir -p "$STATE_DIR"
+
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
+
+is_healthy() {
+  curl -fsS -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1
+}
+
+recorded_pid() {
+  [ -r "$PID_FILE" ] || return 1
+  local pid
+  pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && printf '%s' "$pid"
+}
+
+port_holders() {
+  # Print PIDs currently listening on our port (may be empty)
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null || true
+}
+
+cmd_status() {
+  local pid state
+  if pid=$(recorded_pid); then
+    if is_healthy; then state="running (healthy)"; else state="running (unhealthy)"; fi
+  else
+    pid=""
+    if is_healthy; then state="running (unmanaged)"; else state="stopped"; fi
+  fi
+  printf 'state=%s\npid=%s\nport=%s\n' "$state" "$pid" "$PORT"
+}
+
+cmd_start() {
+  if is_healthy; then
+    log "start: already healthy on :$PORT"
+    cmd_status
+    return 0
+  fi
+
+  if [ ! -x "$PYTHON" ] || [ ! -r "$SERVER_PY" ]; then
+    log "start: python or server.py missing ($PYTHON / $SERVER_PY)"
+    echo "kokoro not installed" >&2
+    return 1
+  fi
+
+  log "start: launching server"
+  nohup "$PYTHON" "$SERVER_PY" >> "$LOG_FILE" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$PID_FILE"
+
+  # Wait up to 8s for /health to succeed
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    if is_healthy; then
+      log "start: healthy after ${i}s (pid=$pid)"
+      cmd_status
+      return 0
+    fi
+    # If the process already died, bail early.
+    if ! kill -0 "$pid" 2>/dev/null; then
+      log "start: process exited during boot (pid=$pid) — see log"
+      rm -f "$PID_FILE"
+      return 1
+    fi
+  done
+
+  log "start: timed out waiting for health (pid=$pid)"
+  return 1
+}
+
+cmd_stop() {
+  local pid=""
+  pid=$(recorded_pid || true)
+  if [ -n "$pid" ]; then
+    log "stop: sending TERM to pid=$pid"
+    kill -TERM "$pid" 2>/dev/null || true
+    for i in 1 2 3 4 5; do
+      if ! kill -0 "$pid" 2>/dev/null; then break; fi
+      sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      log "stop: escalating to KILL pid=$pid"
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+  # Sweep any stragglers still holding the port
+  local stragglers
+  stragglers=$(port_holders)
+  if [ -n "$stragglers" ]; then
+    log "stop: killing port stragglers: $stragglers"
+    echo "$stragglers" | xargs -I{} kill -KILL {} 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+  log "stop: complete"
+  cmd_status
+}
+
+cmd_restart() {
+  cmd_stop || true
+  cmd_start
+}
+
+case "${1:-status}" in
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart ;;
+  status)  cmd_status ;;
+  *)       echo "usage: $0 {start|stop|restart|status}" >&2; exit 2 ;;
+esac

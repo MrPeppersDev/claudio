@@ -1,0 +1,42 @@
+#!/bin/bash
+# claudetop plugin — writes iterm_session_id -> transcript_path on each render.
+# Consumed by play-last.sh so the Speechify menu-bar / hotkey play the message
+# from the *focused* iTerm pane, not whichever Claude session was last active.
+#
+# Key format: iTerm sets ITERM_SESSION_ID like "w0t0p0:UUID". AppleScript's
+# `unique id of current session` may return just the UUID. We write both keys
+# so the lookup from Hammerspoon matches regardless of which form it has.
+#
+# Outputs nothing — keeps the statusline visually unchanged.
+
+set -eu
+
+JSON=$(cat)
+TRANSCRIPT=$(printf '%s' "$JSON" | jq -r '.transcript_path // empty' 2>/dev/null || true)
+[ -z "${TRANSCRIPT:-}" ] && exit 0
+
+SID="${ITERM_SESSION_ID:-}"
+[ -z "$SID" ] && exit 0
+
+MAP_DIR="$HOME/.claude/speechify/sessions"
+mkdir -p "$MAP_DIR"
+
+write_key() {
+  local key="$1"
+  # Sanitize for filesystem: replace colon/slash/space.
+  local safe
+  safe=$(printf '%s' "$key" | tr ':/ ' '___')
+  printf 'transcript_path=%s\nts=%s\n' "$TRANSCRIPT" "$(date +%s)" > "$MAP_DIR/$safe"
+}
+
+write_key "$SID"
+# Also write keyed by the part after the last colon (AppleScript unique-id form)
+UUID_PART="${SID##*:}"
+if [ "$UUID_PART" != "$SID" ]; then
+  write_key "$UUID_PART"
+fi
+
+# Garbage collect entries not touched in 2 days
+find "$MAP_DIR" -type f -mtime +2 -delete 2>/dev/null || true
+
+exit 0

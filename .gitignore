@@ -1,0 +1,24 @@
+# Runtime state
+state
+backend
+*.pid
+*.log
+
+# Session map scratch
+sessions/
+selection.txt
+
+# Cached audio output
+last.mp3
+last.wav
+cache/
+
+# Python venv (recreated by install.sh)
+kokoro/venv/
+
+# Downloaded model weights (fetched by kokoro/download-model.sh)
+kokoro/kokoro-v1.0.onnx
+kokoro/voices-v1.0.bin
+
+# macOS
+.DS_Store
