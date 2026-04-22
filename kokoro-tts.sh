@@ -6,7 +6,9 @@
 # starts lazily on the first F13 after a reboot.
 #
 # Env vars:
-#   KOKORO_VOICE       voice name (default: af_bella)
+#   KOKORO_VOICE       voice name, or a weighted blend (default: af_bella).
+#                      Blend syntax: "af_bella:70,am_michael:30" — weights
+#                      are normalized, so "1,1" is a 50/50 mix.
 #   KOKORO_SPEED       target effective speed (default: 2.0)
 #   KOKORO_SYNTH_CAP   max synth speed before afplay picks up the rest
 #                      (default: 1.5; see split-speed note below)

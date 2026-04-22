@@ -93,6 +93,8 @@ hs.hotkey.bind({}, "F13", function() claudio.toggle() end)
 ## Env vars
 
 - `KOKORO_VOICE` — default `af_bella`. See [VOICES.md][voices] for the full list.
+  Accepts a weighted blend too: `af_bella:70,am_michael:30`. Weights are
+  normalized — `1,1` is a 50/50 mix. Embeddings are averaged server-side.
 - `KOKORO_SPEED` — target effective speed. Default `2.0`.
 - `KOKORO_SYNTH_CAP` — split point between synth and afplay. Default `1.5`
   (synth at 1.5×, afplay covers the remaining multiplier). Lower values push

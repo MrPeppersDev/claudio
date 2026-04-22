@@ -40,6 +40,43 @@ VOICES = set(KOKORO.get_voices())
 print(f"[kokoro] loaded in {time.time()-t0:.2f}s ({len(VOICES)} voices)", flush=True)
 
 
+def resolve_voice(spec: str):
+    """
+    Parse a voice spec and return either a voice name (str) or a blended
+    embedding (np.ndarray). Blend syntax: "name1:weight1,name2:weight2".
+    Weights are normalized so they needn't sum to 1.
+
+    Examples:
+      "af_bella"                            -> "af_bella"           (str)
+      "af_bella:70,am_michael:30"           -> blended ndarray
+      "af_bella:1,am_michael:1,bf_emma:1"   -> equal 3-way blend
+
+    Raises ValueError on unknown voice or zero total weight.
+    """
+    if "," not in spec and ":" not in spec:
+        # Plain name — let KOKORO.create() validate by name.
+        return spec
+    entries = []
+    for part in spec.split(","):
+        if ":" in part:
+            name, raw_w = part.split(":", 1)
+            weight = float(raw_w.strip())
+        else:
+            name, weight = part, 1.0
+        name = name.strip()
+        if name not in VOICES:
+            raise ValueError(f"unknown voice {name!r}")
+        entries.append((name, weight))
+    total = sum(w for _, w in entries)
+    if total <= 0:
+        raise ValueError("blend weights must sum to a positive number")
+    blend = None
+    for name, w in entries:
+        contribution = KOKORO.get_voice_style(name) * (w / total)
+        blend = contribution if blend is None else blend + contribution
+    return blend.astype(np.float32)
+
+
 def samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
     pcm = np.clip(samples, -1.0, 1.0)
     pcm = (pcm * 32767.0).astype(np.int16)
@@ -85,15 +122,18 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         text = (payload.get("text") or "").strip()
-        voice = payload.get("voice") or "bm_george"
+        voice_spec = payload.get("voice") or "af_bella"
         speed = float(payload.get("speed") or 1.0)
         lang = payload.get("lang") or "en-gb"
 
         if not text:
             self._json(400, {"error": "text required"})
             return
-        if voice not in VOICES:
-            self._json(400, {"error": f"unknown voice {voice!r}"})
+
+        try:
+            voice = resolve_voice(voice_spec)
+        except ValueError as e:
+            self._json(400, {"error": str(e)})
             return
 
         t0 = time.time()
@@ -106,7 +146,7 @@ class Handler(BaseHTTPRequestHandler):
         wav = samples_to_wav(samples, sr)
         t2 = time.time()
         sys.stderr.write(
-            f"[kokoro] synth chars={len(text)} voice={voice} speed={speed} "
+            f"[kokoro] synth chars={len(text)} voice={voice_spec} speed={speed} "
             f"synth={t1-t0:.2f}s encode={t2-t1:.2f}s bytes={len(wav)}\n"
         )
 
