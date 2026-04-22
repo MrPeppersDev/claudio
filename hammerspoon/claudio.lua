@@ -120,7 +120,16 @@ local function captureSelection(cb)
   local prevCount = hs.pasteboard.changeCount()
   local prevContents = hs.pasteboard.getContents()
   hs.eventtap.keyStroke({ "cmd" }, "c", 0)
-  hs.timer.doAfter(0.18, function()
+
+  -- Poll the pasteboard for the copy to land. Cmd+C dispatch is async and
+  -- per-app latency varies: AX-capable text fields respond in ~20-50 ms,
+  -- iTerm up to ~150 ms under load. A fixed wait either gives up too early
+  -- on a slow app or makes F13 feel laggy on a fast one. Polling every
+  -- ~20 ms lets us return the moment changeCount advances.
+  local MAX_WAIT_MS = 500
+  local POLL_MS = 20
+
+  local function finish()
     local newCount = hs.pasteboard.changeCount()
     local newContents = hs.pasteboard.getContents()
 
@@ -146,7 +155,22 @@ local function captureSelection(cb)
 
     lastSeenChangeCount = newCount
     cb(nil)
-  end)
+  end
+
+  local elapsed = 0
+  local function poll()
+    if hs.pasteboard.changeCount() > prevCount then
+      finish()
+      return
+    end
+    elapsed = elapsed + POLL_MS
+    if elapsed >= MAX_WAIT_MS then
+      finish()
+      return
+    end
+    hs.timer.doAfter(POLL_MS / 1000, poll)
+  end
+  hs.timer.doAfter(POLL_MS / 1000, poll)
 end
 
 local function focusedItermSessionId()
