@@ -40,10 +40,14 @@ before=$({ find "$cache_dir" -name '*.wav' 2>/dev/null || true; } | wc -l | tr -
 
 total=0
 while IFS= read -r line || [ -n "$line" ]; do
-  phrase="${line%%#*}"                              # drop inline comments
-  phrase="${phrase#"${phrase%%[![:space:]]*}"}"     # ltrim
+  # Trim first so leading-whitespace `#` still counts as a comment.
+  phrase="${line#"${line%%[![:space:]]*}"}"         # ltrim
   phrase="${phrase%"${phrase##*[![:space:]]}"}"     # rtrim
-  [ -z "$phrase" ] && continue
+  # Treat `#` as a comment ONLY when it starts the line — otherwise a
+  # perfectly valid phrase like `That's my #1 guess.` gets truncated.
+  case "$phrase" in
+    ''|'#'*) continue ;;
+  esac
   total=$((total + 1))
   # Run through preprocess + kokoro-tts with playback off. We don't care
   # about stdout; we only want the cache/<hash>.wav side effect.
