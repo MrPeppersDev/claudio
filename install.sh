@@ -1,26 +1,22 @@
 #!/bin/bash
 # install.sh — bootstrap Claudio (Kokoro TTS for Claude Code) on a new machine.
 #
-# Assumes this repo is checked out at ~/.claude/claudio. If you cloned it
-# elsewhere, move or symlink it there before running.
+# The repo can be cloned anywhere; this script derives its location from its
+# own path. State (cache, logs, pid files) defaults to ~/.claude/claudio and
+# can be moved by exporting CLAUDIO_STATE_DIR before running the scripts.
 #
 # What this does:
-#   1. Verifies ~/.claude/claudio is the repo path (scripts hardcode it).
-#   2. Symlinks hammerspoon/claudio.lua  → ~/.hammerspoon/claudio.lua
+#   1. Symlinks hammerspoon/claudio.lua  → ~/.hammerspoon/claudio.lua
 #      and  claudetop.d/claudio-session-map → ~/.claude/claudetop.d/…
-#   3. Creates a Python >= 3.10 venv and installs kokoro dependencies.
+#   2. Creates a Python >= 3.10 venv and installs kokoro dependencies.
 #      (Prefers 3.12. Override with CLAUDIO_PYTHON=/path/to/python if needed.)
-#   4. Downloads the Kokoro model weights + voices (one-time, ~340 MB).
-#   5. Warms the cache with common phrases so the first F13 isn't cold.
-#   6. Prints next steps (Hammerspoon reload).
+#   3. Downloads the Kokoro model weights + voices (one-time, ~340 MB).
+#   4. Warms the cache with common phrases so the first F13 isn't cold.
+#   5. Prints next steps (Hammerspoon reload).
 
 set -euo pipefail
 
-REPO="$HOME/.claude/claudio"
-if [ ! -d "$REPO/.git" ]; then
-  echo "ERROR: expected repo at $REPO — got: $(ls -ld "$REPO" 2>&1)"
-  exit 1
-fi
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- 1. Symlinks for integrations ---
 mkdir -p "$HOME/.hammerspoon" "$HOME/.claude/claudetop.d"

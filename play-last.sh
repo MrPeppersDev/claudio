@@ -17,15 +17,23 @@
 
 set -euo pipefail
 
-STATE_DIR="$HOME/.claude/claudio"
+# SCRIPT_DIR is where *this* script lives — the Claudio repo checkout. Used
+# to find sibling scripts (preprocess.py, kokoro-tts.sh, kokoro-server.sh)
+# so the repo can live anywhere, not just ~/.claude/claudio.
+# STATE_DIR is where runtime files (lock, state, log, cache, sessions) live.
+# It defaults to ~/.claude/claudio for backward compatibility but is
+# user-overridable via CLAUDIO_STATE_DIR so the repo can be checked out
+# elsewhere (e.g. a test worktree) without state leaking into it.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="${CLAUDIO_STATE_DIR:-$HOME/.claude/claudio}"
 LOCK_FILE="$STATE_DIR/job.pid"
 STATE_FILE="$STATE_DIR/state"
 LOG_FILE="$STATE_DIR/play.log"
 SESSION_MAP_DIR="$STATE_DIR/sessions"
 PROJECTS_DIR="$HOME/.claude/projects"
-PREPROCESS="$STATE_DIR/preprocess.py"
-TTS_SCRIPT="$STATE_DIR/kokoro-tts.sh"
-SERVER_SCRIPT="$STATE_DIR/kokoro-server.sh"
+PREPROCESS="$SCRIPT_DIR/preprocess.py"
+TTS_SCRIPT="$SCRIPT_DIR/kokoro-tts.sh"
+SERVER_SCRIPT="$SCRIPT_DIR/kokoro-server.sh"
 
 # Ensure Kokoro server is up. Idempotent: ~0.05s when healthy, up to ~8s on
 # cold start. Called only when we're about to synth (not on toggle-stop).

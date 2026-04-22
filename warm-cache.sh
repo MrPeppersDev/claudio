@@ -16,11 +16,14 @@
 #   - could be hooked into the menu bar ("Warm cache") — not wired yet
 set -euo pipefail
 
-CLAUDIO_DIR="$HOME/.claude/claudio"
-PHRASES="${1:-$CLAUDIO_DIR/common-phrases.txt}"
-PREPROCESS="$CLAUDIO_DIR/preprocess.py"
-TTS_SCRIPT="$CLAUDIO_DIR/kokoro-tts.sh"
-SERVER_SCRIPT="$CLAUDIO_DIR/kokoro-server.sh"
+# Script location (repo) is separate from the state directory (cache). The
+# phrase list lives with the repo, cache lives in state. Either can be moved.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="${CLAUDIO_STATE_DIR:-$HOME/.claude/claudio}"
+PHRASES="${1:-$SCRIPT_DIR/common-phrases.txt}"
+PREPROCESS="$SCRIPT_DIR/preprocess.py"
+TTS_SCRIPT="$SCRIPT_DIR/kokoro-tts.sh"
+SERVER_SCRIPT="$SCRIPT_DIR/kokoro-server.sh"
 
 if [ ! -f "$PHRASES" ]; then
   echo "warm-cache: no phrase file at $PHRASES" >&2
@@ -31,7 +34,7 @@ fi
 "$SERVER_SCRIPT" start >/dev/null
 
 voice="${KOKORO_VOICE:-af_bella}"
-cache_dir="${KOKORO_CACHE_DIR:-$CLAUDIO_DIR/cache}"
+cache_dir="${KOKORO_CACHE_DIR:-$STATE_DIR/cache}"
 mkdir -p "$cache_dir"
 before=$({ find "$cache_dir" -name '*.wav' 2>/dev/null || true; } | wc -l | tr -d ' ')
 
