@@ -96,8 +96,12 @@ if [ -n "$TEXT_FILE" ]; then
     log "ERROR: text file is empty: $TEXT_FILE"
     exit 1
   fi
+  # PREVIEW goes to the state file (used by the menu bar) but NOT to the
+  # persistent log — user content can include tokens, PII, or chat
+  # fragments that shouldn't accumulate on disk indefinitely. The log
+  # line records only the length.
   PREVIEW=$(printf '%s' "$TEXT" | head -1 | cut -c1-80)
-  log "playing ${#TEXT} chars from selection — ${PREVIEW}"
+  log "playing ${#TEXT} chars from selection"
   write_state synth "$PREVIEW"
   ensure_server
   printf '%s' "$TEXT" | /usr/bin/python3 "$PREPROCESS" | "$TTS_SCRIPT"
@@ -159,8 +163,11 @@ if [ -z "${TEXT:-}" ] || [ "$TEXT" = "null" ]; then
 fi
 
 # Preview = first 80 chars of first line, for the menu bar dropdown.
+# Kept out of the persistent log for the same reason as the --text-file
+# branch above: assistant text can contain secrets, PII, or chat fragments
+# we don't want accumulating on disk. The log records only the length.
 PREVIEW=$(printf '%s' "$TEXT" | head -1 | cut -c1-80)
-log "playing ${#TEXT} chars — ${PREVIEW}"
+log "playing ${#TEXT} chars"
 
 write_state synth "$PREVIEW"
 ensure_server
