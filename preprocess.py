@@ -92,8 +92,9 @@ _MD_TRANSFORMS = [
     # Collapse adjacent sentinels (two code blocks with only whitespace
     # between them) to one. kokoro-tts.sh would play them as one earcon
     # anyway — but keeping the input clean means per-segment synth logs
-    # stay readable.
-    (re.compile(r"\x1e(\s*\x1e)+"), EARCON_SENTINEL),
+    # stay readable. Note: \s in Python matches \x1e/\x1d, so we use an
+    # explicit whitespace class to avoid eating other sentinels.
+    (re.compile(r"\x1e([ \t\n\r\f\v]*\x1e)+"), EARCON_SENTINEL),
 ]
 
 
@@ -137,11 +138,37 @@ def apply_pronunciations(text: str, rules: list[tuple[str, str]]) -> str:
     return text
 
 
+# --- Sentence boundaries -------------------------------------------------
+
+# ASCII 0x1D (group separator). kokoro-tts.sh splits on this to cache each
+# sentence separately under sha256(voice|speed|lang|sentence). Cache hits
+# across messages are common for stock phrasing ("Let me check that.",
+# "Here's what I found.").
+SENTENCE_SENTINEL = "\x1d"
+
+# Sentence boundary: terminal punct + whitespace + uppercase-letter/digit,
+# OR a blank line (paragraph break). Uppercase lookahead keeps "e.g. foo"
+# from splitting — at the cost of missing "Dr. Smith" style splits, which
+# hurts nothing beyond cache granularity. Explicit whitespace class (not
+# \s): Python's \s matches our sentinel bytes \x1e and \x1d, which would
+# otherwise let the match step over a code-block earcon boundary.
+_WS = r"[ \t\n\r\f\v]"
+_SENTENCE_BOUNDARY = re.compile(rf"(?<=[.!?]){_WS}+(?=[A-Z0-9])|\n{{2,}}")
+
+
+def split_sentences(text: str) -> str:
+    text = _SENTENCE_BOUNDARY.sub(SENTENCE_SENTINEL, text)
+    # Collapse runs of sentence sentinels with whitespace between them.
+    text = re.sub(rf"\x1d({_WS}*\x1d)+", SENTENCE_SENTINEL, text)
+    return text
+
+
 def main() -> int:
     text = sys.stdin.read()
     text = strip_markdown(text)
     rules = load_pronunciations(HERE / "pronunciations.txt")
     text = apply_pronunciations(text, rules)
+    text = split_sentences(text)
     sys.stdout.write(text)
     return 0
 

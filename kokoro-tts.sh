@@ -16,6 +16,8 @@
 #   KOKORO_LANG        phoneme lang (auto: bm_/bf_ → en-gb, else en-us)
 #   KOKORO_EARCON      WAV/AIFF played at structural boundaries
 #                      (default: /System/Library/Sounds/Pop.aiff)
+#   KOKORO_CACHE_DIR   per-sentence WAV cache (default: ~/.claude/claudio/cache)
+#   KOKORO_CACHE_MAX_MB cache size cap, mtime-LRU pruned (default: 200)
 #
 # Owned by play-last.sh via job.pid; writes state={synth,play} to the state
 # file; afplay runs in foreground so the parent's pkill -P tears everything
@@ -43,8 +45,39 @@ LOG_FILE="$STATE_DIR/tts.log"
 mkdir -p "$STATE_DIR"
 
 EARCON="${KOKORO_EARCON:-/System/Library/Sounds/Pop.aiff}"
+CACHE_DIR="${KOKORO_CACHE_DIR:-$STATE_DIR/cache}"
+CACHE_MAX_MB="${KOKORO_CACHE_MAX_MB:-200}"
+mkdir -p "$CACHE_DIR"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
+
+# Hash key for a sentence: voice|synth_speed|lang|text. Any change in those
+# produces different audio, so they all go into the key. Null bytes between
+# fields prevent "ab|c" colliding with "a|bc".
+sentence_hash() {
+  printf '%s\0%s\0%s\0%s' "$VOICE" "$SYNTH_SPEED" "$LANG_CODE" "$1" \
+    | shasum -a 256 | awk '{print $1}'
+}
+
+# Evict cache entries by mtime (oldest first) until total size is under cap.
+# macOS stat: -f '%m %z %N' → mtime size path. Called once per invocation;
+# usually a fast no-op because the cache grows slowly.
+prune_cache() {
+  local max_bytes=$((CACHE_MAX_MB * 1024 * 1024))
+  local total
+  total=$(find "$CACHE_DIR" -name '*.wav' -type f -print0 2>/dev/null \
+    | xargs -0 stat -f '%z' 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  [ "$total" -le "$max_bytes" ] && return
+  local freed_before="$total"
+  while IFS=' ' read -r mtime size path; do
+    [ "$total" -le "$max_bytes" ] && break
+    [ -z "$path" ] && continue
+    rm -f "$path"
+    total=$((total - size))
+  done < <(find "$CACHE_DIR" -name '*.wav' -type f -print0 \
+    | xargs -0 stat -f '%m %z %N' 2>/dev/null | sort -n)
+  log "cache prune: ${freed_before} -> ${total} bytes (cap ${max_bytes})"
+}
 
 current_preview() {
   grep -E '^preview=' "$STATE_FILE" 2>/dev/null | head -1 | sed 's/^preview=//'
@@ -73,61 +106,94 @@ SYNTH_CAP="${KOKORO_SYNTH_CAP:-1.5}"
 SYNTH_SPEED=$(awk -v s="$SPEED" -v c="$SYNTH_CAP" 'BEGIN{print (s>c?c:s)}')
 PLAYBACK_RATE=$(awk -v s="$SPEED" -v ss="$SYNTH_SPEED" 'BEGIN{print s/ss}')
 
-# Split on preprocess.py's earcon sentinel (ASCII 0x1E) into per-segment
-# text files. Most messages have no sentinel — the loop degenerates to one
-# pass and behaves exactly like the previous single-shot path.
-SEG_DIR=$(mktemp -d "$STATE_DIR/segments.XXXXXX")
-trap 'rm -rf "$SEG_DIR"' EXIT
+# Two-level split:
+#   outer \x1e = earcon sentinel (from preprocess.py; ran over code blocks)
+#   inner \x1d = sentence sentinel (cache granularity)
+# A single-paragraph message with no code produces one segment with N
+# sentences; a short reply with no code and one sentence produces a single
+# segment/single sentence and behaves like the original single-shot path.
+WORK_DIR=$(mktemp -d "$STATE_DIR/segments.XXXXXX")
+PLAYLIST="$WORK_DIR/playlist.txt"
+: > "$PLAYLIST"
+trap 'rm -rf "$WORK_DIR"' EXIT
 
-printf '%s' "$TEXT" | awk -v RS=$'\x1e' -v dir="$SEG_DIR" '
-  { out = sprintf("%s/%04d.txt", dir, NR); printf "%s", $0 > out; close(out) }
+printf '%s' "$TEXT" | awk -v RS=$'\x1e' -v dir="$WORK_DIR" '
+  { out = sprintf("%s/seg-%04d.txt", dir, NR); printf "%s", $0 > out; close(out) }
 '
 
-SEG_COUNT=$(find "$SEG_DIR" -name '*.txt' | wc -l | tr -d ' ')
+SEG_COUNT=$(find "$WORK_DIR" -maxdepth 1 -name 'seg-*.txt' | wc -l | tr -d ' ')
 log "kokoro synthesize: voice=$VOICE target=${SPEED}x synth=${SYNTH_SPEED}x playback=${PLAYBACK_RATE}x lang=$LANG_CODE chars=${#TEXT} segments=$SEG_COUNT"
 write_state synth
+prune_cache
 
-for seg_txt in "$SEG_DIR"/*.txt; do
-  seg_text=$(cat "$seg_txt")
-  # Skip whitespace-only segments: they come from sentinels at edges or
-  # with only blank lines between adjacent elisions. The earcon boundary
-  # is implicit from the missing .wav on the playback pass.
-  if [ -z "${seg_text//[[:space:]]/}" ]; then
-    continue
-  fi
-  seg_wav="${seg_txt%.txt}.wav"
-  REQ_BODY=$(jq -cn \
-    --arg text "$seg_text" \
-    --arg voice "$VOICE" \
-    --arg lang "$LANG_CODE" \
-    --argjson speed "$SYNTH_SPEED" \
-    '{text: $text, voice: $voice, speed: $speed, lang: $lang}')
-  HTTP_CODE=$(curl -sS -o "$seg_wav" -w '%{http_code}' \
-    --max-time 120 \
-    -X POST "$URL/speak" \
-    -H "Content-Type: application/json" \
-    -d "$REQ_BODY") || {
-    log "ERROR: curl failed — is kokoro-server running at $URL?"
-    exit 4
-  }
-  if [ "$HTTP_CODE" != "200" ]; then
-    ERR=$(cat "$seg_wav" 2>/dev/null || true)
-    log "HTTP $HTTP_CODE: $ERR"
-    exit 4
-  fi
+hits=0
+misses=0
+first_seg=1
+for seg_txt in "$WORK_DIR"/seg-*.txt; do
+  seg_id=$(basename "$seg_txt" .txt)
+  sent_dir="$WORK_DIR/$seg_id.sent"
+  mkdir -p "$sent_dir"
+  awk -v RS=$'\x1d' -v dir="$sent_dir" '
+    { out = sprintf("%s/%04d.txt", dir, NR); printf "%s", $0 > out; close(out) }
+  ' "$seg_txt"
+
+  seg_has_audio=0
+  for sent_txt in "$sent_dir"/*.txt; do
+    sent_text=$(cat "$sent_txt")
+    # Skip whitespace-only sentences — same rationale as empty segments.
+    if [ -z "${sent_text//[[:space:]]/}" ]; then
+      continue
+    fi
+    hash=$(sentence_hash "$sent_text")
+    cache_wav="$CACHE_DIR/$hash.wav"
+    if [ -f "$cache_wav" ]; then
+      touch "$cache_wav"
+      hits=$((hits + 1))
+    else
+      REQ_BODY=$(jq -cn \
+        --arg text "$sent_text" \
+        --arg voice "$VOICE" \
+        --arg lang "$LANG_CODE" \
+        --argjson speed "$SYNTH_SPEED" \
+        '{text: $text, voice: $voice, speed: $speed, lang: $lang}')
+      HTTP_CODE=$(curl -sS -o "$cache_wav.tmp" -w '%{http_code}' \
+        --max-time 120 \
+        -X POST "$URL/speak" \
+        -H "Content-Type: application/json" \
+        -d "$REQ_BODY") || {
+        log "ERROR: curl failed — is kokoro-server running at $URL?"
+        rm -f "$cache_wav.tmp"
+        exit 4
+      }
+      if [ "$HTTP_CODE" != "200" ]; then
+        ERR=$(cat "$cache_wav.tmp" 2>/dev/null || true)
+        log "HTTP $HTTP_CODE: $ERR"
+        rm -f "$cache_wav.tmp"
+        exit 4
+      fi
+      mv "$cache_wav.tmp" "$cache_wav"
+      misses=$((misses + 1))
+    fi
+
+    if [ "$seg_has_audio" -eq 0 ] && [ "$first_seg" -eq 0 ]; then
+      printf 'EARCON\n' >> "$PLAYLIST"
+    fi
+    printf '%s\n' "$cache_wav" >> "$PLAYLIST"
+    seg_has_audio=1
+  done
+  [ "$seg_has_audio" -eq 1 ] && first_seg=0
 done
 
+log "cache: hits=$hits misses=$misses"
 write_state play
+
 have_earcon=0
 [ -r "$EARCON" ] && have_earcon=1
-first=1
-for seg_txt in "$SEG_DIR"/*.txt; do
-  seg_wav="${seg_txt%.txt}.wav"
-  [ -f "$seg_wav" ] || continue
-  if [ "$first" -eq 0 ] && [ "$have_earcon" -eq 1 ]; then
-    afplay "$EARCON"
+while IFS= read -r line; do
+  if [ "$line" = "EARCON" ]; then
+    [ "$have_earcon" -eq 1 ] && afplay "$EARCON"
+  else
+    afplay -q 1 -r "$PLAYBACK_RATE" "$line"
   fi
-  afplay -q 1 -r "$PLAYBACK_RATE" "$seg_wav"
-  first=0
-done
+done < "$PLAYLIST"
 log "done"
