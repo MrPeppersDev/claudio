@@ -119,7 +119,11 @@ local function captureSelection(cb)
     local newContents = hs.pasteboard.getContents()
 
     if newCount > prevCount and newContents and #newContents > 0 then
-      if prevContents ~= nil then hs.pasteboard.setContents(prevContents) end
+      -- Restore pasteboard. When the pasteboard was empty before we ran
+      -- Cmd+C, prevContents is nil — setContents(nil) is a no-op, so the
+      -- captured selection would linger until the user's next copy.
+      -- setContents("") overwrites with empty and clears the residue.
+      hs.pasteboard.setContents(prevContents or "")
       cb(newContents)
       return
     end
@@ -168,7 +172,17 @@ function M.toggle()
 
   captureSelection(function(selection)
     if selection then
-      local tmp = STATE_DIR .. "/selection.txt"
+      -- mktemp creates the file mode-0600 on macOS, so the selection —
+      -- which may contain tokens, private chat text, or PII — isn't
+      -- world-readable in ~/.claude/claudio/. play-last.sh unlinks the
+      -- file immediately after reading it, so the window of exposure is
+      -- only the synth lifetime rather than until-next-F13.
+      local tmp = hs.execute("mktemp '" .. STATE_DIR .. "/selection.XXXXXX'", true)
+      tmp = tmp and tmp:gsub("%s+$", "") or nil
+      if not tmp or tmp == "" then
+        hs.alert.show("Claudio: mktemp failed")
+        return
+      end
       local f = io.open(tmp, "w")
       if f then f:write(selection); f:close() end
       runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
