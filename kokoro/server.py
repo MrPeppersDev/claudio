@@ -19,6 +19,7 @@ import io
 import json
 import math
 import os
+import re
 import sys
 import time
 import wave
@@ -34,6 +35,14 @@ VOICES_PATH = os.path.join(HERE, "voices-v1.0.bin")
 
 HOST = os.environ.get("KOKORO_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KOKORO_PORT", "8880"))
+
+# Kokoro-82M's hard per-call cap is 510 phonemes — the voice style array has
+# shape (510, ...), and _create_audio indexes voice[len(tokens)] after
+# truncating phonemes to 510 chars, so a 510-token call hits IndexError.
+# Upstream _split_phonemes only splits between punctuated parts, so a single
+# long unpunctuated span still blows up. We phonemize once, chunk to ≤500
+# (leaves a 9-phoneme margin), and concatenate the per-chunk audio ourselves.
+MAX_PHONEMES_PER_CALL = 500
 
 print(f"[kokoro] loading model from {MODEL_PATH}", flush=True)
 t0 = time.time()
@@ -77,6 +86,110 @@ def resolve_voice(spec: str):
         contribution = KOKORO.get_voice_style(name) * (w / total)
         blend = contribution if blend is None else blend + contribution
     return blend.astype(np.float32)
+
+
+def chunk_phonemes(phonemes: str, limit: int = MAX_PHONEMES_PER_CALL) -> list[str]:
+    """
+    Split a phoneme string into pieces each of length <= limit. Produces the
+    fewest pieces possible given the length cap — every concat point adds an
+    audible seam, so packing is worth the complexity.
+
+    Strategy: split on the *strongest* boundary (sentence punct `.!?`), then
+    greedy-pack the pieces back together up to the limit. For any single
+    piece that still exceeds the limit, fall through to clause punct
+    (`,;:—–`), then whitespace, then hard-cut.
+    """
+    if len(phonemes) <= limit:
+        return [phonemes]
+
+    sentence_pieces = _split_keeping_delims(phonemes, r"[.!?]")
+    # If a piece is already over the limit (e.g. a 2000-char bulleted list
+    # with no terminal punct), recurse into clause-level splitting first so
+    # the greedy packer sees chunks it can actually fit.
+    expanded: list[str] = []
+    for p in sentence_pieces:
+        if len(p) <= limit:
+            expanded.append(p)
+        else:
+            expanded.extend(_chunk_on_clause(p, limit))
+    return _greedy_pack(expanded, limit)
+
+
+def _split_keeping_delims(text: str, delim_class: str) -> list[str]:
+    """
+    Split `text` such that each piece ends with its terminating delimiter
+    (if one was present). e.g. "abc. def! ghi" + r"[.!?]" →
+    ["abc.", " def!", " ghi"].
+    """
+    pattern = re.compile(rf"([^{delim_class[1:-1]}]*{delim_class})")
+    pieces = pattern.findall(text)
+    consumed = sum(len(p) for p in pieces)
+    if consumed < len(text):
+        pieces.append(text[consumed:])
+    return [p for p in pieces if p]
+
+
+def _chunk_on_clause(piece: str, limit: int) -> list[str]:
+    """Second-tier split: `,;:—–` clause boundaries, then whitespace."""
+    clause_pieces = _split_keeping_delims(piece, r"[,;:—–]")
+    out: list[str] = []
+    for cp in clause_pieces:
+        if len(cp) <= limit:
+            out.append(cp)
+        else:
+            out.extend(_chunk_on_whitespace(cp, limit))
+    return out
+
+
+def _chunk_on_whitespace(piece: str, limit: int) -> list[str]:
+    """Third-tier: greedy-pack words. Hard-cut only if a single word > limit."""
+    words = piece.split()
+    if not words:
+        return [piece]
+    out: list[str] = []
+    current = ""
+    for w in words:
+        if len(w) > limit:
+            # Rare for phoneme strings, but possible for e.g. URLs that got
+            # phonemized char-by-char. Flush and hard-cut the word.
+            if current:
+                out.append(current)
+                current = ""
+            for i in range(0, len(w), limit):
+                out.append(w[i:i + limit])
+            continue
+        candidate = (current + " " + w) if current else w
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            out.append(current)
+            current = w
+    if current:
+        out.append(current)
+    return out
+
+
+def _greedy_pack(pieces: list[str], limit: int) -> list[str]:
+    """
+    Concatenate `pieces` in order into chunks whose length never exceeds
+    `limit`. Pieces are kept atomic — a piece that already fits the limit is
+    never sliced further by the packer. Joining uses no separator; pieces
+    are expected to retain their own leading/trailing whitespace.
+    """
+    out: list[str] = []
+    current = ""
+    for p in pieces:
+        if not p:
+            continue
+        if len(current) + len(p) <= limit:
+            current += p
+        else:
+            if current:
+                out.append(current.strip())
+            current = p
+    if current:
+        out.append(current.strip())
+    return [c for c in out if c]
 
 
 def peaking_eq(samples: np.ndarray, fs: int, f0: float, gain_db: float, q: float) -> np.ndarray:
@@ -175,7 +288,20 @@ class Handler(BaseHTTPRequestHandler):
 
         t0 = time.time()
         try:
-            samples, sr = KOKORO.create(text, voice=voice, speed=speed, lang=lang)
+            # Phonemize once, then chunk into ≤MAX_PHONEMES_PER_CALL pieces
+            # so we never trip Kokoro-82M's 510-phoneme IndexError on long
+            # unpunctuated spans. Short inputs → one chunk → single create()
+            # call, identical to the old path.
+            phonemes = KOKORO.tokenizer.phonemize(text, lang)
+            chunks = chunk_phonemes(phonemes)
+            parts = []
+            for chunk in chunks:
+                part, sr = KOKORO.create(
+                    chunk, voice=voice, speed=speed, lang=lang,
+                    is_phonemes=True,
+                )
+                parts.append(part)
+            samples = parts[0] if len(parts) == 1 else np.concatenate(parts)
         except Exception as e:
             self._json(500, {"error": f"synth failed: {e}"})
             return
@@ -185,7 +311,8 @@ class Handler(BaseHTTPRequestHandler):
         wav = samples_to_wav(samples, sr)
         t3 = time.time()
         sys.stderr.write(
-            f"[kokoro] synth chars={len(text)} voice={voice_spec} speed={speed} "
+            f"[kokoro] synth chars={len(text)} phonemes={len(phonemes)} "
+            f"chunks={len(chunks)} voice={voice_spec} speed={speed} "
             f"eq={eq_gain_db}dB@{eq_freq}Hz synth={t1-t0:.2f}s "
             f"eq_time={t2-t1:.3f}s encode={t3-t2:.2f}s bytes={len(wav)}\n"
         )
