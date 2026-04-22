@@ -1,6 +1,5 @@
 # Runtime state
 state
-backend
 *.pid
 *.log
 

@@ -1,21 +1,21 @@
 #!/bin/bash
 # kokoro-tts.sh — local Kokoro-82M TTS via our own Python HTTP server.
 #
-# Drop-in replacement for speechify-tts.sh. Reads text on stdin, synthesizes
-# locally (no external network), plays via afplay.
-#
-# The server is managed by kokoro-server.sh (start / stop). Hammerspoon
-# starts/stops it automatically when the backend is hot-swapped in the menu.
+# Reads text on stdin, synthesizes locally (no external network), plays via
+# afplay. The server is managed by kokoro-server.sh, which play-last.sh
+# starts lazily on the first F13 after a reboot.
 #
 # Env vars:
-#   KOKORO_VOICE   voice name (default: bm_george — British male, matches Speechify)
-#   KOKORO_SPEED   multiplier (default: 1.3 — gentler than Speechify's 2.5x)
-#   KOKORO_URL     server base URL (default: http://127.0.0.1:8880)
-#   KOKORO_LANG    phoneme lang (default: en-gb; use en-us for American voices)
+#   KOKORO_VOICE       voice name (default: af_bella)
+#   KOKORO_SPEED       target effective speed (default: 2.0)
+#   KOKORO_SYNTH_CAP   max synth speed before afplay picks up the rest
+#                      (default: 1.5; see split-speed note below)
+#   KOKORO_URL         server base URL (default: http://127.0.0.1:8880)
+#   KOKORO_LANG        phoneme lang (auto: bm_/bf_ → en-gb, else en-us)
 #
-# Same contract as speechify-tts.sh: owned by play-last.sh via job.pid,
-# writes state={synth,play} to the state file, afplay runs in foreground so
-# the parent's pkill -P tears everything down on stop.
+# Owned by play-last.sh via job.pid; writes state={synth,play} to the state
+# file; afplay runs in foreground so the parent's pkill -P tears everything
+# down on stop.
 
 set -euo pipefail
 

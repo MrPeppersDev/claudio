@@ -1,0 +1,85 @@
+# Pronunciation dictionary — applied before TTS synthesis.
+#
+# Format:  FROM|TO     (one per line; # starts a comment)
+# Matching: whole-word, case-sensitive, word-boundary respecting.
+# Order:   longer/more-specific rules should come first (e.g. "APIs" before "API").
+#
+# Tip: when you hear a mispronunciation, append a line to this file.
+# Changes take effect on the next invocation — no reload needed.
+
+# --- Acronyms (plural forms first) ---
+APIs|ay pee eyes
+API|ay pee eye
+URLs|you are ells
+URL|you are ell
+CLIs|see ell eyes
+CLI|see ell eye
+UIs|you eyes
+UI|you eye
+IDs|eye dees
+SDKs|ess dee kays
+SDK|ess dee kay
+IDEs|eye dee eez
+IDE|eye dee ee
+LLMs|ell ell ems
+LLM|ell ell em
+GPUs|gee pee yous
+GPU|gee pee you
+CPUs|see pee yous
+CPU|see pee you
+JWTs|jay double yoo tees
+JWT|jay double yoo tee
+CSS|see ess ess
+HTML|aitch tee em ell
+JSON|jay son
+XML|ex em ell
+SQL|sequel
+YAML|yam-ul
+HTTPS|aitch tee tee pee ess
+HTTP|aitch tee tee pee
+TCP|tee see pee
+UDP|you dee pee
+DNS|dee en ess
+SSH|ess ess aitch
+SSL|ess ess ell
+TLS|tee ell ess
+CORS|cors
+AWS|ay double yoo ess
+GCP|gee see pee
+OAuth|oh auth
+gRPC|gee are pee see
+GPT|gee pee tee
+MCP|em see pee
+PR|pee are
+PRs|pee ares
+CI|see eye
+CD|see dee
+
+# --- Tools & commands ---
+kubectl|kube control
+nginx|engine ex
+zsh|zee shell
+regex|reh-jex
+async|ay-sink
+await|a-wait
+stderr|standard err
+stdout|standard out
+stdin|standard in
+localhost|local-host
+
+# --- Platforms / proper nouns ---
+macOS|mac oh ess
+iOS|eye oh ess
+GitHub|git hub
+GitLab|git lab
+PostgreSQL|postgres
+Postgres|postgres
+Redis|red iss
+Kubernetes|koo ber net eez
+Docker|docker
+
+# --- Abbreviations spelled in-sentence ---
+e.g.|for example,
+i.e.|that is,
+etc.|et cetera
+vs.|versus

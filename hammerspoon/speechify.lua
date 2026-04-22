@@ -1,28 +1,20 @@
--- speechify.lua — menu bar dropdown for Speechify / Kokoro TTS.
+-- speechify.lua — menu bar dropdown for Kokoro TTS.
 --
--- State source: ~/.claude/speechify/state (written by play-last.sh / *-tts.sh).
+-- State source: ~/.claude/speechify/state (written by play-last.sh / kokoro-tts.sh).
 --   state=<idle|synth|play>
 --   preview=<first 80 chars of the message being read>
 --   ts=<unix seconds>
 --
--- Backend: ~/.claude/speechify/backend (contains "speechify" or "kokoro").
---   Missing file = default "speechify". Changed via the dropdown menu.
+-- Icon: ▸ idle, ⟳ synth, ▶ play.
 --
--- Icon: ▸ idle, ⟳ synth, ▶ play. Suffix shows backend: "▸·s" (speechify)
--- or "▸·k" (kokoro) so you know at a glance which one F13 will hit.
---
--- Menu: Play/Stop toggle + backend radio + live status. Selecting a backend
--- stops any in-flight job AND starts/stops the Kokoro server so only the
--- active backend is consuming resources.
---
--- F13 still triggers the same toggle as the top menu item.
+-- Menu: Play/Stop toggle, manual Stop server (to free ~600 MB RAM when idle),
+-- plus live status. F13 triggers the same toggle as the top menu item.
 
 local M = {}
 
 local HOME = os.getenv("HOME")
 local STATE_DIR = HOME .. "/.claude/speechify"
 local STATE_FILE = STATE_DIR .. "/state"
-local BACKEND_FILE = STATE_DIR .. "/backend"
 local PLAY_SCRIPT = STATE_DIR .. "/play-last.sh"
 local SERVER_SCRIPT = STATE_DIR .. "/kokoro-server.sh"
 
@@ -35,7 +27,7 @@ local watcher = nil
 local lastSeenChangeCount = nil
 
 -- ============================================================
--- State / backend file helpers
+-- State helpers
 -- ============================================================
 
 local function readState()
@@ -51,23 +43,6 @@ local function readState()
   end
   f:close()
   return s
-end
-
-local function readBackend()
-  local f = io.open(BACKEND_FILE, "r")
-  if not f then return "speechify" end
-  local v = (f:read("*a") or ""):gsub("%s+", "")
-  f:close()
-  if v == "kokoro" or v == "speechify" then return v end
-  return "speechify"
-end
-
-local function writeBackend(name)
-  local f = io.open(BACKEND_FILE, "w")
-  if not f then return false end
-  f:write(name)
-  f:close()
-  return true
 end
 
 -- ============================================================
@@ -92,24 +67,8 @@ local function kokoroServerRunning()
   return out ~= nil and out:find("state=running") ~= nil
 end
 
--- Start/stop run synchronously (via hs.execute) so menu-driven state changes
--- settle before the user can trigger F13. Each command is ~1s; Hammerspoon's
--- brief pause is a fair trade for not racing the server boot.
-local function kokoroServerStart()
-  hs.execute(SERVER_SCRIPT .. " start >/dev/null 2>&1", true)
-end
 local function kokoroServerStop()
   hs.execute(SERVER_SCRIPT .. " stop >/dev/null 2>&1", true)
-end
-
--- stopActiveJob: used before switching backends. Uses play-last.sh's toggle
--- semantics — if a job is running, re-running it kills the tree.
-local function stopActiveJob()
-  if jobIsRunning() then
-    hs.execute(PLAY_SCRIPT .. " >/dev/null 2>&1 &", true)
-    -- give the kill a moment to propagate
-    hs.timer.usleep(200000)
-  end
 end
 
 -- ============================================================
@@ -120,7 +79,7 @@ local function runPlayScript(args)
   hs.task.new("/bin/bash",
     function(code)
       if code ~= 0 and code ~= 143 then -- 143 = SIGTERM on stop; not an error
-        hs.alert.show("Speechify error (exit " .. code .. ")")
+        hs.alert.show("Claudio error (exit " .. code .. ")")
       end
     end,
     args
@@ -147,7 +106,7 @@ local function captureSelection(cb)
 
   local ax = axSelection()
   if ax then
-    print(string.format("[speechify] AX selection: %d chars (front=%s)", #ax, frontName))
+    print(string.format("[claudio] AX selection: %d chars (front=%s)", #ax, frontName))
     cb(ax)
     return
   end
@@ -223,28 +182,6 @@ function M.toggle()
 end
 
 -- ============================================================
--- Backend hot-swap
--- ============================================================
--- Contract: after switching, only the newly-selected backend has resources
--- in use. Order matters: stop the current job BEFORE changing the backend
--- file (so the stop hits the right backend), then start/stop the server
--- synchronously so the next F13 can't race.
-
-local function setBackend(name)
-  local current = readBackend()
-  if current == name then return end
-
-  stopActiveJob()
-  writeBackend(name)
-
-  if name == "kokoro" then
-    kokoroServerStart()
-  else
-    kokoroServerStop()
-  end
-end
-
--- ============================================================
 -- Menu rendering
 -- ============================================================
 
@@ -256,7 +193,6 @@ end
 
 local function buildMenu()
   local s = readState()
-  local backend = readBackend()
   local busy = (s.state == "play" or s.state == "synth")
   local kokoroUp = kokoroServerRunning()
 
@@ -275,18 +211,17 @@ local function buildMenu()
 
   table.insert(items, { title = "-" })
 
-  -- Backend radio
-  table.insert(items, { title = "Backend", disabled = true })
-  table.insert(items, {
-    title = "Speechify (cloud)",
-    checked = (backend == "speechify"),
-    fn = function() setBackend("speechify") end,
-  })
-  table.insert(items, {
-    title = "Kokoro (local, offline)",
-    checked = (backend == "kokoro"),
-    fn = function() setBackend("kokoro") end,
-  })
+  -- Server lifecycle (manual RAM release). Disabled when busy so you can't
+  -- kill the server mid-synth.
+  if kokoroUp then
+    table.insert(items, {
+      title = "Stop server (free ~600 MB)",
+      disabled = busy,
+      fn = function() kokoroServerStop() end,
+    })
+  else
+    table.insert(items, { title = "Server: stopped (starts on next play)", disabled = true })
+  end
 
   table.insert(items, { title = "-" })
 
@@ -297,30 +232,18 @@ local function buildMenu()
   end
   table.insert(items, { title = statusText, disabled = true })
 
-  local serverLine
-  if backend == "kokoro" then
-    serverLine = "Kokoro server: " .. (kokoroUp and "running" or "stopped")
-  else
-    serverLine = "Kokoro server: " .. (kokoroUp and "running (switching off)" or "stopped")
-  end
-  table.insert(items, { title = serverLine, disabled = true })
-
   return items
 end
 
 local function render()
   if not menubar then return end
   local s = readState()
-  local backend = readBackend()
+  menubar:setTitle(iconFor(s.state))
 
-  local title = iconFor(s.state) .. "·" .. (backend == "kokoro" and "k" or "s")
-  menubar:setTitle(title)
-
-  local tip = string.format("Speechify — %s (backend: %s)",
+  local tip = "Claudio — " .. (
     s.state == "play" and "Playing"
       or s.state == "synth" and "Synthesizing"
-      or "Idle",
-    backend)
+      or "Idle")
   if s.preview and s.preview ~= "" then
     tip = tip .. '\n"' .. s.preview .. '"'
   end
@@ -336,7 +259,7 @@ function M.start()
   if menubar then return end
   hs.fs.mkdir(STATE_DIR)
   menubar = hs.menubar.new()
-  menubar:setTitle("▸·s")
+  menubar:setTitle("▸")
   -- Dropdown menu. Using a function makes the menu content dynamic each open.
   menubar:setMenu(buildMenu)
 

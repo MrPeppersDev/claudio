@@ -6,7 +6,7 @@
 #     and exit. This is the "toggle stop" path.
 #   * Otherwise: find the most recently modified transcript under
 #     ~/.claude/projects/**, extract the last assistant message that contains
-#     text content, and pipe it to speechify-tts.sh.
+#     text content, pass it through preprocess.py, and pipe to kokoro-tts.sh.
 #
 # Lock model: play-last.sh owns job.pid for its entire run — synthesis *and*
 # playback. A second invocation while the first is mid-synth finds the lock
@@ -23,25 +23,18 @@ STATE_FILE="$STATE_DIR/state"
 LOG_FILE="$STATE_DIR/play.log"
 SESSION_MAP_DIR="$STATE_DIR/sessions"
 PROJECTS_DIR="$HOME/.claude/projects"
+PREPROCESS="$STATE_DIR/preprocess.py"
+TTS_SCRIPT="$STATE_DIR/kokoro-tts.sh"
+SERVER_SCRIPT="$STATE_DIR/kokoro-server.sh"
 
-# Backend selection. Priority: $TTS_BACKEND env > $STATE_DIR/backend file > speechify.
-# Flip to local offline: `echo kokoro > ~/.claude/speechify/backend`.
-BACKEND_FILE="$STATE_DIR/backend"
-if [ -n "${TTS_BACKEND:-}" ]; then
-  BACKEND="$TTS_BACKEND"
-elif [ -r "$BACKEND_FILE" ]; then
-  BACKEND=$(tr -d '[:space:]' < "$BACKEND_FILE")
-else
-  BACKEND="speechify"
-fi
-case "$BACKEND" in
-  kokoro)    TTS_SCRIPT="$HOME/.claude/speechify/kokoro-tts.sh" ;;
-  speechify) TTS_SCRIPT="$HOME/.claude/speechify/speechify-tts.sh" ;;
-  *)
-    printf '[%s] ERROR: unknown backend %q\n' "$(date +%H:%M:%S)" "$BACKEND" >> "$LOG_FILE" 2>/dev/null || true
+# Ensure Kokoro server is up. Idempotent: ~0.05s when healthy, up to ~8s on
+# cold start. Called only when we're about to synth (not on toggle-stop).
+ensure_server() {
+  "$SERVER_SCRIPT" start >/dev/null 2>&1 || {
+    log "ERROR: kokoro-server failed to start"
     exit 1
-    ;;
-esac
+  }
+}
 
 # Usage: play-last.sh [--session <id>] [--text-file <path>]
 #   --session     iTerm session id; used to scope transcript lookup
@@ -106,7 +99,8 @@ if [ -n "$TEXT_FILE" ]; then
   PREVIEW=$(printf '%s' "$TEXT" | head -1 | cut -c1-80)
   log "playing ${#TEXT} chars from selection — ${PREVIEW}"
   write_state synth "$PREVIEW"
-  printf '%s' "$TEXT" | "$TTS_SCRIPT"
+  ensure_server
+  printf '%s' "$TEXT" | /usr/bin/python3 "$PREPROCESS" | "$TTS_SCRIPT"
   exit 0
 fi
 
@@ -169,4 +163,5 @@ PREVIEW=$(printf '%s' "$TEXT" | head -1 | cut -c1-80)
 log "playing ${#TEXT} chars — ${PREVIEW}"
 
 write_state synth "$PREVIEW"
-printf '%s' "$TEXT" | "$TTS_SCRIPT"
+ensure_server
+printf '%s' "$TEXT" | /usr/bin/python3 "$PREPROCESS" | "$TTS_SCRIPT"
