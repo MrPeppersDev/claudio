@@ -44,6 +44,11 @@ PORT = int(os.environ.get("KOKORO_PORT", "8880"))
 # (leaves a 9-phoneme margin), and concatenate the per-chunk audio ourselves.
 MAX_PHONEMES_PER_CALL = 500
 
+# Hard cap on request body size. The only real payload is a /speak text blob
+# (a few KB typically, tens of KB at most). Anything much larger is either
+# a bug or a client trying to force a multi-GB allocation.
+MAX_REQUEST_BYTES = 1_000_000  # 1 MB
+
 print(f"[kokoro] loading model from {MODEL_PATH}", flush=True)
 t0 = time.time()
 KOKORO = Kokoro(MODEL_PATH, VOICES_PATH)
@@ -292,9 +297,22 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/speak":
             self._json(404, {"error": "not found"})
             return
-        length = int(self.headers.get("Content-Length", "0"))
+        # Content-Length required: we don't support chunked. Rejecting up
+        # front with 411 is clearer than accepting 0 and 400ing later.
+        if "Content-Length" not in self.headers:
+            self._json(411, {"error": "Content-Length required"})
+            return
+        try:
+            length = int(self.headers["Content-Length"])
+        except ValueError:
+            self._json(400, {"error": "Content-Length not an integer"})
+            return
         if length <= 0:
             self._json(400, {"error": "empty body"})
+            return
+        if length > MAX_REQUEST_BYTES:
+            self._json(413, {"error": f"body too large "
+                                      f"({length} > {MAX_REQUEST_BYTES} bytes)"})
             return
         try:
             payload = json.loads(self.rfile.read(length))
