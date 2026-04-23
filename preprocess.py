@@ -6,8 +6,12 @@ Reads stdin, writes transformed text to stdout. Applied by play-last.sh
 feeding kokoro-tts.sh.
 
 Transformations, in order:
-  1. Markdown stripping (code blocks, links, emphasis, etc.)
-  2. Pronunciation dictionary (from pronunciations.txt)
+  1. Unicode whitespace normalization (NBSP → space, drop zero-width)
+  2. Markdown stripping (code blocks, links, emphasis, etc.)
+  3. Web-paste chrome cleanup (bare URL lines, short-line-run nav, all-caps
+     micro-lines) — conservative heuristics for pasted web pages
+  4. Pronunciation dictionary (from pronunciations.txt)
+  5. Sentence / paragraph sentinel injection (for downstream split+cache)
 
 Deliberately stdlib-only so we can run under /usr/bin/python3 (no venv dep).
 """
@@ -16,6 +20,29 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+
+# --- Unicode whitespace --------------------------------------------------
+
+# Paste from a browser brings along characters that aren't in `[ \t]` but
+# visually behave as spaces. If we don't normalize them, the explicit
+# `[ \t]` classes in the markdown regexes (heading, bullet, hr) silently
+# miss matches at the leading/trailing edges of lines. Zero-width chars
+# (U+200B, U+200C, U+200D, U+FEFF) carry no acoustic meaning at all — drop.
+_WS_NORMALIZE = str.maketrans({
+    "\u00a0": " ",  # no-break space
+    "\u202f": " ",  # narrow no-break space
+    "\u2007": " ",  # figure space
+    "\u2009": " ",  # thin space
+    "\u200b": "",   # zero-width space
+    "\u200c": "",   # zero-width non-joiner
+    "\u200d": "",   # zero-width joiner
+    "\ufeff": "",   # BOM / zero-width no-break space
+})
+
+
+def normalize_whitespace(text: str) -> str:
+    return text.translate(_WS_NORMALIZE)
 
 
 # --- Markdown -------------------------------------------------------------
@@ -104,6 +131,87 @@ def strip_markdown(text: str) -> str:
     return text
 
 
+# --- Web paste chrome ----------------------------------------------------
+#
+# Heuristics for stripping nav/header/footer residue that comes along when a
+# user copies text out of a web page. Runs AFTER strip_markdown so the code
+# fences are already collapsed into EARCON_SENTINEL (and we don't misread
+# their short lines as chrome). Runs BEFORE pronunciation and sentence split
+# so the dict/sentence logic only sees prose.
+#
+# Conservative by design:
+#   * bare-URL lines — drop outright, they read as alphabet soup.
+#   * short-line runs — drop a run of ≥5 consecutive lines that are each
+#     ≤20 chars with no sentence punctuation. Threshold chosen so shopping
+#     lists / tight bullet lists (usually 3-4 items) pass through; nav
+#     sidebars (typically 7+ links) get caught.
+#   * all-caps micro-lines — drop standalone lines that are ≤25 chars and
+#     contain no lowercase letters ("MENU", "FOLLOW US"). Lines that mix
+#     case (including acronyms in prose) are unaffected.
+
+_BARE_URL_LINE = re.compile(r"(?m)^[ \t]*https?://\S+[ \t]*$")
+_SENTENCE_PUNCT = re.compile(r"[.!?,:;]")
+
+# Run length at which a window of short lines is interpreted as chrome.
+_SHORT_RUN_MIN = 5
+_SHORT_LINE_MAX_CHARS = 20
+_ALLCAPS_LINE_MAX_CHARS = 25
+
+
+def _is_short_chrome_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or len(stripped) > _SHORT_LINE_MAX_CHARS:
+        return False
+    if _SENTENCE_PUNCT.search(stripped):
+        return False
+    # Structural sentinels from strip_markdown aren't chrome — leave alone.
+    if EARCON_SENTINEL in stripped:
+        return False
+    return True
+
+
+def _is_all_caps_micro_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or len(stripped) > _ALLCAPS_LINE_MAX_CHARS:
+        return False
+    if EARCON_SENTINEL in stripped:
+        return False
+    saw_letter = False
+    for ch in stripped:
+        if ch.islower():
+            return False
+        if ch.isalpha():
+            saw_letter = True
+    return saw_letter
+
+
+def clean_web_artifacts(text: str) -> str:
+    # Drop bare URLs first so they don't pad out the short-line-run count
+    # with lines that are "short" but not really nav.
+    text = _BARE_URL_LINE.sub("", text)
+
+    lines = text.split("\n")
+    runs_to_drop: list[tuple[int, int]] = []
+    run_start: int | None = None
+    for i, line in enumerate(lines):
+        if _is_short_chrome_line(line):
+            if run_start is None:
+                run_start = i
+        else:
+            if run_start is not None and i - run_start >= _SHORT_RUN_MIN:
+                runs_to_drop.append((run_start, i))
+            run_start = None
+    if run_start is not None and len(lines) - run_start >= _SHORT_RUN_MIN:
+        runs_to_drop.append((run_start, len(lines)))
+
+    # Splice from the tail so earlier indices stay valid.
+    for start, end in reversed(runs_to_drop):
+        del lines[start:end]
+
+    lines = [l for l in lines if not _is_all_caps_micro_line(l)]
+    return "\n".join(lines)
+
+
 # --- Pronunciation dictionary --------------------------------------------
 
 def load_pronunciations(path: Path) -> list[tuple[str, str]]:
@@ -186,7 +294,9 @@ def split_sentences(text: str) -> str:
 
 def main() -> int:
     text = sys.stdin.read()
+    text = normalize_whitespace(text)
     text = strip_markdown(text)
+    text = clean_web_artifacts(text)
     rules = load_pronunciations(HERE / "pronunciations.txt")
     text = apply_pronunciations(text, rules)
     text = split_sentences(text)
