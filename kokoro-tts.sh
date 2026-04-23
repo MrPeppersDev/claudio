@@ -28,21 +28,21 @@
 #                      Only applied to the FIRST sentence of an utterance —
 #                      later sentences get pad=0 so per-sentence seams don't
 #                      stack into an audible stutter. play-stream.py adds a
-#                      200ms pre-roll at stream open that covers CoreAudio
-#                      warm-up, and by the time sentence 2 starts, the stream
-#                      is already live so there's no cold start to hide.
+#                      pre-roll at stream open that covers CoreAudio warm-up,
+#                      and by the time sentence 2 starts, the stream is
+#                      already live so there's no cold start to hide.
 #   KOKORO_COALESCE_MAX_CHARS  if a segment is this many chars or fewer, the
 #                      whole segment is synthesized as one Kokoro call instead
 #                      of per-sentence. Bigger single synth = smoother prosody
 #                      across sentence boundaries (Kokoro picks its own breath
 #                      pattern), at the cost of losing sentence-level cache
 #                      granularity for short messages (default: 400; 0 disables).
-#   KOKORO_TAIL_TRIM_MS trailing silence kept after the last audible sample.
-#                      Kokoro bakes ~100-200ms of tail into every utterance.
-#                      Disabled by default because the single-sample threshold
-#                      in server.py eats soft unvoiced closing consonants
-#                      (t/p/k); the planned windowed-RMS replacement will
-#                      re-enable with a safe default (default: 0 = no trim)
+#   KOKORO_TAIL_TRIM_MS trailing silence kept after the last audible frame.
+#                      Uses windowed-RMS energy detection with a 60ms dwell
+#                      so unvoiced closing consonants (t/p/k) survive intact
+#                      — the previous single-sample threshold ate release
+#                      bursts from t/p/k whose amplitude sits below 0.005.
+#                      (default: 40; 0 disables — keep Kokoro's native tail)
 #
 # Owned by play-last.sh via job.pid; writes state={synth,play} to the state
 # file; play-stream.py is a long-lived child — the parent's pkill -P tears
@@ -80,7 +80,7 @@ EQ_GAIN_DB="${KOKORO_EQ_GAIN_DB:-3.0}"
 EQ_FREQ="${KOKORO_EQ_FREQ:-2500}"
 EQ_Q="${KOKORO_EQ_Q:-1.0}"
 PAD_START_MS="${KOKORO_PAD_START_MS:-150}"
-TAIL_TRIM_MS="${KOKORO_TAIL_TRIM_MS:-0}"
+TAIL_TRIM_MS="${KOKORO_TAIL_TRIM_MS:-40}"
 COALESCE_MAX_CHARS="${KOKORO_COALESCE_MAX_CHARS:-400}"
 mkdir -p "$CACHE_DIR"
 
@@ -335,10 +335,15 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
       printf 'EARCON %s\n' "$EARCON" >&9
     fi
 
-    # Paragraph-level pause via play-stream silence insert. Gated on
-    # "playing" so we never pause before the very first utterance.
+    # Paragraph-level pause via play-stream silence insert. With windowed-
+    # RMS tail trim active (~40 ms kept), this 150 ms gap plus the trimmed
+    # tail on the previous sentence ≈ paragraph-y without dragging. Gated
+    # on "playing" so we never pause before the very first utterance, and
+    # routed through play-stream PAUSE (not shell sleep) because the bash
+    # loop is ahead of what the stream has actually played — a shell sleep
+    # here would pause the producer, not the listener.
     if [ "$paragraph_before" -eq 1 ] && [ "$playing" -eq 1 ]; then
-      printf 'PAUSE 200\n' >&9
+      printf 'PAUSE 150\n' >&9
     fi
 
     if [ "$playing" -eq 0 ]; then
