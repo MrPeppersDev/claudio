@@ -122,6 +122,12 @@ echo "installing deps into venv..."
 "$REPO/kokoro/venv/bin/pip" install --upgrade pip >/dev/null
 "$REPO/kokoro/venv/bin/pip" install -r "$REPO/kokoro/requirements.txt"
 
+# pysbd is used by preprocess.py, which runs under /usr/bin/python3 (not the
+# venv Python above). Install it to the user site for the system interpreter.
+# preprocess.py has a regex fallback so this failure is non-fatal.
+/usr/bin/python3 -m pip install --user --quiet pysbd \
+  || echo "WARN: pysbd install failed — preprocess.py will use regex fallback"
+
 # --- 3. Model weights ---
 bash "$REPO/kokoro/download-model.sh"
 

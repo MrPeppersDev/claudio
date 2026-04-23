@@ -46,8 +46,10 @@ idempotent, so running it twice should be harmless.
   `shellcheck`-clean if possible
 - Lua: match what's in `hammerspoon/claudio.lua` — no frameworks, plain
   Hammerspoon API
-- Python: `server.py` + `preprocess.py` use stdlib + the one listed
-  dependency; avoid adding heavy deps
+- Python: `server.py` + `preprocess.py` use stdlib + optional user-site deps;
+  avoid adding further heavy deps without a graceful fallback. Optional deps:
+  - `pysbd` (MIT) — sentence boundary detection; falls back to regex splitter.
+    Install: `pip install --user pysbd`
 
 Comments explain *why*, not *what*. If a block does something surprising
 (e.g., why earcons are synchronous), say so.
