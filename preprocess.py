@@ -15,10 +15,19 @@ Transformations, in order:
   6. Sentence / paragraph sentinel injection (for downstream split+cache)
 
 Deliberately stdlib-only so we can run under /usr/bin/python3 (no venv dep).
+pysbd is used for sentence segmentation when available (pip install pysbd),
+with an automatic regex fallback for stdlib-only environments.
 """
 import re
 import sys
 from pathlib import Path
+
+try:
+    import pysbd as _pysbd
+    _PYSBD_SEGMENTER = _pysbd.Segmenter(language="en", clean=False)
+    _HAVE_PYSBD = True
+except ImportError:  # pragma: no cover — fallback path for stdlib-only envs
+    _HAVE_PYSBD = False
 
 HERE = Path(__file__).resolve().parent
 
@@ -379,7 +388,43 @@ def merge_short_sentences(text: str) -> str:
     return SENTENCE_SENTINEL.join(parts)
 
 
-def split_sentences(text: str) -> str:
+def _split_sentences_pysbd(text: str) -> str:
+    """Split sentences using pysbd, preserving paragraph boundaries and sentinels."""
+    # Split on paragraph boundaries first, preserving inter-paragraph separators.
+    # We use re.split with a capturing group so we know where boundaries were.
+    parts = _PARAGRAPH_BOUNDARY.split(text)
+
+    result_sentences: list[str] = []
+    for para_idx, para in enumerate(parts):
+        if not para:
+            continue
+        # pysbd can treat terminal punctuation followed by a control character
+        # (e.g. EARCON_SENTINEL \x1e) as a sentence boundary, which would
+        # split "foo.\x1ebar" into ["foo.", "bar"] and lose the earcon from
+        # its sentence.  Protect earcons with a temporary ASCII placeholder
+        # before segmentation, then restore them in each returned segment.
+        _EARCON_PH = "\x02EARCON\x03"
+        para_safe = para.replace(EARCON_SENTINEL, _EARCON_PH)
+
+        # Segment this paragraph into sentences.
+        raw_sentences = _PYSBD_SEGMENTER.segment(para_safe)
+        # Strip trailing whitespace pysbd may leave; drop empties.
+        # Restore earcon sentinels that were temporarily replaced.
+        sentences = [s.strip().replace(_EARCON_PH, EARCON_SENTINEL) for s in raw_sentences]
+        sentences = [s for s in sentences if s]
+        if not sentences:
+            continue
+        if para_idx > 0:
+            # Prefix first sentence of each non-first paragraph with the
+            # paragraph sentinel so downstream sees the longer-pause marker.
+            sentences[0] = PARAGRAPH_SENTINEL + sentences[0]
+        result_sentences.extend(sentences)
+
+    return SENTENCE_SENTINEL.join(result_sentences)
+
+
+def _split_sentences_regex(text: str) -> str:
+    """Regex-based sentence splitter — stdlib fallback when pysbd is absent."""
     # Paragraph first: replace the blank-line run with a sentence sentinel
     # (so sentence-level splitting still sees the boundary) plus a paragraph
     # prefix (so the next sentence carries "longer pause before me").
@@ -389,6 +434,14 @@ def split_sentences(text: str) -> str:
     # \x1c deliberately not in the whitespace class — it survives as the
     # paragraph prefix on the next surviving sentinel.
     text = re.sub(rf"\x1d({_WS}*\x1d)+", SENTENCE_SENTINEL, text)
+    return text
+
+
+def split_sentences(text: str) -> str:
+    if _HAVE_PYSBD:
+        text = _split_sentences_pysbd(text)
+    else:
+        text = _split_sentences_regex(text)
     # If a paragraph marker ends up at the very start of the output (the
     # selection began with a blank line), there is no "before" to pause
     # against — drop leading markers.
