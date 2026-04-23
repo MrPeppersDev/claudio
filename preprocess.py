@@ -275,6 +275,78 @@ _SENTENCE_BOUNDARY = re.compile(rf"(?<=[.!?]){_WS}+(?=[A-Z0-9])")
 _PARAGRAPH_BOUNDARY = re.compile(r"\n[ \t]*\n[\s]*")
 
 
+# Below this visible-text length, Kokoro prosody goes flat/clipped ("OK.",
+# "Got it.") because the duration model lacks phoneme context. We fuse such
+# sentences into a neighbor so the synth sees enough to inflect naturally.
+# 15 chars captures "That's fine." (12c) and shorter; "I agree with you."
+# (17c) stays independent.
+_SHORT_SENTENCE_CHARS = 15
+
+# Matches all structural sentinels plus whitespace — used to measure how much
+# actual text a sentence-segment carries (as opposed to punctuation or pure
+# structural markers).
+_SENTINEL_OR_WS = re.compile(r"[\x1c\x1d\x1e\s]")
+
+
+def _visible_text_length(segment: str) -> int:
+    return len(_SENTINEL_OR_WS.sub("", segment))
+
+
+def merge_short_sentences(text: str) -> str:
+    """
+    Post-processing over the sentinel-tagged text from split_sentences.
+    Merges sentences whose visible text is shorter than _SHORT_SENTENCE_CHARS
+    with an adjacent sentence so Kokoro has enough phoneme context for
+    natural prosody. Never crosses a paragraph boundary (\\x1c prefix).
+    """
+    if SENTENCE_SENTINEL not in text:
+        return text
+    parts = text.split(SENTENCE_SENTINEL)
+    starts_para = [p.startswith(PARAGRAPH_SENTINEL) for p in parts]
+
+    def has_text(i: int) -> bool:
+        return 0 <= i < len(parts) and _visible_text_length(parts[i]) > 0
+
+    i = 0
+    while i < len(parts):
+        vis = _visible_text_length(parts[i])
+        # Segments with no visible text at all (pure earcon between
+        # paragraphs, say) aren't sentences — skip them rather than trying
+        # to fuse them into a neighbor and swallowing the earcon.
+        if vis == 0 or vis >= _SHORT_SENTENCE_CHARS:
+            i += 1
+            continue
+
+        # Forward merge: pull the next sentence in if it's in the same
+        # paragraph and has real text.
+        if i + 1 < len(parts) and not starts_para[i + 1] and has_text(i + 1):
+            prefix = PARAGRAPH_SENTINEL if starts_para[i] else ""
+            cur = parts[i].lstrip(PARAGRAPH_SENTINEL)
+            parts[i + 1] = prefix + cur.rstrip() + " " + parts[i + 1]
+            starts_para[i + 1] = starts_para[i]
+            del parts[i]
+            del starts_para[i]
+            continue  # recheck: the merged segment may still be short
+
+        # Backward merge: stick onto the previous sentence, but only if the
+        # current sentence isn't itself a paragraph-start (don't blur the
+        # pause between two paragraphs).
+        if i > 0 and not starts_para[i] and has_text(i - 1):
+            parts[i - 1] = parts[i - 1].rstrip() + " " + parts[i]
+            del parts[i]
+            del starts_para[i]
+            # The growing parts[i-1] was already over threshold (we never
+            # leave a short segment behind on a forward pass), so no recheck
+            # needed — advance.
+            continue
+
+        # Singleton short paragraph with no valid merge candidate. Leave it;
+        # the intentional paragraph break matters more than the prosody hit.
+        i += 1
+
+    return SENTENCE_SENTINEL.join(parts)
+
+
 def split_sentences(text: str) -> str:
     # Paragraph first: replace the blank-line run with a sentence sentinel
     # (so sentence-level splitting still sees the boundary) plus a paragraph
@@ -300,6 +372,7 @@ def main() -> int:
     rules = load_pronunciations(HERE / "pronunciations.txt")
     text = apply_pronunciations(text, rules)
     text = split_sentences(text)
+    text = merge_short_sentences(text)
     sys.stdout.write(text)
     return 0
 
