@@ -52,6 +52,8 @@ idempotent, so running it twice should be harmless.
     Install: `pip install --user pysbd`
   - `num2words` (LGPL-2.1) + `inflect` (MIT) — number/currency/ordinal
     spell-out; skipped when unavailable. Install: `pip install --user num2words inflect`
+  - `trafilatura` (Apache-2.0) — article extraction from HTML pastes;
+    skipped when unavailable. Install: `pip install --user trafilatura lxml_html_clean`
 
 Comments explain *why*, not *what*. If a block does something surprising
 (e.g., why earcons are synchronous), say so.

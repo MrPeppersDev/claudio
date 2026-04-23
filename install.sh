@@ -128,6 +128,8 @@ echo "installing deps into venv..."
   || echo "WARN: pysbd install failed — preprocess.py will use regex fallback"
 /usr/bin/python3 -m pip install --user --quiet num2words inflect \
   || echo "WARN: num2words/inflect install failed — number spell-out will be skipped (non-fatal)"
+/usr/bin/python3 -m pip install --user --quiet trafilatura lxml_html_clean \
+  || echo "WARN: trafilatura install failed — HTML article extraction will be skipped (non-fatal)"
 
 # --- 3. Model weights ---
 bash "$REPO/kokoro/download-model.sh"
