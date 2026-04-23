@@ -58,6 +58,12 @@ idempotent, so running it twice should be harmless.
     PDFs directly so PDF viewers don't need to fall back to the Live Text
     nudge. Install: `pip install --user pymupdf`
 
+- `play-stream.py` (in `kokoro/`) uses `sounddevice` (MIT) which depends on
+  the PortAudio native library. `install.sh` installs it automatically via
+  `brew install portaudio`. If you don't use Homebrew and `import sounddevice`
+  fails, install PortAudio through your package manager (e.g.
+  `port install portaudio` for MacPorts) before running `pip install sounddevice`.
+
 Comments explain *why*, not *what*. If a block does something surprising
 (e.g., why earcons are synchronous), say so.
 

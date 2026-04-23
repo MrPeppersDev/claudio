@@ -114,6 +114,20 @@ MSG
 }
 echo "using $PY ($("$PY" --version 2>&1))"
 
+# sounddevice (used by play-stream.py) needs the PortAudio native library.
+# macOS ships CoreAudio but not PortAudio, so install it via Homebrew if
+# brew is present. If brew is absent the pip install below will still succeed
+# on Apple Silicon (bundled dylib), but on Intel it may fail — in that case
+# the user needs to install PortAudio manually.
+if command -v brew >/dev/null 2>&1; then
+  if ! brew list portaudio >/dev/null 2>&1; then
+    echo "installing portaudio (required by sounddevice)..."
+    brew install portaudio
+  else
+    echo "ok portaudio already installed"
+  fi
+fi
+
 if [ ! -d "$REPO/kokoro/venv" ]; then
   echo "creating venv..."
   "$PY" -m venv "$REPO/kokoro/venv"
