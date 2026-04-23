@@ -41,6 +41,10 @@ local DEFAULT_SPEED = 2.0
 local menubar = nil
 local watcher = nil
 local audioWatcher = nil
+-- eventtap that intercepts system media keys (play/pause, next, previous).
+-- Stored here so M.stop() can clean it up on reload. nil when disabled via
+-- CLAUDIO_MEDIA_KEYS=0 env var.
+local mediaKeyTap = nil
 -- Tracks the pasteboard changeCount at the time of the last toggle. Used by
 -- the copy-on-select terminal fallback to distinguish "user just selected
 -- new text" (changeCount advanced since last toggle) from "stale clipboard
@@ -630,6 +634,74 @@ local function render()
 end
 
 -- ============================================================
+-- Media key interception (Option A: hs.eventtap on systemDefined events)
+-- ============================================================
+--
+-- This intercepts the NX media-key scancodes that AirPods double-tap, the
+-- keyboard F8 (play/pause), F9 (next), and F7 (previous) keys generate.
+-- Handling them here lets claudio respond even when it is not the frontmost
+-- app or registered as a Now Playing source.
+--
+-- Limitation: without a proper MPNowPlayingInfoCenter registration (Option B),
+-- claudio will NOT appear in the Control Center Now Playing widget or on the
+-- lock screen. Option B requires a compiled Swift/ObjC helper to call the
+-- MediaPlayer framework from a background process. Track that work separately
+-- (see the follow-up issue filed alongside this PR).
+--
+-- Disable by setting CLAUDIO_MEDIA_KEYS=0 in the environment before launching
+-- Hammerspoon (e.g. in your shell profile or LaunchAgent plist). When
+-- disabled, media keys pass through unmodified to whichever app macOS has
+-- chosen as the active media session (Music.app, Spotify, etc.).
+local function registerMediaKeys()
+  local enabled = os.getenv("CLAUDIO_MEDIA_KEYS")
+  if enabled == "0" then
+    hs.printf("claudio: media key interception disabled (CLAUDIO_MEDIA_KEYS=0)")
+    return nil
+  end
+
+  local tap = hs.eventtap.new(
+    { hs.eventtap.event.types.systemDefined },
+    function(event)
+      local data = event:systemKey()
+      if not data or not data.down then
+        -- Ignore key-up events to prevent double-fires on press+release.
+        return false
+      end
+
+      if data.key == "PLAY" then
+        -- AirPods double-tap and the keyboard play/pause key both map here.
+        M.toggle()
+        return true  -- swallow: don't pass to Music.app / Spotify
+
+      elseif data.key == "NEXT" then
+        -- Future: skip to next queued item. Guard: only act when a job is
+        -- running so the key still works for other apps when claudio is idle.
+        if jobIsRunning() then
+          -- Placeholder — queue-advance not yet implemented.
+          -- TODO: call M.queueNext() when that function exists.
+          return false
+        end
+        return false
+
+      elseif data.key == "PREVIOUS" then
+        -- Same guard: only intercept during active playback.
+        if jobIsRunning() then
+          -- Placeholder — rewind/restart not yet implemented.
+          return false
+        end
+        return false
+      end
+
+      return false
+    end
+  )
+
+  tap:start()
+  hs.printf("claudio: media key interception active (set CLAUDIO_MEDIA_KEYS=0 to disable)")
+  return tap
+end
+
+-- ============================================================
 -- Lifecycle
 -- ============================================================
 
@@ -659,6 +731,8 @@ function M.start()
   end)
   hs.audiodevice.watcher.start()
 
+  mediaKeyTap = registerMediaKeys()
+
   render()
 end
 
@@ -668,6 +742,10 @@ function M.stop()
   if audioWatcher then
     hs.audiodevice.watcher.stop()
     audioWatcher = nil
+  end
+  if mediaKeyTap then
+    mediaKeyTap:stop()
+    mediaKeyTap = nil
   end
 end
 
