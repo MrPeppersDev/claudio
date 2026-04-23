@@ -1,12 +1,15 @@
 #!/bin/bash
-# play-last.sh — toggle playback of the last assistant message.
+# play-last.sh — synthesize and play a file of text, or toggle-stop.
 #
 # Behavior:
 #   * If a job is already running, kill its process tree (synth or playback)
 #     and exit. This is the "toggle stop" path.
-#   * Otherwise: find the most recently modified transcript under
-#     ~/.claude/projects/**, extract the last assistant message that contains
-#     text content, pass it through preprocess.py, and pipe to kokoro-tts.sh.
+#   * Otherwise: read text from --text-file, preprocess it, and hand off to
+#     kokoro-tts.sh for synth + playback.
+#
+# Scope: selection-only. The caller (hammerspoon/claudio.lua) captures the
+# user's highlighted text and writes it to a temp file. We never scan
+# transcripts or produce speech from anything other than what was passed in.
 #
 # Lock model: play-last.sh owns job.pid for its entire run — synthesis *and*
 # playback. A second invocation while the first is mid-synth finds the lock
@@ -20,17 +23,15 @@ set -euo pipefail
 # SCRIPT_DIR is where *this* script lives — the Claudio repo checkout. Used
 # to find sibling scripts (preprocess.py, kokoro-tts.sh, kokoro-server.sh)
 # so the repo can live anywhere, not just ~/.claude/claudio.
-# STATE_DIR is where runtime files (lock, state, log, cache, sessions) live.
-# It defaults to ~/.claude/claudio for backward compatibility but is
-# user-overridable via CLAUDIO_STATE_DIR so the repo can be checked out
-# elsewhere (e.g. a test worktree) without state leaking into it.
+# STATE_DIR is where runtime files (lock, state, log, cache) live. It
+# defaults to ~/.claude/claudio and is user-overridable via
+# CLAUDIO_STATE_DIR so the repo can be checked out elsewhere (e.g. a test
+# worktree) without state leaking into it.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="${CLAUDIO_STATE_DIR:-$HOME/.claude/claudio}"
 LOCK_FILE="$STATE_DIR/job.pid"
 STATE_FILE="$STATE_DIR/state"
 LOG_FILE="$STATE_DIR/play.log"
-SESSION_MAP_DIR="$STATE_DIR/sessions"
-PROJECTS_DIR="$HOME/.claude/projects"
 PREPROCESS="$SCRIPT_DIR/preprocess.py"
 TTS_SCRIPT="$SCRIPT_DIR/kokoro-tts.sh"
 SERVER_SCRIPT="$SCRIPT_DIR/kokoro-server.sh"
@@ -44,15 +45,12 @@ ensure_server() {
   }
 }
 
-# Usage: play-last.sh [--session <id>] [--text-file <path>]
-#   --session     iTerm session id; used to scope transcript lookup
-#   --text-file   read playback text from this file and skip transcript lookup
-# With no args, plays last message from the globally-most-recent transcript.
-REQUESTED_SID=""
+# Usage: play-last.sh --text-file <path>
+#   --text-file   read playback text from this file
+# No-args form is reserved for the toggle-stop path (kills an in-flight job).
 TEXT_FILE=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --session)   REQUESTED_SID="${2:-}"; shift 2 ;;
     --text-file) TEXT_FILE="${2:-}"; shift 2 ;;
     *)           shift ;;  # ignore unknowns for forward-compat
   esac
@@ -122,102 +120,32 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# --- Text-file path: skip transcript lookup entirely ---
-if [ -n "$TEXT_FILE" ]; then
-  if [ ! -r "$TEXT_FILE" ]; then
-    log "ERROR: text file not readable: $TEXT_FILE"
-    exit 1
-  fi
-  TEXT=$(cat "$TEXT_FILE")
-  # Unlink immediately — claudio.lua writes selections here, and selection
-  # text can contain secrets or PII. We've already copied it into $TEXT; the
-  # file has no further purpose and shouldn't persist between runs.
-  rm -f "$TEXT_FILE"
-  if [ -z "${TEXT:-}" ]; then
-    log "ERROR: text file is empty: $TEXT_FILE"
-    exit 1
-  fi
-  # PREVIEW goes to the state file (used by the menu bar) but NOT to the
-  # persistent log — user content can include tokens, PII, or chat
-  # fragments that shouldn't accumulate on disk indefinitely. The log
-  # line records only the length.
-  PREVIEW=$(printf '%s' "$TEXT" | head -1 | cut -c1-80)
-  log "playing ${#TEXT} chars from selection"
-  write_state synth "$PREVIEW"
-  ensure_server
-  printf '%s' "$TEXT" | /usr/bin/python3 "$PREPROCESS" | "$TTS_SCRIPT"
-  exit 0
-fi
-
-# Whitelist-based sanitization. Must stay in lockstep with the
-# `sanitize_sid` function in claudetop.d/claudio-session-map — they write,
-# we read, and any drift silently loses the lookup.
-sanitize_sid() {
-  printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9_-' '_' | tr -s '_' | cut -c1-128
-}
-
-# --- Resolve transcript for the requested iTerm session, if any ---
-LATEST=""
-if [ -n "$REQUESTED_SID" ]; then
-  # Try both raw id and UUID-after-colon (claudetop plugin writes both keys).
-  for candidate in "$REQUESTED_SID" "${REQUESTED_SID##*:}"; do
-    safe=$(sanitize_sid "$candidate")
-    [ -z "$safe" ] && continue
-    map_file="$SESSION_MAP_DIR/$safe"
-    if [ -f "$map_file" ]; then
-      mapped=$(grep -E '^transcript_path=' "$map_file" | head -1 | sed 's/^transcript_path=//')
-      if [ -n "$mapped" ] && [ -r "$mapped" ]; then
-        LATEST="$mapped"
-        log "session-mapped: sid=$REQUESTED_SID -> $LATEST"
-        break
-      fi
-    fi
-  done
-fi
-
-# --- Fallback: most recently modified transcript anywhere ---
-# Subshell disables pipefail because `head -1` closing early makes sort exit
-# with SIGPIPE, which pipefail would promote to a script-killing error.
-if [ -z "$LATEST" ]; then
-  log "fallback: no session mapping (sid='${REQUESTED_SID:-none}'), using global latest"
-  LATEST=$(set +o pipefail; \
-    find "$PROJECTS_DIR" -type f -name '*.jsonl' -print0 2>/dev/null \
-    | xargs -0 stat -f '%m %N' 2>/dev/null \
-    | sort -rn | head -1 | cut -d' ' -f2-)
-fi
-
-if [ -z "${LATEST:-}" ] || [ ! -r "$LATEST" ]; then
-  log "ERROR: no transcript found under $PROJECTS_DIR"
-  osascript -e 'display notification "No Claude transcript found" with title "Claudio"'
+# --- Play path: --text-file is required ---
+if [ -z "$TEXT_FILE" ]; then
+  log "ERROR: no --text-file given; nothing to play"
+  osascript -e 'display notification "No text to play — highlight text and press F13" with title "Claudio"'
   exit 1
 fi
 
-log "transcript: $LATEST"
-
-# --- Extract last assistant message that has text content ---
-# Assistant messages can contain mixed content (thinking, text, tool_use).
-# Take the last JSONL line where .type=="assistant" AND at least one content
-# block has type=="text", then join all text blocks with blank lines.
-TEXT=$(jq -rs '
-  [.[] | select(.type=="assistant" and (.message.content | any(.type=="text")))]
-  | last
-  | [.message.content[] | select(.type=="text") | .text]
-  | join("\n\n")
-' "$LATEST" 2>/dev/null || true)
-
-if [ -z "${TEXT:-}" ] || [ "$TEXT" = "null" ]; then
-  log "ERROR: no assistant text found in $LATEST"
-  osascript -e 'display notification "No assistant text to play" with title "Claudio"'
+if [ ! -r "$TEXT_FILE" ]; then
+  log "ERROR: text file not readable: $TEXT_FILE"
   exit 1
 fi
-
-# Preview = first 80 chars of first line, for the menu bar dropdown.
-# Kept out of the persistent log for the same reason as the --text-file
-# branch above: assistant text can contain secrets, PII, or chat fragments
-# we don't want accumulating on disk. The log records only the length.
+TEXT=$(cat "$TEXT_FILE")
+# Unlink immediately — claudio.lua writes selections here, and selection
+# text can contain secrets or PII. We've already copied it into $TEXT; the
+# file has no further purpose and shouldn't persist between runs.
+rm -f "$TEXT_FILE"
+if [ -z "${TEXT:-}" ]; then
+  log "ERROR: text file is empty: $TEXT_FILE"
+  exit 1
+fi
+# PREVIEW goes to the state file (used by the menu bar) but NOT to the
+# persistent log — user content can include tokens, PII, or chat
+# fragments that shouldn't accumulate on disk indefinitely. The log
+# line records only the length.
 PREVIEW=$(printf '%s' "$TEXT" | head -1 | cut -c1-80)
-log "playing ${#TEXT} chars"
-
+log "playing ${#TEXT} chars from selection"
 write_state synth "$PREVIEW"
 ensure_server
 printf '%s' "$TEXT" | /usr/bin/python3 "$PREPROCESS" | "$TTS_SCRIPT"

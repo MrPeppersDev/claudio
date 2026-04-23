@@ -7,7 +7,6 @@
 #
 # What this does:
 #   1. Symlinks hammerspoon/claudio.lua  → ~/.hammerspoon/claudio.lua
-#      and  claudetop.d/claudio-session-map → ~/.claude/claudetop.d/…
 #   2. Creates a Python >= 3.10 venv and installs kokoro dependencies.
 #      (Prefers 3.12. Override with CLAUDIO_PYTHON=/path/to/python if needed.)
 #   3. Downloads the Kokoro model weights + voices (one-time, ~340 MB).
@@ -19,7 +18,17 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- 1. Symlinks for integrations ---
-mkdir -p "$HOME/.hammerspoon" "$HOME/.claude/claudetop.d"
+mkdir -p "$HOME/.hammerspoon"
+
+# Clean up a legacy symlink from earlier versions that wired a claudetop
+# statusline plugin for iTerm transcript mapping. That whole code path is
+# gone — selection-only playback doesn't need it. Dangling symlinks are
+# skipped by claudetop but still visible in `ls`, so remove it properly.
+LEGACY_CLAUDETOP_LINK="$HOME/.claude/claudetop.d/claudio-session-map"
+if [ -L "$LEGACY_CLAUDETOP_LINK" ]; then
+  rm -f "$LEGACY_CLAUDETOP_LINK"
+  echo "removed legacy symlink: $LEGACY_CLAUDETOP_LINK"
+fi
 
 link() {
   local src="$1" dest="$2"
@@ -40,9 +49,9 @@ link() {
   fi
 
   # Existing regular file. The previous behavior printed WARN and silently
-  # skipped, so installs appeared to succeed while Hammerspoon / claudetop
-  # kept loading a stale copy. Back up and link, so the user keeps their
-  # file but gets a working install.
+  # skipped, so installs appeared to succeed while Hammerspoon kept loading
+  # a stale copy. Back up and link, so the user keeps their file but gets
+  # a working install.
   if [ -f "$dest" ]; then
     local bak="$dest.bak.$(date +%s)"
     mv "$dest" "$bak"
@@ -66,7 +75,6 @@ link() {
   echo "linked $dest -> $src"
 }
 link "$REPO/hammerspoon/claudio.lua"             "$HOME/.hammerspoon/claudio.lua"
-link "$REPO/claudetop.d/claudio-session-map"     "$HOME/.claude/claudetop.d/claudio-session-map"
 
 # --- 2. Python venv + Kokoro deps ---
 # Find a Python >= 3.10 — kokoro-onnx supports 3.10+. We prefer 3.12 because

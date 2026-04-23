@@ -1,8 +1,8 @@
 # Claudio
 
-Local, offline text-to-speech for Claude Code on macOS. F13 reads either
-a text selection or the last assistant message from the focused iTerm
-session, synthesized by a local Kokoro-82M model.
+Local, offline highlighted-text-to-speech for macOS. Select text in any
+app, press F13, hear it. Synthesis runs entirely against a local
+Kokoro-82M model — no API keys, no network.
 
 - **Fully offline** — no API keys, no network. Once installed, everything
   runs against weights on disk.
@@ -28,11 +28,11 @@ What Claudio adds on top:
 - **Split-speed synthesis** — model runs at 1.5× and afplay's phase vocoder
   covers the remaining 1.33× to hit effective 2.0× without muddied phonemes
 - **Menu bar UI + F13 hotkey** (Hammerspoon)
-- **Selection-or-last-message** capture — picks up highlighted text if any,
-  otherwise extracts the last assistant message from the focused iTerm pane
-- **Session-scoped transcripts** — the claudetop statusline plugin writes
-  `iterm_session_id → transcript_path` so F13 reads from the *focused* pane,
-  not the globally-most-recent one
+- **App-agnostic selection capture** — three fallbacks in order:
+  Accessibility API (works in most native apps, Safari, Notes, Mail),
+  simulated Cmd+C + pasteboard diff (works anywhere Cmd+C does),
+  copy-on-select pasteboard scan (iTerm2, Terminal.app, Alacritty,
+  kitty, WezTerm, Ghostty)
 
 ## Layout
 
@@ -53,8 +53,6 @@ What Claudio adds on top:
 │   └── voices-v1.0.bin        # (gitignored, 27 MB, pulled at install)
 ├── hammerspoon/
 │   └── claudio.lua            # menubar dropdown, F13 hotkey, selection capture
-├── claudetop.d/
-│   └── claudio-session-map    # statusline plugin: iTerm session → transcript
 └── install.sh                 # bootstrap for a new machine
 ```
 
@@ -67,8 +65,7 @@ cd ~/.claude/claudio
 ```
 
 Install does:
-1. Symlinks `hammerspoon/claudio.lua` and the claudetop plugin to their
-   runtime locations.
+1. Symlinks `hammerspoon/claudio.lua` to `~/.hammerspoon/claudio.lua`.
 2. Creates a Python venv (prefers 3.12; accepts anything ≥ 3.10) and
    installs `kokoro-onnx`, `soundfile`, `scipy`. Override the interpreter
    with `CLAUDIO_PYTHON=/path/to/python3` if auto-detection picks wrong.
@@ -89,14 +86,9 @@ hs.hotkey.bind({}, "F13", function() claudio.toggle() end)
 ## Usage
 
 - **F13** — highlight text in any app, then press F13 to read it aloud.
-  Press F13 again to stop.
+  Press F13 again to stop. With no selection, F13 shows a reminder.
 - **Menu bar icon** — dropdown with Play/Stop and manual server stop.
   `▸` idle, `⟳` synth, `▶` playing.
-
-> **Note:** F13 with no selection currently shows a reminder rather than
-> reading the latest assistant message. Full-message playback will come
-> back once we can summarize server-side — raw multi-paragraph responses
-> are rarely what you actually want to hear.
 
 ## Env vars
 
@@ -118,7 +110,7 @@ hs.hotkey.bind({}, "F13", function() claudio.toggle() end)
   Default `3.0` / `2500` / `1.0`. A small presence bump helps consonant intelligibility
   survive the 1.33× afplay time-stretch. Set `KOKORO_EQ_GAIN_DB=0` to disable.
   All three participate in the cache key, so toggling them auto-invalidates stale entries.
-- `CLAUDIO_STATE_DIR` — where runtime state (lock, logs, cache, session map) lives.
+- `CLAUDIO_STATE_DIR` — where runtime state (lock, logs, cache) lives.
   Default `~/.claude/claudio`. Shell scripts derive their own location from `$BASH_SOURCE`,
   so the repo can be cloned anywhere; only state has a conventional default.
 - `CLAUDIO_DIR` — Lua-side override pointing at the repo (for Hammerspoon to find
@@ -157,11 +149,10 @@ runs it automatically at the end of a fresh install.
   each synth. Idempotent: ~0.05 s no-op when already healthy, up to ~8 s on
   cold boot.
 - **Selection capture** (`claudio.lua`): Accessibility API → simulated
-  Cmd+C → iTerm copy-on-select fallback. Three paths in order of preference.
-- **Session-scoped transcripts:** the `claudetop.d` statusline plugin writes
-  `iterm_session_id → transcript_path` on each render; `play-last.sh` uses
-  that map so F13 reads the Claude message from the *focused* pane rather
-  than the globally-most-recent one.
+  Cmd+C + pasteboard diff → copy-on-select terminal pasteboard scan. Three
+  paths in order of preference; the terminal fallback is gated to a small
+  whitelist (iTerm2, Terminal.app, Alacritty, kitty, WezTerm, Ghostty) so
+  stale clipboards in non-terminal apps don't get replayed.
 
 ## License
 
