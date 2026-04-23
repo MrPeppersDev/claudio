@@ -4,6 +4,7 @@ Minimal local HTTP server wrapping kokoro-onnx.
 
 Endpoints:
   GET  /health        -> {"ok": true, "voices": N, "loaded": bool}
+  GET  /voices        -> {"voices": ["af_bella", ...]}  (sorted)
   POST /speak         -> audio/wav bytes
        body: {"text": "...", "voice": "bm_george", "speed": 1.3}
 
@@ -314,6 +315,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._json(200, {"ok": True, "voices": len(VOICES), "loaded": True})
+        elif self.path == "/voices":
+            # Sorted so clients (the menu bar, for one) can display a stable
+            # ordering without doing the sort themselves.
+            self._json(200, {"voices": sorted(VOICES)})
         else:
             self._json(404, {"error": "not found"})
 

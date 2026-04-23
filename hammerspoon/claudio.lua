@@ -22,8 +22,11 @@ local CLAUDIO_DIR = os.getenv("CLAUDIO_DIR") or (HOME .. "/.claude/claudio")
 local STATE_DIR = os.getenv("CLAUDIO_STATE_DIR") or CLAUDIO_DIR
 local STATE_FILE = STATE_DIR .. "/state"
 local SPEED_FILE = STATE_DIR .. "/speed"
+local VOICE_FILE = STATE_DIR .. "/voice"
 local PLAY_SCRIPT = CLAUDIO_DIR .. "/play-last.sh"
 local SERVER_SCRIPT = CLAUDIO_DIR .. "/kokoro-server.sh"
+local KOKORO_URL = os.getenv("KOKORO_URL") or "http://127.0.0.1:8880"
+local DEFAULT_VOICE = "af_bella"
 
 -- Speed options shown in the menu. 2.0 is the shell default; keeping it
 -- here in one list means the checkmarked value and the persisted value
@@ -95,6 +98,49 @@ local function writeSpeed(s)
   if not f then return end
   f:write(string.format("%g\n", s))
   f:close()
+end
+
+local function readVoice()
+  local f = io.open(VOICE_FILE, "r")
+  if not f then return DEFAULT_VOICE end
+  local raw = (f:read("*a") or ""):match("^%s*([%w_%.,:]+)")
+  f:close()
+  return raw or DEFAULT_VOICE
+end
+
+local function writeVoice(v)
+  local f = io.open(VOICE_FILE, "w")
+  if not f then return end
+  f:write(v .. "\n")
+  f:close()
+end
+
+-- Voice list comes from the server's /voices endpoint so we don't have to
+-- ship a separate manifest that drifts from the actual shipped model. The
+-- server doesn't change voices between runs, so cache the response for
+-- the life of the Hammerspoon process rather than re-fetching every menu
+-- open. A cold fetch costs ~5-20 ms; stale results would only matter if
+-- someone swaps model files mid-session, which they can fix by reloading
+-- Hammerspoon.
+local cachedVoices = nil
+local function fetchVoices()
+  if cachedVoices then return cachedVoices end
+  local out, ok_ = hs.execute(
+    "curl -fsS -m 2 '" .. KOKORO_URL .. "/voices' 2>/dev/null", true)
+  if not ok_ or not out or out == "" then return nil end
+  local voices = {}
+  -- Minimal JSON pluck — the response is small and we don't want to pull
+  -- in a JSON library just for this. Match bare-word voice names inside
+  -- the array literal.
+  for name in out:gmatch('"([%w_]+)"') do
+    if name ~= "voices" then
+      table.insert(voices, name)
+    end
+  end
+  if #voices == 0 then return nil end
+  table.sort(voices)
+  cachedVoices = voices
+  return voices
 end
 
 -- ============================================================
@@ -325,6 +371,44 @@ local function buildMenu()
   table.insert(items, {
     title = "Speed: " .. fmtSpeed(currentSpeed),
     menu = speedSubmenu,
+  })
+
+  -- Voice submenu. If the server isn't up, the submenu is disabled with
+  -- the current voice as the title — we don't auto-start the server just
+  -- to populate a menu. If the server is up but /voices fails for any
+  -- reason, fall back to a single-item "<current> (server not responding)"
+  -- so users see something instead of a silent failure.
+  local currentVoice = readVoice()
+  local voiceSubmenu = {}
+  if kokoroUp then
+    local voices = fetchVoices()
+    if voices then
+      for _, v in ipairs(voices) do
+        local name = v  -- capture for closure
+        table.insert(voiceSubmenu, {
+          title = name,
+          checked = (name == currentVoice),
+          fn = function()
+            writeVoice(name)
+            hs.alert.show("Claudio voice: " .. name, 1.2)
+          end,
+        })
+      end
+    else
+      table.insert(voiceSubmenu, {
+        title = currentVoice .. " (voice list unavailable)",
+        disabled = true,
+      })
+    end
+  else
+    table.insert(voiceSubmenu, {
+      title = currentVoice .. " (server stopped — starts on next play)",
+      disabled = true,
+    })
+  end
+  table.insert(items, {
+    title = "Voice: " .. currentVoice,
+    menu = voiceSubmenu,
   })
 
   table.insert(items, { title = "-" })
