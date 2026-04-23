@@ -168,6 +168,15 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
   seg_has_audio=0
   for sent_txt in "$sent_dir"/*.txt; do
     sent_text=$(cat "$sent_txt")
+    # \x1c at the start = preprocess.py marked this sentence as the first
+    # of a new paragraph. Strip the marker so it doesn't poison the cache
+    # key (identical sentences must hash the same regardless of position)
+    # and remember the flag so we insert a longer pause before playback.
+    paragraph_before=0
+    if [ "${sent_text:0:1}" = $'\x1c' ]; then
+      paragraph_before=1
+      sent_text="${sent_text:1}"
+    fi
     if [ -z "${sent_text//[[:space:]]/}" ]; then
       continue
     fi
@@ -227,6 +236,14 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
     # the listener hears the "clunk" distinctly before the next sentence.
     if [ "$seg_has_audio" -eq 0 ] && [ "$first_seg" -eq 0 ] && [ "$have_earcon" -eq 1 ]; then
       afplay "$EARCON"
+    fi
+
+    # Paragraph-level pause. ~400ms on top of Kokoro's natural ~150ms
+    # sentence-end tail = ~550ms total, which matches what audiobook
+    # tuning lands at for paragraph breaks. Gated on "playing" so we
+    # never pause before the very first utterance.
+    if [ "$paragraph_before" -eq 1 ] && [ "$playing" -eq 1 ]; then
+      sleep 0.4
     fi
 
     if [ "$playing" -eq 0 ]; then
