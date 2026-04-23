@@ -16,8 +16,10 @@ Protocol (each stdin line is one command):
 Exits cleanly on stdin EOF or SIGTERM.
 """
 
+import io
 import os
 import signal
+import subprocess
 import sys
 
 import numpy as np
@@ -63,25 +65,33 @@ def _read_audio_as_float32(path: str) -> np.ndarray:
 
 
 def _stretch(samples: np.ndarray, rate: float) -> np.ndarray:
-    """Pitch-preserving time stretch via resample_poly (primary) with
-    fallback to scipy.signal.resample if resample_poly fails."""
+    """Pitch-preserving time stretch via sox tempo (WSOLA phase vocoder).
+
+    scipy.signal.resample_poly is NOT pitch-preserving — it's sample-rate
+    conversion, so 1.33x faster becomes ~a third octave higher (chipmunk).
+    Sox's `tempo -s` is a real time-domain phase vocoder that holds pitch
+    steady while compressing duration; bench #101 confirmed its consonant
+    preservation is within 0.25 dB of rubberband R3 at 1.33x. Cheaper
+    than pulling pyrubberband / librosa as a Python dep.
+    """
     if abs(rate - 1.0) < 1e-6:
         return samples
-    # resample_poly(samples, up, down) outputs a signal of length
-    #   input_len * up / down
-    # To shorten by rate > 1.0: output_len = input_len / rate
-    #   → up=10000, down=int(10000 * rate)
-    up = 10000
-    down = int(round(10000.0 * rate))
-    if down <= 0:
-        down = 1
+    buf = io.BytesIO()
+    sf.write(buf, samples, SAMPLE_RATE, format="WAV", subtype="PCM_16")
     try:
-        return resample_poly(samples, up=up, down=down).astype(np.float32)
-    except Exception:
-        # Fallback: not pitch-preserving but handles edge cases
-        target_len = max(1, int(len(samples) / rate))
-        from scipy.signal import resample as _resample
-        return _resample(samples, target_len).astype(np.float32)
+        proc = subprocess.run(
+            ["sox", "-t", "wav", "-", "-t", "wav", "-", "tempo", "-s", f"{rate:.6f}"],
+            input=buf.getvalue(),
+            capture_output=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        # Sox missing or failed — play at 1.0x rather than corrupt pitch.
+        print(f"play-stream: sox tempo unavailable, skipping stretch: {exc}",
+              file=sys.stderr)
+        return samples
+    stretched, _ = sf.read(io.BytesIO(proc.stdout), dtype="float32", always_2d=False)
+    return stretched.astype(np.float32)
 
 
 def _silence(ms: int) -> np.ndarray:

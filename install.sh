@@ -114,17 +114,24 @@ MSG
 }
 echo "using $PY ($("$PY" --version 2>&1))"
 
-# sounddevice (used by play-stream.py) needs the PortAudio native library.
-# macOS ships CoreAudio but not PortAudio, so install it via Homebrew if
-# brew is present. If brew is absent the pip install below will still succeed
-# on Apple Silicon (bundled dylib), but on Intel it may fail — in that case
-# the user needs to install PortAudio manually.
+# play-stream.py has two native-dep needs beyond the Python venv:
+#   portaudio — sounddevice (OutputStream); CoreAudio alone isn't enough
+#   sox       — pitch-preserving time-stretch for speeds != 1.0x. scipy's
+#               resample_poly is NOT pitch-preserving (chipmunk at 1.33x).
+# Install via Homebrew if present; on Intel Macs without brew the user has
+# to handle these manually.
 if command -v brew >/dev/null 2>&1; then
   if ! brew list portaudio >/dev/null 2>&1; then
     echo "installing portaudio (required by sounddevice)..."
     brew install portaudio
   else
     echo "ok portaudio already installed"
+  fi
+  if ! command -v sox >/dev/null 2>&1; then
+    echo "installing sox (required for pitch-preserving time-stretch)..."
+    brew install sox
+  else
+    echo "ok sox already installed"
   fi
 fi
 
