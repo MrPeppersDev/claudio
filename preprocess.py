@@ -146,20 +146,41 @@ def apply_pronunciations(text: str, rules: list[tuple[str, str]]) -> str:
 # "Here's what I found.").
 SENTENCE_SENTINEL = "\x1d"
 
-# Sentence boundary: terminal punct + whitespace + uppercase-letter/digit,
-# OR a blank line (paragraph break). Uppercase lookahead keeps "e.g. foo"
-# from splitting — at the cost of missing "Dr. Smith" style splits, which
-# hurts nothing beyond cache granularity. Explicit whitespace class (not
-# \s): Python's \s matches our sentinel bytes \x1e and \x1d, which would
-# otherwise let the match step over a code-block earcon boundary.
+# ASCII 0x1C (file separator). Carried as a *prefix* on the first sentence of
+# each new paragraph, not as an independent separator. kokoro-tts.sh strips
+# it when reading the sentence and inserts a longer pause before playback.
+# Prefix (rather than separator) keeps the sentence-level split on \x1d
+# working unchanged, so the sentence cache keying stays stable.
+PARAGRAPH_SENTINEL = "\x1c"
+
+# Sentence boundary: terminal punct + whitespace + uppercase-letter/digit.
+# Uppercase lookahead keeps "e.g. foo" from splitting — at the cost of
+# missing "Dr. Smith" style splits, which hurts nothing beyond cache
+# granularity. Explicit whitespace class (not \s): Python's \s matches our
+# sentinel bytes \x1e/\x1d/\x1c, which would otherwise let the match step
+# over a structural boundary.
 _WS = r"[ \t\n\r\f\v]"
-_SENTENCE_BOUNDARY = re.compile(rf"(?<=[.!?]){_WS}+(?=[A-Z0-9])|\n{{2,}}")
+_SENTENCE_BOUNDARY = re.compile(rf"(?<=[.!?]){_WS}+(?=[A-Z0-9])")
+# Paragraph boundary: two or more consecutive newlines, possibly with
+# horizontal whitespace between. Handled first so the paragraph marker
+# survives into the downstream sentence-level split.
+_PARAGRAPH_BOUNDARY = re.compile(r"\n[ \t]*\n[\s]*")
 
 
 def split_sentences(text: str) -> str:
+    # Paragraph first: replace the blank-line run with a sentence sentinel
+    # (so sentence-level splitting still sees the boundary) plus a paragraph
+    # prefix (so the next sentence carries "longer pause before me").
+    text = _PARAGRAPH_BOUNDARY.sub(SENTENCE_SENTINEL + PARAGRAPH_SENTINEL, text)
     text = _SENTENCE_BOUNDARY.sub(SENTENCE_SENTINEL, text)
     # Collapse runs of sentence sentinels with whitespace between them.
+    # \x1c deliberately not in the whitespace class — it survives as the
+    # paragraph prefix on the next surviving sentinel.
     text = re.sub(rf"\x1d({_WS}*\x1d)+", SENTENCE_SENTINEL, text)
+    # If a paragraph marker ends up at the very start of the output (the
+    # selection began with a blank line), there is no "before" to pause
+    # against — drop leading markers.
+    text = text.lstrip(PARAGRAPH_SENTINEL)
     return text
 
 
