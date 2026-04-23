@@ -55,6 +55,52 @@ def normalize_whitespace(text: str) -> str:
     return text.translate(_WS_NORMALIZE)
 
 
+# --- HTML article extraction ---------------------------------------------
+
+# trafilatura is an optional user-site dep. When absent, extraction is a
+# pass-through; the regex web-chrome cleanup downstream still covers simple
+# cases.
+try:
+    import trafilatura as _trafilatura
+    _HAVE_TRAFILATURA = True
+except ImportError:  # pragma: no cover — optional
+    _HAVE_TRAFILATURA = False
+
+# Cheap HTML sniff. Full-document tags are the strong signal; closing-tag
+# density catches fragments that omit <html>/<body>. "if x < 5 and y > 3"
+# has zero `</`, so comparison operators never trigger.
+_HTML_SIGNALS = re.compile(r"<html|<article|<body", re.IGNORECASE)
+_CLOSE_TAG = re.compile(r"</")
+
+
+def _looks_like_html(text: str) -> bool:
+    if _HTML_SIGNALS.search(text):
+        return True
+    return len(_CLOSE_TAG.findall(text)) >= 5
+
+
+def maybe_extract_article(text: str) -> str:
+    """Run trafilatura if the input looks like HTML; otherwise pass through.
+
+    Returns Markdown on success — downstream strip_markdown() handles both
+    Markdown and plain text, so callers don't need to know which ran.
+    """
+    if not _HAVE_TRAFILATURA or not _looks_like_html(text):
+        return text
+    extracted = _trafilatura.extract(
+        text,
+        output_format="markdown",
+        include_comments=False,
+        include_tables=False,
+    )
+    if extracted is None:
+        return text
+    # Guard against trafilatura returning a fragment for malformed snippets.
+    if len(text) > 500 and len(extracted) < 100:
+        return text
+    return extracted
+
+
 # --- Markdown -------------------------------------------------------------
 
 # Each entry: (compiled pattern, replacement or callable). Order matters —
@@ -595,6 +641,7 @@ def split_sentences(text: str) -> str:
 def main() -> int:
     text = sys.stdin.read()
     text = normalize_whitespace(text)
+    text = maybe_extract_article(text)
     text = strip_markdown(text)
     text = clean_web_artifacts(text)
     text = normalize_dashes(text)
