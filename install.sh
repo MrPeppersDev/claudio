@@ -122,14 +122,17 @@ echo "installing deps into venv..."
 "$REPO/kokoro/venv/bin/pip" install --upgrade pip >/dev/null
 "$REPO/kokoro/venv/bin/pip" install -r "$REPO/kokoro/requirements.txt"
 
-# preprocess.py runs under /usr/bin/python3 (not the venv above) and uses
-# optional user-site deps. Each has a graceful fallback so failures are non-fatal.
+# preprocess.py and pdf_extract.py run under /usr/bin/python3 (not the venv
+# above) and use optional user-site deps. Each has a graceful fallback so
+# failures are non-fatal.
 /usr/bin/python3 -m pip install --user --quiet pysbd \
   || echo "WARN: pysbd install failed — preprocess.py will use regex fallback"
 /usr/bin/python3 -m pip install --user --quiet num2words inflect \
   || echo "WARN: num2words/inflect install failed — number spell-out will be skipped (non-fatal)"
 /usr/bin/python3 -m pip install --user --quiet trafilatura lxml_html_clean \
   || echo "WARN: trafilatura install failed — HTML article extraction will be skipped (non-fatal)"
+/usr/bin/python3 -m pip install --user --quiet pymupdf \
+  || echo "WARN: pymupdf install failed — PDF direct extraction will fall back to Live Text nudge (non-fatal)"
 
 # --- 3. Model weights ---
 bash "$REPO/kokoro/download-model.sh"

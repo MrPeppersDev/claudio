@@ -337,11 +337,38 @@ local function captureSelection(cb)
     end
 
     lastSeenChangeCount = newCount
-    -- Empty capture. For known PDF viewers, pass back a targeted hint so
-    -- the caller can surface the Live Text / right-click-Copy workaround
-    -- rather than the generic "highlight text" alert.
-    local hint = PDF_VIEWERS[frontName] and (frontName .. ": " .. PDF_EMPTY_HINT) or nil
-    cb(nil, hint)
+    -- Empty capture. For known PDF viewers, try to resolve the open
+    -- document path via AX so the caller can attempt direct extraction
+    -- with pdf_extract.py. If AX yields a path we return a table hint
+    -- {pdfPath=..., text=...} so the caller can choose; if not, fall back
+    -- to the plain text hint that nudges toward Live Text.
+    if PDF_VIEWERS[frontName] then
+      local pdfPath = nil
+      local ok, frontWin = pcall(function()
+        return hs.application.frontmostApplication():focusedWindow()
+      end)
+      if ok and frontWin then
+        local axOk, winEl = pcall(hs.axuielement.windowElement, frontWin)
+        if axOk and winEl then
+          -- AXDocument is a file:// URL on the main window in Preview and Skim.
+          local docAttr = winEl:attributeValue("AXDocument")
+          if type(docAttr) == "string" and docAttr:sub(1, 7) == "file://" then
+            -- URL-decode %20 etc. via a simple gsub for the common case;
+            -- full percent-decoding is not needed for typical file paths.
+            pdfPath = docAttr:sub(8):gsub("%%(%x%x)", function(h)
+              return string.char(tonumber(h, 16))
+            end)
+          end
+        end
+      end
+      if pdfPath then
+        cb(nil, { pdfPath = pdfPath, text = frontName .. ": " .. PDF_EMPTY_HINT })
+      else
+        cb(nil, { text = frontName .. ": " .. PDF_EMPTY_HINT })
+      end
+    else
+      cb(nil, nil)
+    end
   end
 
   local elapsed = 0
@@ -395,8 +422,44 @@ function M.toggle()
       if tmp then
         runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
       end
-    elseif hint then
-      hs.alert.show("Claudio: " .. hint, 3)
+    elseif hint and hint.pdfPath then
+      -- PDF viewer with a resolved document path: try direct extraction via
+      -- pdf_extract.py. On success (exit 0) pipe the extracted text into
+      -- play-last.sh the same way a selection would go. On exit 2 (scanned /
+      -- no text layer) or exit 1 (other error) fall back to the Live Text
+      -- nudge so the user still gets a useful prompt.
+      local extractScript = CLAUDIO_DIR .. "/pdf_extract.py"
+      local tmp = hs.execute("mktemp '" .. STATE_DIR .. "/pdf_extract.XXXXXX'", true)
+      tmp = tmp and tmp:gsub("%s+$", "") or nil
+      if not tmp or tmp == "" then
+        hs.alert.show("Claudio: mktemp failed")
+        return
+      end
+      hs.task.new("/usr/bin/python3",
+        function(code, stdout, stderr)
+          if code == 0 and stdout and #stdout > 0 then
+            -- Write extracted text to the tempfile and play it.
+            local f = io.open(tmp, "w")
+            if f then
+              f:write(stdout)
+              f:close()
+              runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
+            else
+              os.remove(tmp)
+              hs.alert.show("Claudio: could not write PDF text")
+            end
+          else
+            -- Exit 2 = scanned PDF; exit 1 = other error. Either way, nudge
+            -- toward Live Text so the user isn't left with nothing.
+            os.remove(tmp)
+            hs.alert.show("Claudio: " .. (hint.text or PDF_EMPTY_HINT), 3)
+          end
+        end,
+        { extractScript, "--path", hint.pdfPath }
+      ):start()
+    elseif hint and hint.text then
+      -- PDF viewer but no resolved path (AX gave us nothing): show the hint.
+      hs.alert.show("Claudio: " .. hint.text, 3)
     else
       hs.alert.show("Claudio: highlight text to play")
     end
