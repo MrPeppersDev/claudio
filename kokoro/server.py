@@ -94,6 +94,23 @@ EQ_Q_RANGE = (0.1, 20.0)
 # so the first phoneme's attack can sound smushed. A short pad (~80ms)
 # gives the ear an onset cue without adding noticeable dead air.
 PAD_START_MS_RANGE = (0.0, 1000.0)
+# Trailing silence target. Kokoro bakes ~100-200ms of tail silence into
+# every utterance; back-to-back sentences compound that with the next
+# sentence's leading pad, so inter-sentence gaps drift to 250-350ms. We
+# detect where audible signal ends (windowed RMS) and keep only this much.
+TAIL_TRIM_MS_RANGE = (0.0, 1000.0)
+# RMS energy threshold for "is this frame audible" when locating the tail.
+# -45 dBFS  →  10 ** (-45/20) ≈ 0.0056. Chosen well above the noise floor
+# but below any phoneme you'd want to keep — including unvoiced stops like
+# t/p/k whose release bursts sit at 0.01-0.04 RMS.
+TAIL_RMS_THRESHOLD = 10 ** (-45.0 / 20.0)  # ≈ 0.0056
+# Frame length for RMS analysis: 10ms at Kokoro's native 24 kHz.
+TAIL_RMS_FRAME_SAMPLES = 240  # 10ms @ 24000 Hz
+# Dwell: how many consecutive below-threshold frames we require after the
+# last audible frame before committing the trim point. 6 frames = 60ms.
+# Unvoiced stop release bursts last 20-80ms (≤8 frames), so they survive
+# as long as the silence after them hasn't accumulated 60ms yet.
+TAIL_RMS_DWELL_FRAMES = 6  # 60ms
 
 
 class ValidationError(ValueError):
@@ -293,6 +310,73 @@ def peaking_eq(samples: np.ndarray, fs: int, f0: float, gain_db: float, q: float
     return lfilter(b, a, samples).astype(samples.dtype)
 
 
+def trim_tail_silence(samples: np.ndarray, sample_rate: int, target_ms: float) -> np.ndarray:
+    """
+    Trim trailing silence so only ``target_ms`` of tail remains after the
+    last audible frame.
+
+    Algorithm:
+    1. Compute per-frame RMS energy in non-overlapping 10ms windows.
+    2. Walk backward to find the last frame whose RMS exceeds
+       TAIL_RMS_THRESHOLD.
+    3. Require TAIL_RMS_DWELL_FRAMES (60ms) of continuous below-threshold
+       frames after that anchor before committing the trim. This keeps
+       unvoiced stop release bursts (t/p/k, 20-80ms) intact because their
+       energy spike is audible and they haven't yet accumulated 60ms of
+       silence behind them.
+    4. Keep ``target_ms`` of silence after the anchor frame.
+
+    Edge cases:
+    - target_ms <= 0 → return unchanged (disable)
+    - samples.size == 0 → return unchanged
+    - all-silent input → return unchanged (no anchor to trim to)
+    - existing tail already shorter than target_ms → return unchanged
+    - signal shorter than one frame → return unchanged
+    """
+    if target_ms <= 0 or samples.size == 0:
+        return samples
+
+    frame = TAIL_RMS_FRAME_SAMPLES
+    n_frames = samples.size // frame
+    if n_frames == 0:
+        return samples
+
+    # Compute RMS per frame using reshape (avoids per-frame Python loop).
+    frames = samples[:n_frames * frame].reshape(n_frames, frame).astype(np.float64)
+    rms = np.sqrt(np.mean(frames ** 2, axis=1))
+
+    # Walk backward: find last frame above threshold followed by at least
+    # TAIL_RMS_DWELL_FRAMES consecutive below-threshold frames.
+    last_audible_frame = -1
+    for i in range(n_frames - 1, -1, -1):
+        if rms[i] > TAIL_RMS_THRESHOLD:
+            # Check dwell: need TAIL_RMS_DWELL_FRAMES silent frames after i.
+            dwell_end = i + 1 + TAIL_RMS_DWELL_FRAMES
+            if dwell_end > n_frames:
+                # Not enough frames left after i for the dwell requirement —
+                # this could be a burst very close to the end of the signal.
+                # Treat it as the anchor anyway (conservative: don't trim).
+                last_audible_frame = i
+                break
+            # All frames in [i+1, i+1+DWELL) must be below threshold.
+            if np.all(rms[i + 1:dwell_end] <= TAIL_RMS_THRESHOLD):
+                last_audible_frame = i
+                break
+
+    if last_audible_frame < 0:
+        # All silent — nothing to anchor the trim to.
+        return samples
+
+    keep_samples = int(round(sample_rate * target_ms / 1000.0))
+    # Anchor at end of last audible frame.
+    anchor_sample = (last_audible_frame + 1) * frame
+    end = min(samples.size, anchor_sample + keep_samples)
+    if end >= samples.size:
+        # Existing tail is already no longer than target_ms — never extend.
+        return samples
+    return samples[:end]
+
+
 def samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
     pcm = np.clip(samples, -1.0, 1.0)
     pcm = (pcm * 32767.0).astype(np.int16)
@@ -390,6 +474,10 @@ class Handler(BaseHTTPRequestHandler):
                 _parse_float(payload.get("pad_start_ms"), field="pad_start_ms", default=0.0),
                 field="pad_start_ms", lo=PAD_START_MS_RANGE[0], hi=PAD_START_MS_RANGE[1],
             )
+            tail_trim_ms = _check_range(
+                _parse_float(payload.get("tail_trim_ms"), field="tail_trim_ms", default=0.0),
+                field="tail_trim_ms", lo=TAIL_TRIM_MS_RANGE[0], hi=TAIL_TRIM_MS_RANGE[1],
+            )
         except ValidationError as e:
             self._json(400, {"error": str(e)})
             return
@@ -426,6 +514,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         t1 = time.time()
         samples = peaking_eq(samples, sr, eq_freq, eq_gain_db, eq_q)
+        # Trim before pad so the pad length is exactly what the client asked
+        # for regardless of how much native tail Kokoro baked in.
+        if tail_trim_ms > 0:
+            samples = trim_tail_silence(samples, sr, tail_trim_ms)
         if pad_start_ms > 0:
             # Prepend zero samples after EQ so we don't run the filter over
             # silence (pointless cost; silence stays silent anyway). The
@@ -442,6 +534,7 @@ class Handler(BaseHTTPRequestHandler):
             f"[kokoro] synth chars={len(text)} phonemes={len(phonemes)} "
             f"chunks={len(chunks)} voice={voice_spec} speed={speed} "
             f"eq={eq_gain_db}dB@{eq_freq}Hz pad={pad_start_ms}ms "
+            f"trim={tail_trim_ms}ms "
             f"synth={t1-t0:.2f}s eq_time={t2-t1:.3f}s "
             f"encode={t3-t2:.2f}s bytes={len(wav)}\n"
         )
