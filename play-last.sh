@@ -35,6 +35,11 @@ LOG_FILE="$STATE_DIR/play.log"
 PREPROCESS="$SCRIPT_DIR/preprocess.py"
 TTS_SCRIPT="$SCRIPT_DIR/kokoro-tts.sh"
 SERVER_SCRIPT="$SCRIPT_DIR/kokoro-server.sh"
+# Queue mode: items in QUEUE_DIR, drain coordinator's pid + atomic lock
+# sit as siblings so wiping items doesn't disturb drain ownership.
+QUEUE_DIR="$STATE_DIR/queue"
+QUEUE_PID_FILE="$STATE_DIR/queue.pid"
+QUEUE_LOCK_DIR="$STATE_DIR/queue.lock"
 
 # Ensure Kokoro server is up. Idempotent: ~0.05s when healthy, up to ~8s on
 # cold start. Called only when we're about to synth (not on toggle-stop).
@@ -45,13 +50,18 @@ ensure_server() {
   }
 }
 
-# Usage: play-last.sh --text-file <path>
-#   --text-file   read playback text from this file
-# No-args form is reserved for the toggle-stop path (kills an in-flight job).
+# Usage:
+#   play-last.sh                              toggle-stop any in-flight job + queue
+#   play-last.sh --text-file <path>           play one selection (old behavior)
+#   play-last.sh --queue-add --text-file <p>  append selection to queue; drain if idle
+#   play-last.sh --drain                      internal: coordinator loop for queue mode
+MODE=play
 TEXT_FILE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --text-file) TEXT_FILE="${2:-}"; shift 2 ;;
+    --queue-add) MODE=queue-add; shift ;;
+    --drain)     MODE=drain; shift ;;
     *)           shift ;;  # ignore unknowns for forward-compat
   esac
 done
@@ -109,7 +119,123 @@ collect_descendants() {
   done
 }
 
-# --- Toggle: stop any in-flight job ---
+# Returns 0 if the drain coordinator is running.
+drain_is_alive() {
+  [ -r "$QUEUE_PID_FILE" ] || return 1
+  local pid
+  pid=$(cat "$QUEUE_PID_FILE" 2>/dev/null || true)
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# --- Queue-add: append this selection to the queue; start drain if needed ---
+if [ "$MODE" = "queue-add" ]; then
+  if [ -z "$TEXT_FILE" ] || [ ! -r "$TEXT_FILE" ]; then
+    log "queue-add: missing/unreadable text file: ${TEXT_FILE:-<unset>}"
+    exit 1
+  fi
+  mkdir -p "$QUEUE_DIR"
+  # mktemp gives a collision-safe name; mtime is what we sort on for
+  # playback order, so two items added the same second still stay distinct.
+  dest=$(mktemp "$QUEUE_DIR/item.XXXXXXXX")
+  mv "$TEXT_FILE" "$dest" || { log "queue-add: move failed"; exit 1; }
+  queued_count=$(ls -1 "$QUEUE_DIR" 2>/dev/null | wc -l | tr -d ' ')
+  log "queue-add: enqueued $(basename "$dest") (queue=$queued_count)"
+  # Advisory check — the atomic lock inside --drain is what actually
+  # prevents two drainers, so races here are benign.
+  if drain_is_alive; then
+    exit 0
+  fi
+  log "queue-add: starting drain"
+  nohup "$0" --drain >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  exit 0
+fi
+
+# --- Drain: coordinator loop for queued items ---
+if [ "$MODE" = "drain" ]; then
+  # Atomic start — mkdir is the lock primitive. A stale lock dir from a
+  # hard-killed drain would otherwise block all future drains, so check the
+  # pid inside it and steal the lock if that process is gone.
+  if ! mkdir "$QUEUE_LOCK_DIR" 2>/dev/null; then
+    old_drain=""
+    [ -r "$QUEUE_PID_FILE" ] && old_drain=$(cat "$QUEUE_PID_FILE" 2>/dev/null || true)
+    if [ -n "$old_drain" ] && kill -0 "$old_drain" 2>/dev/null; then
+      log "drain: another drain already running (pid=$old_drain), exiting"
+      exit 0
+    fi
+    log "drain: clearing stale lock (old pid=$old_drain)"
+    rm -rf "$QUEUE_LOCK_DIR"
+    rm -f "$QUEUE_PID_FILE"
+    mkdir "$QUEUE_LOCK_DIR" || { log "drain: lock acquire failed"; exit 1; }
+  fi
+  echo $$ > "$QUEUE_PID_FILE"
+  log "drain: started pid=$$"
+
+  current_child=""
+  drain_cleanup() {
+    # Kill whatever child is still running (if we got SIGTERMed mid-item)
+    if [ -n "$current_child" ] && kill -0 "$current_child" 2>/dev/null; then
+      kill -TERM "$current_child" 2>/dev/null || true
+    fi
+    rm -rf "$QUEUE_DIR" "$QUEUE_LOCK_DIR"
+    rm -f "$QUEUE_PID_FILE"
+    write_state idle
+    log "drain: cleanup done"
+  }
+  trap drain_cleanup EXIT INT TERM
+
+  while :; do
+    # Oldest first. `ls -tr` sorts by mtime ascending on both BSD + GNU ls.
+    next=$(ls -tr "$QUEUE_DIR" 2>/dev/null | head -1 || true)
+    if [ -z "$next" ]; then
+      log "drain: queue empty"
+      break
+    fi
+    next_path="$QUEUE_DIR/$next"
+    log "drain: playing $next"
+    # Run as a background child so we can capture its pid for our trap.
+    # `wait` returns the child's exit status.
+    "$0" --text-file "$next_path" &
+    current_child=$!
+    set +e
+    wait "$current_child"
+    ec=$?
+    set -e
+    current_child=""
+    # 143 = SIGTERM (toggle-stop killed us). Any nonzero exit → stop draining;
+    # the user either asked to stop or the play path errored and further
+    # items probably won't fare better.
+    if [ "$ec" -ne 0 ]; then
+      log "drain: child exited $ec — stopping"
+      break
+    fi
+  done
+  exit 0
+fi
+
+# --- Toggle: stop any in-flight job or queue ---
+# Queue drain first: a running drain would otherwise spawn the next item
+# seconds after we killed the current one, defeating the stop. Drain's own
+# trap sweeps its child + state; the rm lines are belt-and-braces in case
+# the drain got SIGKILLed (trap wouldn't fire) or died uncleanly earlier.
+if [ -z "$TEXT_FILE" ] && [ "$MODE" = "play" ] && drain_is_alive; then
+  drain_pid=$(cat "$QUEUE_PID_FILE" 2>/dev/null || true)
+  kill -TERM "$drain_pid" 2>/dev/null || true
+  sleep 0.2
+  if [ -n "$drain_pid" ] && kill -0 "$drain_pid" 2>/dev/null; then
+    kill -KILL "$drain_pid" 2>/dev/null || true
+  fi
+  rm -rf "$QUEUE_DIR" "$QUEUE_LOCK_DIR"
+  rm -f "$QUEUE_PID_FILE"
+  log "stopped drain pid=$drain_pid"
+  # If there's no single-item lock left to handle, we're done; otherwise
+  # fall through so the LOCK_FILE block below kills the remaining playback.
+  if [ ! -f "$LOCK_FILE" ]; then
+    write_state idle
+    exit 0
+  fi
+fi
+
 if [ -f "$LOCK_FILE" ]; then
   OLD_PID=$(cat "$LOCK_FILE" 2>/dev/null || true)
   if [ -n "${OLD_PID:-}" ] && kill -0 "$OLD_PID" 2>/dev/null && is_our_process "$OLD_PID"; then

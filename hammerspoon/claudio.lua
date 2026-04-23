@@ -25,6 +25,7 @@ local SPEED_FILE = STATE_DIR .. "/speed"
 local VOICE_FILE = STATE_DIR .. "/voice"
 local PLAY_LOG = STATE_DIR .. "/play.log"
 local SERVER_LOG = STATE_DIR .. "/kokoro-server.log"
+local QUEUE_DIR = STATE_DIR .. "/queue"
 local PLAY_SCRIPT = CLAUDIO_DIR .. "/play-last.sh"
 local SERVER_SCRIPT = CLAUDIO_DIR .. "/kokoro-server.sh"
 local KOKORO_URL = os.getenv("KOKORO_URL") or "http://127.0.0.1:8880"
@@ -143,6 +144,58 @@ local function fetchVoices()
   table.sort(voices)
   cachedVoices = voices
   return voices
+end
+
+-- ============================================================
+-- Queue helpers
+-- ============================================================
+
+-- Returns a list of queued items oldest-first: { {name, preview}, ... }.
+-- Sorting by mtime matches play-last.sh's drain order (`ls -tr`), so what
+-- the menu shows is exactly what will play. Preview is the first non-blank
+-- line of the file truncated for menu display.
+local function readQueue()
+  -- hs.fs.dir throws on a missing directory (not just returns nil), so
+  -- stat first. Queue dir is created by play-last.sh on first enqueue.
+  if not hs.fs.attributes(QUEUE_DIR) then return {} end
+  local ok_dir, dir = pcall(hs.fs.dir, QUEUE_DIR)
+  if not ok_dir or not dir then return {} end
+  local items = {}
+  for name in dir do
+    if name ~= "." and name ~= ".." then
+      local path = QUEUE_DIR .. "/" .. name
+      local attrs = hs.fs.attributes(path)
+      if attrs and attrs.mode == "file" then
+        local f = io.open(path, "r")
+        local first = ""
+        if f then
+          -- Read enough to get past leading blank lines without slurping a
+          -- 100 KB paste. 2 KB is plenty for a menu preview.
+          local head = f:read(2048) or ""
+          f:close()
+          for line in head:gmatch("[^\n]+") do
+            local t = line:match("^%s*(.-)%s*$")
+            if t ~= "" then first = t; break end
+          end
+        end
+        if #first > 60 then first = first:sub(1, 57) .. "…" end
+        table.insert(items, {
+          name = name,
+          preview = first,
+          mtime = attrs.modification or 0,
+        })
+      end
+    end
+  end
+  table.sort(items, function(a, b) return a.mtime < b.mtime end)
+  return items
+end
+
+-- Clear all queue files. Leaves the drain coordinator alive: it will see
+-- the empty directory on its next `ls` iteration and exit through its own
+-- cleanup trap, which is safer than trying to signal it from here.
+local function clearQueueFiles()
+  hs.execute("rm -f '" .. QUEUE_DIR .. "'/item.* 2>/dev/null", true)
 end
 
 -- ============================================================
@@ -288,6 +341,25 @@ end
 -- Toggle (same entry point from menu item and F13)
 -- ============================================================
 
+-- Common: grab selection → write to a mode-0600 tempfile → invoke play-last.sh.
+-- Returns the tmp path, or nil on failure (already alerted).
+local function selectionToTempfile(selection)
+  -- mktemp creates the file mode-0600 on macOS, so the selection —
+  -- which may contain tokens, private chat text, or PII — isn't
+  -- world-readable in ~/.claude/claudio/. play-last.sh unlinks the
+  -- file immediately after reading it, so the window of exposure is
+  -- only the synth lifetime rather than until-next-F13.
+  local tmp = hs.execute("mktemp '" .. STATE_DIR .. "/selection.XXXXXX'", true)
+  tmp = tmp and tmp:gsub("%s+$", "") or nil
+  if not tmp or tmp == "" then
+    hs.alert.show("Claudio: mktemp failed")
+    return nil
+  end
+  local f = io.open(tmp, "w")
+  if f then f:write(selection); f:close() end
+  return tmp
+end
+
 function M.toggle()
   if jobIsRunning() then
     runPlayScript({ PLAY_SCRIPT })
@@ -296,22 +368,30 @@ function M.toggle()
 
   captureSelection(function(selection)
     if selection then
-      -- mktemp creates the file mode-0600 on macOS, so the selection —
-      -- which may contain tokens, private chat text, or PII — isn't
-      -- world-readable in ~/.claude/claudio/. play-last.sh unlinks the
-      -- file immediately after reading it, so the window of exposure is
-      -- only the synth lifetime rather than until-next-F13.
-      local tmp = hs.execute("mktemp '" .. STATE_DIR .. "/selection.XXXXXX'", true)
-      tmp = tmp and tmp:gsub("%s+$", "") or nil
-      if not tmp or tmp == "" then
-        hs.alert.show("Claudio: mktemp failed")
-        return
+      local tmp = selectionToTempfile(selection)
+      if tmp then
+        runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
       end
-      local f = io.open(tmp, "w")
-      if f then f:write(selection); f:close() end
-      runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
     else
       hs.alert.show("Claudio: highlight text to play")
+    end
+  end)
+end
+
+-- Append current selection to the queue. If a job is already running, this
+-- lets the user stack "what's next" without interrupting what's playing.
+-- play-last.sh handles both the mv-into-queue and (if needed) spawning the
+-- drain coordinator, so from here it's just capture → write → invoke.
+function M.queueAdd()
+  captureSelection(function(selection)
+    if not selection then
+      hs.alert.show("Claudio: highlight text to queue")
+      return
+    end
+    local tmp = selectionToTempfile(selection)
+    if tmp then
+      runPlayScript({ PLAY_SCRIPT, "--queue-add", "--text-file", tmp })
+      hs.alert.show("Queued", 0.8)
     end
   end)
 end
@@ -337,6 +417,7 @@ local function buildMenu()
   local s = readState()
   local busy = (s.state == "play" or s.state == "synth")
   local kokoroUp = kokoroServerRunning()
+  local queue = readQueue()
 
   local statusLabel
   if s.state == "play" then statusLabel = "Playing"
@@ -366,6 +447,50 @@ local function buildMenu()
       end
     end,
   })
+
+  -- Queue selection. Same refocus dance as Speak — the capture path is
+  -- identical, we just hand off to play-last.sh with --queue-add. Title
+  -- shows the pending count when non-empty so the user doesn't have to
+  -- open the submenu to see how deep the queue is.
+  local queueTitle = "＋ Queue selection"
+  if #queue > 0 then
+    queueTitle = queueTitle .. " (" .. #queue .. " pending)"
+  end
+  table.insert(items, {
+    title = queueTitle,
+    fn = function()
+      if lastFrontApp then
+        lastFrontApp:activate()
+        hs.timer.doAfter(0.08, function() M.queueAdd() end)
+      else
+        M.queueAdd()
+      end
+    end,
+  })
+
+  -- Queue inspection + clear. Submenu is only shown when there's something
+  -- to inspect; an empty submenu is just noise. Items are disabled (display-
+  -- only) — clicking them should not replay or reorder; the only action is
+  -- "Clear queue".
+  if #queue > 0 then
+    local queueSubmenu = {}
+    for i, item in ipairs(queue) do
+      local preview = item.preview ~= "" and item.preview or "(empty)"
+      table.insert(queueSubmenu, {
+        title = string.format("%d. %s", i, preview),
+        disabled = true,
+      })
+    end
+    table.insert(queueSubmenu, { title = "-" })
+    table.insert(queueSubmenu, {
+      title = "Clear queue",
+      fn = function() clearQueueFiles() end,
+    })
+    table.insert(items, {
+      title = "Queue: " .. #queue .. " pending",
+      menu = queueSubmenu,
+    })
+  end
 
   table.insert(items, { title = "-" })
 
