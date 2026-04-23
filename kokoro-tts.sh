@@ -27,10 +27,11 @@
 #                      on the first afplay doesn't eat the opening word
 #                      (default: 150; 0 disables)
 #   KOKORO_TAIL_TRIM_MS trailing silence kept after the last audible sample.
-#                      Kokoro bakes ~100-200ms of tail into every utterance
-#                      and back-to-back sentences compound that with the
-#                      next sentence's pad, so tighten to this much
-#                      (default: 40; 0 disables — keep Kokoro's native tail)
+#                      Kokoro bakes ~100-200ms of tail into every utterance.
+#                      Disabled by default because the single-sample threshold
+#                      in server.py eats soft unvoiced closing consonants
+#                      (t/p/k); the planned windowed-RMS replacement will
+#                      re-enable with a safe default (default: 0 = no trim)
 #
 # Owned by play-last.sh via job.pid; writes state={synth,play} to the state
 # file; afplay runs in foreground so the parent's pkill -P tears everything
@@ -64,7 +65,7 @@ EQ_GAIN_DB="${KOKORO_EQ_GAIN_DB:-3.0}"
 EQ_FREQ="${KOKORO_EQ_FREQ:-2500}"
 EQ_Q="${KOKORO_EQ_Q:-1.0}"
 PAD_START_MS="${KOKORO_PAD_START_MS:-150}"
-TAIL_TRIM_MS="${KOKORO_TAIL_TRIM_MS:-40}"
+TAIL_TRIM_MS="${KOKORO_TAIL_TRIM_MS:-0}"
 mkdir -p "$CACHE_DIR"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
@@ -254,13 +255,13 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
       afplay "$EARCON"
     fi
 
-    # Paragraph-level pause. Now that the server trims Kokoro's tail to
-    # ~40ms, we need less explicit pause: 150ms here + 40ms trimmed tail
-    # + 150ms leading pad on the next sentence ≈ 340ms of break, which
-    # still sounds paragraph-y without dragging. Gated on "playing" so
-    # we never pause before the very first utterance.
+    # Paragraph-level pause. With trim disabled, Kokoro's native 100-200ms
+    # tail is back in play, so pair that with a short explicit sleep for
+    # ~300ms total break — paragraph-y without dragging. When windowed-RMS
+    # trim ships this should drop back to ~0.15. Gated on "playing" so we
+    # never pause before the very first utterance.
     if [ "$paragraph_before" -eq 1 ] && [ "$playing" -eq 1 ]; then
-      sleep 0.15
+      sleep 0.2
     fi
 
     if [ "$playing" -eq 0 ]; then
