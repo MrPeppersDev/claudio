@@ -27,10 +27,24 @@ local SERVER_SCRIPT = CLAUDIO_DIR .. "/kokoro-server.sh"
 local menubar = nil
 local watcher = nil
 -- Tracks the pasteboard changeCount at the time of the last toggle. Used by
--- the iTerm copy-on-select fallback to distinguish "user just selected new
--- text" (changeCount advanced since last toggle) from "stale clipboard from
--- minutes ago" (no change since last toggle).
+-- the copy-on-select terminal fallback to distinguish "user just selected
+-- new text" (changeCount advanced since last toggle) from "stale clipboard
+-- from minutes ago" (no change since last toggle).
 local lastSeenChangeCount = nil
+
+-- Terminal apps that copy-on-select (selection is already on the pasteboard
+-- without Cmd+C). Gating the stale-pasteboard fallback to these apps avoids
+-- replaying whatever's been sitting on the clipboard in a non-terminal app.
+-- Membership keyed by hs.application.frontmostApplication():name().
+local COPY_ON_SELECT_TERMINALS = {
+  ["iTerm2"] = true,
+  ["iTerm"] = true,
+  ["Terminal"] = true,
+  ["Alacritty"] = true,
+  ["kitty"] = true,
+  ["WezTerm"] = true,
+  ["Ghostty"] = true,
+}
 
 -- ============================================================
 -- State helpers
@@ -93,7 +107,7 @@ local function runPlayScript(args)
 end
 
 -- ============================================================
--- Selection capture (AX → Cmd+C → iTerm copy-on-select)
+-- Selection capture (AX → Cmd+C → copy-on-select terminal fallback)
 -- ============================================================
 
 local function axSelection()
@@ -143,8 +157,7 @@ local function captureSelection(cb)
       return
     end
 
-    local isTerminal = (frontName == "iTerm2" or frontName == "iTerm"
-                        or frontName == "Terminal")
+    local isTerminal = COPY_ON_SELECT_TERMINALS[frontName] == true
     local baseline = lastSeenChangeCount or prevCount
     if isTerminal and newContents and #newContents > 0
         and newCount > baseline then
@@ -171,23 +184,6 @@ local function captureSelection(cb)
     hs.timer.doAfter(POLL_MS / 1000, poll)
   end
   hs.timer.doAfter(POLL_MS / 1000, poll)
-end
-
-local function focusedItermSessionId()
-  local okCall, id = hs.osascript.applescript([[
-    tell application "System Events"
-      if not (exists (processes where name is "iTerm2")) then return ""
-    end tell
-    tell application "iTerm2"
-      try
-        return unique id of current session of current window
-      on error
-        return ""
-      end try
-    end tell
-  ]])
-  if okCall and type(id) == "string" and id ~= "" then return id end
-  return nil
 end
 
 -- ============================================================
@@ -217,9 +213,6 @@ function M.toggle()
       if f then f:write(selection); f:close() end
       runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
     else
-      -- Selection-only mode. Full-message playback is disabled until we can
-      -- summarize server-side; otherwise F13 reads multi-paragraph responses
-      -- verbatim, which is rarely what you actually want.
       hs.alert.show("Claudio: highlight text to play")
     end
   end)
