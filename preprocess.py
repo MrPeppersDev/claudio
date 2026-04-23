@@ -253,6 +253,149 @@ def normalize_dashes(text: str) -> str:
     return text
 
 
+# --- Numbers -------------------------------------------------------------
+#
+# Spell out numerals, currency, ordinals, percentages, and integers with
+# thousands separators so Kokoro receives words rather than glyphs. Runs
+# AFTER dash normalization (dashes → commas) and BEFORE the pronunciation
+# dictionary so dict entries can still act on the spelled-out output.
+#
+# Optional: if num2words is not installed (e.g. on a fresh /usr/bin/python3
+# without user-site packages), the function degrades to a no-op passthrough
+# so the rest of the pipeline keeps working.
+
+try:
+    import num2words as _num2words
+    _NUMBERS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _NUMBERS_AVAILABLE = False
+
+
+def _year_words(y: int) -> str:
+    """Return the spoken form of a 4-digit year.
+
+    1100-1999 and 2010-2099: split hi/lo (e.g. 2026 -> "twenty twenty-six").
+    1000-1099 and 2000-2009: full cardinal (e.g. 2001 -> "two thousand and one").
+    Exact centuries: "nineteen hundred" etc. (except 2000 -> "two thousand").
+    """
+    hi = y // 100
+    lo = y % 100
+    if y <= 1099 or (2000 <= y <= 2009):
+        return _num2words.num2words(y)
+    elif lo == 0:
+        return _num2words.num2words(hi) + " hundred"
+    else:
+        return _num2words.num2words(hi) + " " + _num2words.num2words(lo)
+
+
+# Pattern to find 4-digit years in the range 1100-2029.
+_YEAR_BARE = re.compile(r"\b(1[1-9]\d{2}|20[0-2]\d)\b")
+# Preceding words that signal a year is being used as a year.
+_YEAR_TRIGGER_BEFORE = re.compile(
+    r"(?:in|since|until|before|after|around|by|from|through|during|circa|year|ca\.?|c\.)\s+$",
+    re.IGNORECASE,
+)
+# Following text that signals a year reading is correct.
+_YEAR_TRIGGER_AFTER = re.compile(
+    r"^\s*(?:AD|BC|CE|BCE\b|[,\.]\s|\s+(?:was|is|will|are|saw|marks|marked|began|ended|started|witnessed))",
+    re.IGNORECASE,
+)
+
+# Currency: optional space after $, comma-grouped digits, optional cents.
+_CURRENCY_RE = re.compile(r"\$\s?[\d,]+(?:\.\d{1,2})?")
+# Ordinals: digits followed immediately by st/nd/rd/th.
+_ORDINAL_RE = re.compile(r"\b(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
+# Percentages: digits (with optional decimal) immediately before %.
+_PERCENT_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s?%")
+# Integers with comma thousands-separators (at least one comma group).
+_THOUSANDS_RE = re.compile(r"\b\d{1,3}(?:,\d{3})+\b")
+
+
+def _replace_currency(m):
+    # type: (re.Match) -> str
+    raw = m.group(0).lstrip("$").replace(",", "").strip()
+    if "." in raw:
+        dollar_str, cent_str = raw.split(".", 1)
+        dollars = int(dollar_str) if dollar_str else 0
+        cents = int(cent_str.ljust(2, "0")[:2])
+    else:
+        dollars = int(raw)
+        cents = 0
+    dw = _num2words.num2words(dollars)
+    dollar_label = "dollar" if dollars == 1 else "dollars"
+    if cents:
+        cw = _num2words.num2words(cents)
+        cent_label = "cent" if cents == 1 else "cents"
+        return "{} {} and {} {}".format(dw, dollar_label, cw, cent_label)
+    return "{} {}".format(dw, dollar_label)
+
+
+def _replace_ordinal(m):
+    # type: (re.Match) -> str
+    return _num2words.num2words(int(m.group(1)), to="ordinal")
+
+
+def _replace_percent(m):
+    # type: (re.Match) -> str
+    n = m.group(1)
+    val = float(n) if "." in n else int(n)
+    return _num2words.num2words(val) + " percent"
+
+
+def _replace_thousands(m):
+    # type: (re.Match) -> str
+    return _num2words.num2words(int(m.group(0).replace(",", "")))
+
+
+def normalize_numbers(text):
+    # type: (str) -> str
+    """Spell out numbers, currency, ordinals, and percentages in *text*.
+
+    Order of substitution:
+      1. Currency (``$1,234.56``) -- must go first so the comma-grouped
+         digits don't get consumed by the thousands rule.
+      2. Ordinals (``3rd``, ``21st``) -- must go before bare integers so
+         ``3rd`` isn't turned into ``3 rd``.
+      3. Percentages (``42%``).
+      4. Years (``2026``) -- only when context suggests a calendar year.
+      5. Comma-grouped integers (``1,234``).
+
+    If ``num2words`` is not installed, returns *text* unchanged.
+    """
+    if not _NUMBERS_AVAILABLE:
+        return text
+
+    # 1. Currency
+    text = _CURRENCY_RE.sub(_replace_currency, text)
+
+    # 2. Ordinals
+    text = _ORDINAL_RE.sub(_replace_ordinal, text)
+
+    # 3. Percentages
+    text = _PERCENT_RE.sub(_replace_percent, text)
+
+    # 4. Years -- context-sensitive substitution. We snapshot the string
+    #    before substitution so before/after slices stay stable throughout
+    #    the re.sub pass (re.sub passes original match positions to the
+    #    callable, but the closure must refer to the *same* string the
+    #    regex was run against).
+    _year_source = text
+
+    def _replace_year(m):
+        before = _year_source[: m.start()]
+        after = _year_source[m.end() :]
+        if _YEAR_TRIGGER_BEFORE.search(before) or _YEAR_TRIGGER_AFTER.match(after):
+            return _year_words(int(m.group(1)))
+        return m.group(0)
+
+    text = _YEAR_BARE.sub(_replace_year, _year_source)
+
+    # 5. Comma-grouped integers (run after years so "1,900" isn't eaten first)
+    text = _THOUSANDS_RE.sub(_replace_thousands, text)
+
+    return text
+
+
 # --- Pronunciation dictionary --------------------------------------------
 
 def load_pronunciations(path: Path) -> list[tuple[str, str]]:
@@ -455,6 +598,7 @@ def main() -> int:
     text = strip_markdown(text)
     text = clean_web_artifacts(text)
     text = normalize_dashes(text)
+    text = normalize_numbers(text)
     rules = load_pronunciations(HERE / "pronunciations.txt")
     text = apply_pronunciations(text, rules)
     text = split_sentences(text)

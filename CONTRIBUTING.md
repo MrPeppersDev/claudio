@@ -50,6 +50,8 @@ idempotent, so running it twice should be harmless.
   avoid adding further heavy deps without a graceful fallback. Optional deps:
   - `pysbd` (MIT) — sentence boundary detection; falls back to regex splitter.
     Install: `pip install --user pysbd`
+  - `num2words` (LGPL-2.1) + `inflect` (MIT) — number/currency/ordinal
+    spell-out; skipped when unavailable. Install: `pip install --user num2words inflect`
 
 Comments explain *why*, not *what*. If a block does something surprising
 (e.g., why earcons are synchronous), say so.
