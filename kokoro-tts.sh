@@ -23,7 +23,14 @@
 #   KOKORO_EQ_FREQ     EQ center frequency, Hz (default: 2500)
 #   KOKORO_EQ_Q        EQ Q factor (default: 1.0)
 #   KOKORO_PAD_START_MS leading silence prepended to each synth WAV so the
-#                      first phoneme isn't smushed (default: 80; 0 disables)
+#                      first phoneme isn't smushed and so CoreAudio ramp-up
+#                      on the first afplay doesn't eat the opening word
+#                      (default: 150; 0 disables)
+#   KOKORO_TAIL_TRIM_MS trailing silence kept after the last audible sample.
+#                      Kokoro bakes ~100-200ms of tail into every utterance
+#                      and back-to-back sentences compound that with the
+#                      next sentence's pad, so tighten to this much
+#                      (default: 40; 0 disables — keep Kokoro's native tail)
 #
 # Owned by play-last.sh via job.pid; writes state={synth,play} to the state
 # file; afplay runs in foreground so the parent's pkill -P tears everything
@@ -56,20 +63,23 @@ CACHE_MAX_MB="${KOKORO_CACHE_MAX_MB:-200}"
 EQ_GAIN_DB="${KOKORO_EQ_GAIN_DB:-3.0}"
 EQ_FREQ="${KOKORO_EQ_FREQ:-2500}"
 EQ_Q="${KOKORO_EQ_Q:-1.0}"
-PAD_START_MS="${KOKORO_PAD_START_MS:-80}"
+PAD_START_MS="${KOKORO_PAD_START_MS:-150}"
+TAIL_TRIM_MS="${KOKORO_TAIL_TRIM_MS:-40}"
 mkdir -p "$CACHE_DIR"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
 
-# Hash key for a sentence: voice|synth_speed|lang|eq_*|pad_start_ms|text.
-# Any change in those produces different audio, so they all go into the key.
+# Hash key: voice|synth_speed|lang|eq_*|pad_start_ms|tail_trim_ms|text. Any
+# change in those produces different audio, so they all go into the key.
 # Null bytes between fields prevent "ab|c" colliding with "a|bc". Every
-# synthesis-affecting knob is mixed in, so toggling any env var (EQ, pad)
-# auto-invalidates stale cache instead of silently mixing pre/post audio.
+# synthesis-affecting knob is mixed in, so toggling any env var (EQ, pad,
+# trim) auto-invalidates stale cache instead of silently mixing pre/post
+# audio.
 sentence_hash() {
-  printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s' \
+  printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s' \
     "$VOICE" "$SYNTH_SPEED" "$LANG_CODE" \
-    "$EQ_GAIN_DB" "$EQ_FREQ" "$EQ_Q" "$PAD_START_MS" "$1" \
+    "$EQ_GAIN_DB" "$EQ_FREQ" "$EQ_Q" \
+    "$PAD_START_MS" "$TAIL_TRIM_MS" "$1" \
     | shasum -a 256 | awk '{print $1}'
 }
 
@@ -198,9 +208,10 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
         --argjson eq_freq "$EQ_FREQ" \
         --argjson eq_q "$EQ_Q" \
         --argjson pad_start_ms "$PAD_START_MS" \
+        --argjson tail_trim_ms "$TAIL_TRIM_MS" \
         '{text: $text, voice: $voice, speed: $speed, lang: $lang,
           eq_gain_db: $eq_gain_db, eq_freq: $eq_freq, eq_q: $eq_q,
-          pad_start_ms: $pad_start_ms}')
+          pad_start_ms: $pad_start_ms, tail_trim_ms: $tail_trim_ms}')
       HTTP_CODE=$(curl -sS -o "$cache_wav.tmp" -w '%{http_code}' \
         --max-time 120 \
         -X POST "$URL/speak" \
@@ -243,12 +254,13 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
       afplay "$EARCON"
     fi
 
-    # Paragraph-level pause. ~400ms on top of Kokoro's natural ~150ms
-    # sentence-end tail = ~550ms total, which matches what audiobook
-    # tuning lands at for paragraph breaks. Gated on "playing" so we
-    # never pause before the very first utterance.
+    # Paragraph-level pause. Now that the server trims Kokoro's tail to
+    # ~40ms, we need less explicit pause: 150ms here + 40ms trimmed tail
+    # + 150ms leading pad on the next sentence ≈ 340ms of break, which
+    # still sounds paragraph-y without dragging. Gated on "playing" so
+    # we never pause before the very first utterance.
     if [ "$paragraph_before" -eq 1 ] && [ "$playing" -eq 1 ]; then
-      sleep 0.4
+      sleep 0.15
     fi
 
     if [ "$playing" -eq 0 ]; then
