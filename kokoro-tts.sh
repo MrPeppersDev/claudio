@@ -23,7 +23,9 @@
 #   KOKORO_EQ_FREQ     EQ center frequency, Hz (default: 2500)
 #   KOKORO_EQ_Q        EQ Q factor (default: 1.0)
 #   KOKORO_PAD_START_MS leading silence prepended to each synth WAV so the
-#                      first phoneme isn't smushed (default: 80; 0 disables)
+#                      first phoneme isn't smushed and so CoreAudio ramp-up
+#                      on the first afplay doesn't eat the opening word
+#                      (default: 150; 0 disables)
 #   KOKORO_TAIL_TRIM_MS trailing silence kept after the last audible frame.
 #                      Uses windowed-RMS energy detection with a 60ms dwell
 #                      so unvoiced closing consonants (t/p/k) survive intact.
@@ -60,7 +62,7 @@ CACHE_MAX_MB="${KOKORO_CACHE_MAX_MB:-200}"
 EQ_GAIN_DB="${KOKORO_EQ_GAIN_DB:-3.0}"
 EQ_FREQ="${KOKORO_EQ_FREQ:-2500}"
 EQ_Q="${KOKORO_EQ_Q:-1.0}"
-PAD_START_MS="${KOKORO_PAD_START_MS:-80}"
+PAD_START_MS="${KOKORO_PAD_START_MS:-150}"
 TAIL_TRIM_MS="${KOKORO_TAIL_TRIM_MS:-40}"
 mkdir -p "$CACHE_DIR"
 
