@@ -54,6 +54,9 @@ idempotent, so running it twice should be harmless.
     spell-out; skipped when unavailable. Install: `pip install --user num2words inflect`
   - `trafilatura` (Apache-2.0) — article extraction from HTML pastes;
     skipped when unavailable. Install: `pip install --user trafilatura lxml_html_clean`
+  - `pymupdf` (AGPL-3.0, acceptable for local use) — `pdf_extract.py` reads
+    PDFs directly so PDF viewers don't need to fall back to the Live Text
+    nudge. Install: `pip install --user pymupdf`
 
 Comments explain *why*, not *what*. If a block does something surprising
 (e.g., why earcons are synchronous), say so.
