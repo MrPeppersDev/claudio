@@ -89,6 +89,11 @@ SPEED_RANGE = (0.25, 4.0)
 EQ_GAIN_DB_RANGE = (-24.0, 24.0)
 EQ_FREQ_RANGE = (20.0, 20_000.0)
 EQ_Q_RANGE = (0.1, 20.0)
+# Leading silence (zero samples) prepended to the output WAV. Kokoro
+# synthesizes each sentence as an independent utterance with no pre-roll,
+# so the first phoneme's attack can sound smushed. A short pad (~80ms)
+# gives the ear an onset cue without adding noticeable dead air.
+PAD_START_MS_RANGE = (0.0, 1000.0)
 
 
 class ValidationError(ValueError):
@@ -381,6 +386,10 @@ class Handler(BaseHTTPRequestHandler):
                 _parse_float(payload.get("eq_q"), field="eq_q", default=1.0),
                 field="eq_q", lo=EQ_Q_RANGE[0], hi=EQ_Q_RANGE[1],
             )
+            pad_start_ms = _check_range(
+                _parse_float(payload.get("pad_start_ms"), field="pad_start_ms", default=0.0),
+                field="pad_start_ms", lo=PAD_START_MS_RANGE[0], hi=PAD_START_MS_RANGE[1],
+            )
         except ValidationError as e:
             self._json(400, {"error": str(e)})
             return
@@ -417,14 +426,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         t1 = time.time()
         samples = peaking_eq(samples, sr, eq_freq, eq_gain_db, eq_q)
+        if pad_start_ms > 0:
+            # Prepend zero samples after EQ so we don't run the filter over
+            # silence (pointless cost; silence stays silent anyway). The
+            # WAV header's frame count is derived from the array length in
+            # samples_to_wav, so just lengthening the array is enough.
+            pad_samples = int(round(sr * pad_start_ms / 1000.0))
+            if pad_samples > 0:
+                silence = np.zeros(pad_samples, dtype=samples.dtype)
+                samples = np.concatenate([silence, samples])
         t2 = time.time()
         wav = samples_to_wav(samples, sr)
         t3 = time.time()
         sys.stderr.write(
             f"[kokoro] synth chars={len(text)} phonemes={len(phonemes)} "
             f"chunks={len(chunks)} voice={voice_spec} speed={speed} "
-            f"eq={eq_gain_db}dB@{eq_freq}Hz synth={t1-t0:.2f}s "
-            f"eq_time={t2-t1:.3f}s encode={t3-t2:.2f}s bytes={len(wav)}\n"
+            f"eq={eq_gain_db}dB@{eq_freq}Hz pad={pad_start_ms}ms "
+            f"synth={t1-t0:.2f}s eq_time={t2-t1:.3f}s "
+            f"encode={t3-t2:.2f}s bytes={len(wav)}\n"
         )
 
         self.send_response(200)
