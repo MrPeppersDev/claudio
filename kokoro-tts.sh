@@ -2,15 +2,16 @@
 # kokoro-tts.sh — local Kokoro-82M TTS via our own Python HTTP server.
 #
 # Reads text on stdin, synthesizes locally (no external network), plays via
-# afplay. The server is managed by kokoro-server.sh, which play-last.sh
-# starts lazily on the first F13 after a reboot.
+# a persistent play-stream.py child (sounddevice OutputStream). The server
+# is managed by kokoro-server.sh, which play-last.sh starts lazily on the
+# first F13 after a reboot.
 #
 # Env vars:
-#   KOKORO_VOICE       voice name, or a weighted blend (default: af_bella).
+#   KOKORO_VOICE       voice name, or a weighted blend (default: af_sarah).
 #                      Blend syntax: "af_bella:70,am_michael:30" — weights
 #                      are normalized, so "1,1" is a 50/50 mix.
 #   KOKORO_SPEED       target effective speed (default: 2.0)
-#   KOKORO_SYNTH_CAP   max synth speed before afplay picks up the rest
+#   KOKORO_SYNTH_CAP   max synth speed before play-stream picks up the rest
 #                      (default: 1.5; see split-speed note below)
 #   KOKORO_URL         server base URL (default: http://127.0.0.1:8880)
 #   KOKORO_LANG        phoneme lang (auto: bm_/bf_ → en-gb, else en-us)
@@ -23,15 +24,27 @@
 #   KOKORO_EQ_FREQ     EQ center frequency, Hz (default: 2500)
 #   KOKORO_EQ_Q        EQ Q factor (default: 1.0)
 #   KOKORO_PAD_START_MS leading silence prepended to each synth WAV so the
-#                      first phoneme isn't smushed (default: 80; 0 disables)
+#                      first phoneme isn't smushed (default: 150; 0 disables).
+#                      Note: play-stream.py also adds a 200ms pre-roll at
+#                      stream open time to absorb CoreAudio device-init cost.
+#   KOKORO_TAIL_TRIM_MS trailing silence kept after the last audible sample.
+#                      Kokoro bakes ~100-200ms of tail into every utterance.
+#                      Disabled by default because the single-sample threshold
+#                      in server.py eats soft unvoiced closing consonants
+#                      (t/p/k); the planned windowed-RMS replacement will
+#                      re-enable with a safe default (default: 0 = no trim)
 #
 # Owned by play-last.sh via job.pid; writes state={synth,play} to the state
-# file; afplay runs in foreground so the parent's pkill -P tears everything
-# down on stop.
+# file; play-stream.py is a long-lived child — the parent's pkill -P tears
+# everything down on stop.
 
 set -euo pipefail
 
-VOICE="${KOKORO_VOICE:-af_bella}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_PYTHON="$SCRIPT_DIR/kokoro/venv/bin/python3"
+PLAY_STREAM="$SCRIPT_DIR/kokoro/play-stream.py"
+
+VOICE="${KOKORO_VOICE:-af_sarah}"
 SPEED="${KOKORO_SPEED:-2.0}"
 URL="${KOKORO_URL:-http://127.0.0.1:8880}"
 # Default lang follows voice family prefix: bm_/bf_ → en-gb, otherwise en-us
@@ -56,20 +69,23 @@ CACHE_MAX_MB="${KOKORO_CACHE_MAX_MB:-200}"
 EQ_GAIN_DB="${KOKORO_EQ_GAIN_DB:-3.0}"
 EQ_FREQ="${KOKORO_EQ_FREQ:-2500}"
 EQ_Q="${KOKORO_EQ_Q:-1.0}"
-PAD_START_MS="${KOKORO_PAD_START_MS:-80}"
+PAD_START_MS="${KOKORO_PAD_START_MS:-150}"
+TAIL_TRIM_MS="${KOKORO_TAIL_TRIM_MS:-0}"
 mkdir -p "$CACHE_DIR"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
 
-# Hash key for a sentence: voice|synth_speed|lang|eq_*|pad_start_ms|text.
-# Any change in those produces different audio, so they all go into the key.
+# Hash key: voice|synth_speed|lang|eq_*|pad_start_ms|tail_trim_ms|text. Any
+# change in those produces different audio, so they all go into the key.
 # Null bytes between fields prevent "ab|c" colliding with "a|bc". Every
-# synthesis-affecting knob is mixed in, so toggling any env var (EQ, pad)
-# auto-invalidates stale cache instead of silently mixing pre/post audio.
+# synthesis-affecting knob is mixed in, so toggling any env var (EQ, pad,
+# trim) auto-invalidates stale cache instead of silently mixing pre/post
+# audio.
 sentence_hash() {
-  printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s' \
+  printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s' \
     "$VOICE" "$SYNTH_SPEED" "$LANG_CODE" \
-    "$EQ_GAIN_DB" "$EQ_FREQ" "$EQ_Q" "$PAD_START_MS" "$1" \
+    "$EQ_GAIN_DB" "$EQ_FREQ" "$EQ_Q" \
+    "$PAD_START_MS" "$TAIL_TRIM_MS" "$1" \
     | shasum -a 256 | awk '{print $1}'
 }
 
@@ -111,13 +127,13 @@ if [ -z "$TEXT" ]; then
   exit 3
 fi
 
-# Split the target speed between the model and afplay. Pushing Kokoro to its
-# 2.0x cap forces the model to compress phonemes and syllables muddle; a
-# gentler synth rate keeps prosody clean, and afplay's pitch-preserving phase
-# vocoder (-q 1) covers the rest without blurring consonants.
+# Split the target speed between the model and play-stream. Pushing Kokoro to
+# its 2.0x cap forces the model to compress phonemes and syllables muddle; a
+# gentler synth rate keeps prosody clean, and play-stream's pitch-preserving
+# resample_poly covers the rest without blurring consonants.
 #   effective_speed = SYNTH_SPEED * PLAYBACK_RATE = SPEED
-# Lower KOKORO_SYNTH_CAP → cleaner phonemes, more afplay stretch.
-# Higher KOKORO_SYNTH_CAP → less afplay work, more model compression.
+# Lower KOKORO_SYNTH_CAP → cleaner phonemes, more play-stream stretch.
+# Higher KOKORO_SYNTH_CAP → less play-stream work, more model compression.
 SYNTH_CAP="${KOKORO_SYNTH_CAP:-1.5}"
 SYNTH_SPEED=$(awk -v s="$SPEED" -v c="$SYNTH_CAP" 'BEGIN{print (s>c?c:s)}')
 PLAYBACK_RATE=$(awk -v s="$SPEED" -v ss="$SYNTH_SPEED" 'BEGIN{print s/ss}')
@@ -129,12 +145,28 @@ PLAYBACK_RATE=$(awk -v s="$SPEED" -v ss="$SYNTH_SPEED" 'BEGIN{print s/ss}')
 # sentences; a short reply with no code and one sentence produces a single
 # segment/single sentence and behaves like the original single-shot path.
 WORK_DIR=$(mktemp -d "$STATE_DIR/segments.XXXXXX")
-prev_pid=""
+
+# FIFO + fixed fd (9) for communicating with play-stream.py. Using a named
+# pipe (mkfifo) instead of process substitution so this works with macOS's
+# bash 3.2 (which doesn't support {VAR}> automatic fd allocation).
+STREAM_FIFO=""
+STREAM_PID=""
+# Track whether fd 9 is currently open so cleanup never tries to close it twice.
+STREAM_FD_OPEN=0
+
 cleanup() {
-  # Kill dangling background afplay on any exit path (error, signal, done).
-  # Parent (play-last.sh) also reaps us via pkill -P for explicit stops;
-  # this covers the synth-failure path where set -e trips.
-  [ -n "$prev_pid" ] && kill "$prev_pid" 2>/dev/null || true
+  # Close fd 9 so play-stream.py hits EOF and begins draining.
+  if [ "$STREAM_FD_OPEN" -eq 1 ]; then
+    exec 9>&- 2>/dev/null || true
+    STREAM_FD_OPEN=0
+  fi
+  # Wait for play-stream.py to drain and exit (it blocks on writes so EOF
+  # wakes it; it then stops the OutputStream and exits).
+  if [ -n "$STREAM_PID" ]; then
+    wait "$STREAM_PID" 2>/dev/null || true
+    STREAM_PID=""
+  fi
+  [ -n "$STREAM_FIFO" ] && rm -f "$STREAM_FIFO"
   rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
@@ -150,12 +182,32 @@ write_state synth
 have_earcon=0
 [ -r "$EARCON" ] && have_earcon=1
 
+# Launch play-stream.py as a persistent child. We connect its stdin to a
+# named pipe (FIFO). Opening the reader first then the writer avoids the
+# blocking open that would occur if we opened the write end first.
+if [ "${KOKORO_NO_PLAY:-0}" != "1" ]; then
+  STREAM_FIFO=$(mktemp -u "$STATE_DIR/stream.XXXXXX")
+  mkfifo "$STREAM_FIFO"
+  # Start the reader (play-stream.py) in the background; it opens the read
+  # end and blocks waiting for data.
+  "$VENV_PYTHON" "$PLAY_STREAM" < "$STREAM_FIFO" &
+  STREAM_PID=$!
+  # Open the write end on fd 9. Safe to remove the FIFO name at this point
+  # because both ends are now open — the pipe lives in the kernel until
+  # both ends close.
+  exec 9>"$STREAM_FIFO"
+  rm -f "$STREAM_FIFO"
+  STREAM_FIFO=""
+  STREAM_FD_OPEN=1
+  # Send initial playback rate.
+  printf 'RATE %s\n' "$PLAYBACK_RATE" >&9
+fi
+
 # Interleaved synth + playback. Each iteration resolves its sentence's WAV
-# (cache hit = instant; miss = one curl to the local server) then hands off
-# to afplay in the background. The next iteration's synth runs concurrently
-# with the current afplay, so server round-trip cost is masked behind the
-# previous sentence's audible playback. Cold first sentence still pays the
-# full synth+start cost; everything after is pipelined.
+# (cache hit = instant; miss = one curl to the local server) then sends the
+# path to play-stream.py via fd 9. The next iteration's synth runs while
+# play-stream is consuming the current WAV, so server round-trip cost is
+# masked behind the previous sentence's audible playback.
 hits=0
 misses=0
 playing=0
@@ -198,9 +250,10 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
         --argjson eq_freq "$EQ_FREQ" \
         --argjson eq_q "$EQ_Q" \
         --argjson pad_start_ms "$PAD_START_MS" \
+        --argjson tail_trim_ms "$TAIL_TRIM_MS" \
         '{text: $text, voice: $voice, speed: $speed, lang: $lang,
           eq_gain_db: $eq_gain_db, eq_freq: $eq_freq, eq_q: $eq_q,
-          pad_start_ms: $pad_start_ms}')
+          pad_start_ms: $pad_start_ms, tail_trim_ms: $tail_trim_ms}')
       HTTP_CODE=$(curl -sS -o "$cache_wav.tmp" -w '%{http_code}' \
         --max-time 120 \
         -X POST "$URL/speak" \
@@ -223,32 +276,24 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
     # KOKORO_NO_PLAY: used by warm-cache.sh to fill the cache during idle
     # time. Everything up to this point still runs (split, hash, synth-on-
     # miss) so the cache ends up in the exact state a real playback would
-    # leave it in. We just skip the afplay handoff.
+    # leave it in. We just skip the play-stream handoff.
     if [ "${KOKORO_NO_PLAY:-0}" = "1" ]; then
       seg_has_audio=1
       continue
     fi
 
-    # Gate on previous afplay before starting this one. The waiting happens
-    # *after* we resolved the current WAV, so synth cost overlaps with prior
-    # playback rather than adding to the gap between sentences.
-    if [ -n "$prev_pid" ]; then
-      wait "$prev_pid" 2>/dev/null || true
-      prev_pid=""
-    fi
-
-    # Earcon fires synchronously at segment boundaries. Keep it blocking so
-    # the listener hears the "clunk" distinctly before the next sentence.
+    # Earcon fires at segment boundaries. Send it to play-stream.py before
+    # the first sentence of each non-first segment. play-stream processes
+    # commands serially (blocking writes), so the earcon finishes before
+    # the next PLAY starts — same synchronous semantics as the old afplay call.
     if [ "$seg_has_audio" -eq 0 ] && [ "$first_seg" -eq 0 ] && [ "$have_earcon" -eq 1 ]; then
-      afplay "$EARCON"
+      printf 'EARCON %s\n' "$EARCON" >&9
     fi
 
-    # Paragraph-level pause. ~400ms on top of Kokoro's natural ~150ms
-    # sentence-end tail = ~550ms total, which matches what audiobook
-    # tuning lands at for paragraph breaks. Gated on "playing" so we
-    # never pause before the very first utterance.
+    # Paragraph-level pause via play-stream silence insert. Gated on
+    # "playing" so we never pause before the very first utterance.
     if [ "$paragraph_before" -eq 1 ] && [ "$playing" -eq 1 ]; then
-      sleep 0.4
+      printf 'PAUSE 200\n' >&9
     fi
 
     if [ "$playing" -eq 0 ]; then
@@ -256,17 +301,23 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
       playing=1
     fi
 
-    afplay -q 1 -r "$PLAYBACK_RATE" "$cache_wav" &
-    prev_pid=$!
+    printf 'PLAY %s\n' "$cache_wav" >&9
     seg_has_audio=1
   done
   [ "$seg_has_audio" -eq 1 ] && first_seg=0
 done
 
-if [ -n "$prev_pid" ]; then
-  wait "$prev_pid" 2>/dev/null || true
-  prev_pid=""
+# Close fd 9 so play-stream.py sees EOF, drains, and exits cleanly.
+if [ "$STREAM_FD_OPEN" -eq 1 ]; then
+  exec 9>&-
+  STREAM_FD_OPEN=0
 fi
+# Wait for the last audio to finish playing before returning to the caller.
+if [ -n "$STREAM_PID" ]; then
+  wait "$STREAM_PID" 2>/dev/null || true
+  STREAM_PID=""
+fi
+
 # Prune only when we actually added bytes. On a pure cache-hit run (the
 # common case for stock phrases once warm) the cache can't have grown, so
 # we skip the stat-every-file scan entirely. At thousands of cached WAVs

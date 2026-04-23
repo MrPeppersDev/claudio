@@ -33,7 +33,7 @@ fi
 # Ensure the server's up — without it every line would fail, loudly.
 "$SERVER_SCRIPT" start >/dev/null
 
-voice="${KOKORO_VOICE:-af_bella}"
+voice="${KOKORO_VOICE:-af_sarah}"
 cache_dir="${KOKORO_CACHE_DIR:-$STATE_DIR/cache}"
 mkdir -p "$cache_dir"
 before=$({ find "$cache_dir" -name '*.wav' 2>/dev/null || true; } | wc -l | tr -d ' ')

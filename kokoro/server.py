@@ -94,6 +94,15 @@ EQ_Q_RANGE = (0.1, 20.0)
 # so the first phoneme's attack can sound smushed. A short pad (~80ms)
 # gives the ear an onset cue without adding noticeable dead air.
 PAD_START_MS_RANGE = (0.0, 1000.0)
+# Trailing silence target. Kokoro bakes ~100-200ms of tail silence into
+# every utterance; back-to-back sentences compound that with the next
+# sentence's leading pad, so inter-sentence gaps drift to 250-350ms. We
+# detect where audible signal ends and keep only this much tail.
+TAIL_TRIM_MS_RANGE = (0.0, 1000.0)
+# Amplitude threshold for "is this sample audible" when locating tail
+# silence. Kokoro float32 output sits in ~[-1, 1]; 0.005 is well above
+# the noise floor but below any phoneme you'd want to keep.
+TAIL_SILENCE_THRESHOLD = 0.005
 
 
 class ValidationError(ValueError):
@@ -293,6 +302,25 @@ def peaking_eq(samples: np.ndarray, fs: int, f0: float, gain_db: float, q: float
     return lfilter(b, a, samples).astype(samples.dtype)
 
 
+def trim_tail_silence(samples: np.ndarray, sample_rate: int, target_ms: float) -> np.ndarray:
+    """
+    Trim trailing silence so only ``target_ms`` of tail remains. Finds the
+    last sample whose absolute amplitude exceeds TAIL_SILENCE_THRESHOLD and
+    keeps that many milliseconds after it. No-op for all-silent input (nothing
+    to anchor the trim to) or when the existing tail is already shorter than
+    the target (never lengthens).
+    """
+    if target_ms <= 0 or samples.size == 0:
+        return samples
+    audible = np.flatnonzero(np.abs(samples) > TAIL_SILENCE_THRESHOLD)
+    if audible.size == 0:
+        return samples
+    last_audible = int(audible[-1])
+    keep_samples = int(round(sample_rate * target_ms / 1000.0))
+    end = min(samples.size, last_audible + 1 + keep_samples)
+    return samples[:end]
+
+
 def samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
     pcm = np.clip(samples, -1.0, 1.0)
     pcm = (pcm * 32767.0).astype(np.int16)
@@ -390,6 +418,10 @@ class Handler(BaseHTTPRequestHandler):
                 _parse_float(payload.get("pad_start_ms"), field="pad_start_ms", default=0.0),
                 field="pad_start_ms", lo=PAD_START_MS_RANGE[0], hi=PAD_START_MS_RANGE[1],
             )
+            tail_trim_ms = _check_range(
+                _parse_float(payload.get("tail_trim_ms"), field="tail_trim_ms", default=0.0),
+                field="tail_trim_ms", lo=TAIL_TRIM_MS_RANGE[0], hi=TAIL_TRIM_MS_RANGE[1],
+            )
         except ValidationError as e:
             self._json(400, {"error": str(e)})
             return
@@ -426,6 +458,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         t1 = time.time()
         samples = peaking_eq(samples, sr, eq_freq, eq_gain_db, eq_q)
+        # Trim before pad so the pad length is exactly what the client asked
+        # for regardless of tail length.
+        if tail_trim_ms > 0:
+            samples = trim_tail_silence(samples, sr, tail_trim_ms)
         if pad_start_ms > 0:
             # Prepend zero samples after EQ so we don't run the filter over
             # silence (pointless cost; silence stays silent anyway). The
@@ -442,6 +478,7 @@ class Handler(BaseHTTPRequestHandler):
             f"[kokoro] synth chars={len(text)} phonemes={len(phonemes)} "
             f"chunks={len(chunks)} voice={voice_spec} speed={speed} "
             f"eq={eq_gain_db}dB@{eq_freq}Hz pad={pad_start_ms}ms "
+            f"trim={tail_trim_ms}ms "
             f"synth={t1-t0:.2f}s eq_time={t2-t1:.3f}s "
             f"encode={t3-t2:.2f}s bytes={len(wav)}\n"
         )
