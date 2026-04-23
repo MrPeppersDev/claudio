@@ -21,8 +21,16 @@ local HOME = os.getenv("HOME")
 local CLAUDIO_DIR = os.getenv("CLAUDIO_DIR") or (HOME .. "/.claude/claudio")
 local STATE_DIR = os.getenv("CLAUDIO_STATE_DIR") or CLAUDIO_DIR
 local STATE_FILE = STATE_DIR .. "/state"
+local SPEED_FILE = STATE_DIR .. "/speed"
 local PLAY_SCRIPT = CLAUDIO_DIR .. "/play-last.sh"
 local SERVER_SCRIPT = CLAUDIO_DIR .. "/kokoro-server.sh"
+
+-- Speed options shown in the menu. 2.0 is the shell default; keeping it
+-- here in one list means the checkmarked value and the persisted value
+-- always agree. Chosen spacing: dense near 1.5–2.0 (where most users
+-- live), stepped out at the extremes.
+local SPEED_OPTIONS = { 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0 }
+local DEFAULT_SPEED = 2.0
 
 local menubar = nil
 local watcher = nil
@@ -70,6 +78,22 @@ local function readState()
   end
   f:close()
   return s
+end
+
+local function readSpeed()
+  local f = io.open(SPEED_FILE, "r")
+  if not f then return DEFAULT_SPEED end
+  local raw = (f:read("*a") or ""):match("^%s*([%d%.]+)")
+  f:close()
+  local n = tonumber(raw)
+  return n or DEFAULT_SPEED
+end
+
+local function writeSpeed(s)
+  local f = io.open(SPEED_FILE, "w")
+  if not f then return end
+  f:write(string.format("%g\n", s))
+  f:close()
 end
 
 -- ============================================================
@@ -274,6 +298,32 @@ local function buildMenu()
         M.toggle()
       end
     end,
+  })
+
+  table.insert(items, { title = "-" })
+
+  -- Speed submenu. Takes effect on the next press, not mid-playback —
+  -- afplay's rate is fixed at process start. Check-mark follows the
+  -- persisted value so the menu and the synth loop never disagree.
+  local function fmtSpeed(s)
+    if s == math.floor(s) then
+      return string.format("%d×", s)
+    end
+    return string.format("%g×", s)
+  end
+  local currentSpeed = readSpeed()
+  local speedSubmenu = {}
+  for _, opt in ipairs(SPEED_OPTIONS) do
+    local isCurrent = math.abs(opt - currentSpeed) < 1e-6
+    table.insert(speedSubmenu, {
+      title = fmtSpeed(opt),
+      checked = isCurrent,
+      fn = function() writeSpeed(opt) end,
+    })
+  end
+  table.insert(items, {
+    title = "Speed: " .. fmtSpeed(currentSpeed),
+    menu = speedSubmenu,
   })
 
   table.insert(items, { title = "-" })

@@ -58,6 +58,19 @@ done
 
 mkdir -p "$STATE_DIR"
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
+
+# Menu-bar settings: let the Hammerspoon UI persist a playback speed
+# without users having to touch env vars or restart anything. Env var
+# wins if explicitly set (CLI override path); otherwise we adopt what
+# the menu wrote. Values that don't parse as a plausible number are
+# silently ignored — kokoro-tts.sh falls back to its own default.
+SPEED_FILE="$STATE_DIR/speed"
+if [ -z "${KOKORO_SPEED:-}" ] && [ -r "$SPEED_FILE" ]; then
+  raw_speed=$(head -1 "$SPEED_FILE" 2>/dev/null | tr -d '[:space:]')
+  if [[ "$raw_speed" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    export KOKORO_SPEED="$raw_speed"
+  fi
+fi
 write_state() {
   # state=<one of: idle|synth|play>   preview=<truncated text, one line>
   local state="$1" preview="${2:-}"
