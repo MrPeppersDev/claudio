@@ -32,7 +32,20 @@ from scipy.signal import resample_poly
 SAMPLE_RATE = 24000   # Kokoro native output rate; stream stays at this rate
 CHANNELS = 1
 DTYPE = "float32"
-PRE_ROLL_MS = 200     # silent pre-roll so CoreAudio ramp-up doesn't eat word 1
+PRE_ROLL_MS = 400     # silent pre-roll so CoreAudio ramp-up doesn't eat word 1.
+                      # Need to cover: CoreAudio device warm-up + the time the
+                      # first sox-tempo subprocess takes to cold-start + any
+                      # sounddevice ring-buffer drain between pre-roll write
+                      # and first real samples arriving. Bumped from 200ms
+                      # because 200 + 135ms (stretched 150ms WAV pad) wasn't
+                      # covering the first-syllable cold start on Bluetooth/
+                      # virtual audio outputs.
+EDGE_FADE_MS = 3      # linear fade-in/out applied to every PLAY/EARCON buffer
+                      # before streaming. Kokoro WAVs often end and begin mid-
+                      # sample (non-zero amplitude), so direct concatenation
+                      # produces an audible DC click at every sentence seam.
+                      # 3 ms on each side is inaudible as a pause but
+                      # eliminates the discontinuity.
 
 # ---- globals ------------------------------------------------------------------
 
@@ -99,6 +112,19 @@ def _silence(ms: int) -> np.ndarray:
     return np.zeros(n, dtype=np.float32)
 
 
+def _edge_fade(samples: np.ndarray, ms: int = EDGE_FADE_MS) -> np.ndarray:
+    """Apply a linear fade-in at the head and fade-out at the tail. Mutates
+    and returns the same array for callers that want to chain."""
+    n = int(SAMPLE_RATE * ms / 1000)
+    if len(samples) < 2 * n:
+        return samples
+    ramp_in = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    ramp_out = np.linspace(1.0, 0.0, n, dtype=np.float32)
+    samples[:n] *= ramp_in
+    samples[-n:] *= ramp_out
+    return samples
+
+
 def _write(samples: np.ndarray) -> None:
     """Block-write samples into the stream."""
     global _stream
@@ -162,7 +188,7 @@ def main() -> None:
             try:
                 samples = _read_audio_as_float32(path)
                 stretched = _stretch(samples, _rate)
-                _write(stretched)
+                _write(_edge_fade(stretched))
             except Exception as exc:
                 print(f"play-stream: PLAY error {path}: {exc}", file=sys.stderr)
 
@@ -172,7 +198,7 @@ def main() -> None:
                 continue
             try:
                 samples = _read_audio_as_float32(path)
-                _write(samples)  # no stretching for earcons
+                _write(_edge_fade(samples))  # no stretching for earcons
             except Exception as exc:
                 print(f"play-stream: EARCON error {path}: {exc}", file=sys.stderr)
 
