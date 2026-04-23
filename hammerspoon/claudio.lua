@@ -23,6 +23,8 @@ local STATE_DIR = os.getenv("CLAUDIO_STATE_DIR") or CLAUDIO_DIR
 local STATE_FILE = STATE_DIR .. "/state"
 local SPEED_FILE = STATE_DIR .. "/speed"
 local VOICE_FILE = STATE_DIR .. "/voice"
+local PLAY_LOG = STATE_DIR .. "/play.log"
+local SERVER_LOG = STATE_DIR .. "/kokoro-server.log"
 local PLAY_SCRIPT = CLAUDIO_DIR .. "/play-last.sh"
 local SERVER_SCRIPT = CLAUDIO_DIR .. "/kokoro-server.sh"
 local KOKORO_URL = os.getenv("KOKORO_URL") or "http://127.0.0.1:8880"
@@ -167,6 +169,24 @@ end
 
 local function kokoroServerStop()
   hs.execute(SERVER_SCRIPT .. " stop >/dev/null 2>&1", true)
+end
+
+-- Opens Terminal.app running `tail -F` on both Claudio log files. Terminal is
+-- shipped with macOS so this works on a vanilla install without requiring the
+-- user to have iTerm / kitty / etc. `touch` first so `tail -F` doesn't spin
+-- on a fresh install where no log exists yet; `-F` (capital) keeps following
+-- across rotate/recreate, which `kokoro-server.sh stop; start` will cause.
+local function tailLogs()
+  hs.execute(string.format("touch '%s' '%s' 2>/dev/null", PLAY_LOG, SERVER_LOG), true)
+  local cmd = string.format("tail -F '%s' '%s'", PLAY_LOG, SERVER_LOG)
+  -- %q quotes and escapes for Lua, but AppleScript double-quoted literals use
+  -- the same `\"` / `\\` / `\n` conventions, so it round-trips cleanly for
+  -- the plain-ASCII command we're passing.
+  local script = string.format(
+    'tell application "Terminal"\nactivate\ndo script %q\nend tell',
+    cmd
+  )
+  hs.osascript.applescript(script)
 end
 
 -- ============================================================
@@ -413,17 +433,27 @@ local function buildMenu()
 
   table.insert(items, { title = "-" })
 
-  -- Server lifecycle (manual RAM release). Disabled when busy so you can't
-  -- kill the server mid-synth.
+  -- Server lifecycle (manual RAM release). Always clickable — the common
+  -- reason you want to hit Stop is that synth is wedged, which is exactly
+  -- when `busy` would otherwise be true. An accidental click during a
+  -- real synth just kills that job, same as F13.
   if kokoroUp then
     table.insert(items, {
       title = "Stop server (free ~600 MB)",
-      disabled = busy,
       fn = function() kokoroServerStop() end,
     })
   else
     table.insert(items, { title = "Server: stopped (starts on next play)", disabled = true })
   end
+
+  -- Live log tail. Opens Terminal.app following play.log and kokoro-server.log
+  -- together — useful when debugging synth start-up, playback drop-outs, or
+  -- the server's self-heal sweep. Separate window per click; closing the
+  -- window kills its tail.
+  table.insert(items, {
+    title = "Tail logs…",
+    fn = function() tailLogs() end,
+  })
 
   table.insert(items, { title = "-" })
 
