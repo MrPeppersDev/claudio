@@ -10,8 +10,9 @@ Transformations, in order:
   2. Markdown stripping (code blocks, links, emphasis, etc.)
   3. Web-paste chrome cleanup (bare URL lines, short-line-run nav, all-caps
      micro-lines) — conservative heuristics for pasted web pages
-  4. Pronunciation dictionary (from pronunciations.txt)
-  5. Sentence / paragraph sentinel injection (for downstream split+cache)
+  4. Dash normalization (phrasal dashes → commas for prosody)
+  5. Pronunciation dictionary (from pronunciations.txt)
+  6. Sentence / paragraph sentinel injection (for downstream split+cache)
 
 Deliberately stdlib-only so we can run under /usr/bin/python3 (no venv dep).
 """
@@ -212,6 +213,37 @@ def clean_web_artifacts(text: str) -> str:
     return "\n".join(lines)
 
 
+# --- Dashes --------------------------------------------------------------
+
+# Phrasal dashes (em/en/double-hyphen/space-flanked hyphen) become commas
+# so Kokoro applies its brief comma pause. Compound-word hyphens
+# ("first-audio"), number ranges ("1-10"), negatives ("-5"), and CLI flag
+# fragments ("ls -la") all stay untouched because they lack horizontal
+# whitespace on both sides.
+#
+# Horizontal whitespace only ([ \t]+, not \s+): a trailing dash at a line
+# break is a stylistic artifact, not a phrase boundary; eating the newline
+# around it would collapse two lines into one.
+_DASH_TRANSFORMS = [
+    # Em-dash (U+2014) and en-dash (U+2013), space-flanked.
+    (re.compile(r"[ \t]+[—–][ \t]+"), ", "),
+    # Double-hyphen em-dash substitute, space-flanked. `---` horizontal
+    # rules are stripped earlier by _MD_TRANSFORMS; a prose `---` (three
+    # dashes) won't match because no internal pair is whitespace-flanked.
+    (re.compile(r"[ \t]+--[ \t]+"), ", "),
+    # Single hyphen, space-flanked — the "phrasal" case. Order-independent
+    # of the double-hyphen rule above since `foo -- bar` has no single
+    # `-` that's whitespace-flanked (the other dash blocks it).
+    (re.compile(r"[ \t]+-[ \t]+"), ", "),
+]
+
+
+def normalize_dashes(text: str) -> str:
+    for pattern, repl in _DASH_TRANSFORMS:
+        text = pattern.sub(repl, text)
+    return text
+
+
 # --- Pronunciation dictionary --------------------------------------------
 
 def load_pronunciations(path: Path) -> list[tuple[str, str]]:
@@ -369,6 +401,7 @@ def main() -> int:
     text = normalize_whitespace(text)
     text = strip_markdown(text)
     text = clean_web_artifacts(text)
+    text = normalize_dashes(text)
     rules = load_pronunciations(HERE / "pronunciations.txt")
     text = apply_pronunciations(text, rules)
     text = split_sentences(text)
