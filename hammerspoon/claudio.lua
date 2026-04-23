@@ -68,6 +68,21 @@ local COPY_ON_SELECT_TERMINALS = {
   ["Ghostty"] = true,
 }
 
+-- PDF / image viewers where an empty-capture is often "user didn't know
+-- they could select" rather than "user selected nothing." For these we
+-- surface a targeted hint instead of the generic "highlight text to play"
+-- alert — Cmd+C already works for selected text, and Live Text bridges
+-- the scanned-PDF case without us needing a Vision/OCR helper.
+local PDF_VIEWERS = {
+  ["Preview"] = true,
+  ["Books"] = true,
+  ["Skim"] = true,
+  ["Adobe Acrobat Reader"] = true,
+  ["Acrobat Reader"] = true,
+  ["PDF Expert"] = true,
+}
+local PDF_EMPTY_HINT = "Select text first; for scanned PDFs use Live Text"
+
 -- ============================================================
 -- State helpers
 -- ============================================================
@@ -318,7 +333,11 @@ local function captureSelection(cb)
     end
 
     lastSeenChangeCount = newCount
-    cb(nil)
+    -- Empty capture. For known PDF viewers, pass back a targeted hint so
+    -- the caller can surface the Live Text / right-click-Copy workaround
+    -- rather than the generic "highlight text" alert.
+    local hint = PDF_VIEWERS[frontName] and (frontName .. ": " .. PDF_EMPTY_HINT) or nil
+    cb(nil, hint)
   end
 
   local elapsed = 0
@@ -366,12 +385,14 @@ function M.toggle()
     return
   end
 
-  captureSelection(function(selection)
+  captureSelection(function(selection, hint)
     if selection then
       local tmp = selectionToTempfile(selection)
       if tmp then
         runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
       end
+    elseif hint then
+      hs.alert.show("Claudio: " .. hint, 3)
     else
       hs.alert.show("Claudio: highlight text to play")
     end
