@@ -34,6 +34,7 @@ local DEFAULT_SPEED = 2.0
 
 local menubar = nil
 local watcher = nil
+local audioWatcher = nil
 -- Tracks the pasteboard changeCount at the time of the last toggle. Used by
 -- the copy-on-select terminal fallback to distinguish "user just selected
 -- new text" (changeCount advanced since last toggle) from "stale clipboard
@@ -383,12 +384,31 @@ function M.start()
   watcher = hs.pathwatcher.new(STATE_DIR, function() render() end)
   watcher:start()
 
+  -- Stop playback when the system's default output device changes. This
+  -- catches headphones-unplug (macOS reroutes to the laptop speakers),
+  -- AirPods disconnect, and the user manually switching output — any of
+  -- which usually means the *previous* output was intentional and the
+  -- new one probably isn't welcome to hear a chunk of text suddenly read
+  -- aloud. Only fires when a job is actually running, so this never
+  -- interferes with casual device switching while idle.
+  audioWatcher = hs.audiodevice.watcher.setWatcherCallback(function(event)
+    if event == "dOut" and jobIsRunning() then
+      runPlayScript({ PLAY_SCRIPT })
+      hs.alert.show("Claudio paused — output device changed")
+    end
+  end)
+  hs.audiodevice.watcher.start()
+
   render()
 end
 
 function M.stop()
   if menubar then menubar:delete(); menubar = nil end
   if watcher then watcher:stop(); watcher = nil end
+  if audioWatcher then
+    hs.audiodevice.watcher.stop()
+    audioWatcher = nil
+  end
 end
 
 return M
