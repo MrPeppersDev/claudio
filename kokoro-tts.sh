@@ -7,7 +7,7 @@
 # first F13 after a reboot.
 #
 # Env vars:
-#   KOKORO_VOICE       voice name, or a weighted blend (default: af_bella).
+#   KOKORO_VOICE       voice name, or a weighted blend (default: af_sarah).
 #                      Blend syntax: "af_bella:70,am_michael:30" — weights
 #                      are normalized, so "1,1" is a 50/50 mix.
 #   KOKORO_SPEED       target effective speed (default: 2.0)
@@ -44,7 +44,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_PYTHON="$SCRIPT_DIR/kokoro/venv/bin/python3"
 PLAY_STREAM="$SCRIPT_DIR/kokoro/play-stream.py"
 
-VOICE="${KOKORO_VOICE:-af_bella}"
+VOICE="${KOKORO_VOICE:-af_sarah}"
 SPEED="${KOKORO_SPEED:-2.0}"
 URL="${KOKORO_URL:-http://127.0.0.1:8880}"
 # Default lang follows voice family prefix: bm_/bf_ → en-gb, otherwise en-us
