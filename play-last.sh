@@ -60,15 +60,26 @@ mkdir -p "$STATE_DIR"
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
 
 # Menu-bar settings: let the Hammerspoon UI persist a playback speed
-# without users having to touch env vars or restart anything. Env var
-# wins if explicitly set (CLI override path); otherwise we adopt what
-# the menu wrote. Values that don't parse as a plausible number are
-# silently ignored — kokoro-tts.sh falls back to its own default.
+# and voice without users having to touch env vars or restart anything.
+# Env vars win if explicitly set (CLI override path); otherwise we adopt
+# what the menu wrote. Values that don't parse are silently ignored —
+# kokoro-tts.sh falls back to its own default.
 SPEED_FILE="$STATE_DIR/speed"
 if [ -z "${KOKORO_SPEED:-}" ] && [ -r "$SPEED_FILE" ]; then
   raw_speed=$(head -1 "$SPEED_FILE" 2>/dev/null | tr -d '[:space:]')
   if [[ "$raw_speed" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     export KOKORO_SPEED="$raw_speed"
+  fi
+fi
+VOICE_FILE="$STATE_DIR/voice"
+if [ -z "${KOKORO_VOICE:-}" ] && [ -r "$VOICE_FILE" ]; then
+  raw_voice=$(head -1 "$VOICE_FILE" 2>/dev/null | tr -d '[:space:]')
+  # Allow blend specs (colon + comma) plus plain names. Anything with
+  # shell-dangerous characters is refused outright — the value gets
+  # passed to downstream tools as an env var, not eval'd, so this is
+  # belt-and-braces rather than a real escape hatch, but cheap.
+  if [[ "$raw_voice" =~ ^[A-Za-z0-9_:,.]+$ ]]; then
+    export KOKORO_VOICE="$raw_voice"
   fi
 fi
 write_state() {
