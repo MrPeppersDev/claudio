@@ -1,15 +1,20 @@
 # Runtime state
 state
+speed
+voice
 *.pid
 *.log
+# Selection tempfiles (mktemp XXXXXX pattern) — normally unlinked by
+# play-last.sh, but a hard-killed synth can leave one behind.
+selection.*
+# kokoro-tts.sh scratch dir (mktemp XXXXXX per synth); segments and
+# per-sentence caches live here. Cleaned on EXIT trap, leaks on SIGKILL.
+segments.*/
+# Queue mode state (FIFO items + coordinator lock dir)
+queue/
+queue.lock/
 
-# Session map scratch
-sessions/
-selection.txt
-
-# Cached audio output
-last.mp3
-last.wav
+# Per-sentence synth cache (SHA-256-keyed WAVs)
 cache/
 
 # Python venv (recreated by install.sh)
