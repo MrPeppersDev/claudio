@@ -31,6 +31,13 @@ local watcher = nil
 -- new text" (changeCount advanced since last toggle) from "stale clipboard
 -- from minutes ago" (no change since last toggle).
 local lastSeenChangeCount = nil
+-- Snapshot of the frontmost app at the moment the dropdown was built. When
+-- the user clicks the menu icon, focus eventually shifts to Hammerspoon —
+-- but buildMenu fires just before that transfer completes, so grabbing it
+-- there captures the *real* user app (Safari, Notes, etc.). Used to re-
+-- activate that app before running the toggle, so selection capture (AX /
+-- simulated Cmd+C) targets the right window.
+local lastFrontApp = nil
 
 -- Terminal apps that copy-on-select (selection is already on the pasteboard
 -- without Cmd+C). Gating the stale-pasteboard fallback to these apps avoids
@@ -229,6 +236,13 @@ local function iconFor(state)
 end
 
 local function buildMenu()
+  -- Snapshot the user's app before the menu takes focus, so the Play item
+  -- can refocus it and capture selection correctly.
+  local app = hs.application.frontmostApplication()
+  if app and app:name() ~= "Hammerspoon" then
+    lastFrontApp = app
+  end
+
   local s = readState()
   local busy = (s.state == "play" or s.state == "synth")
   local kokoroUp = kokoroServerRunning()
@@ -240,10 +254,26 @@ local function buildMenu()
 
   local items = {}
 
-  -- Play / Stop toggle
+  -- Play / Stop toggle. From the menu we refocus the previously-frontmost
+  -- app before running the toggle, because AX and Cmd+C need the real user
+  -- app as frontmost — not Hammerspoon, which the menu briefly focuses.
+  -- Stop doesn't need any of that, so it can just fire.
   table.insert(items, {
-    title = busy and ("■ Stop") or ("▶ Play last message"),
-    fn = function() M.toggle() end,
+    title = busy and ("■ Stop") or ("▶ Speak selection"),
+    fn = function()
+      if busy then
+        M.toggle()
+        return
+      end
+      if lastFrontApp then
+        lastFrontApp:activate()
+        -- 80 ms is enough for focus to settle on all apps I tested; AX and
+        -- pasteboard reads come back clean after this delay.
+        hs.timer.doAfter(0.08, function() M.toggle() end)
+      else
+        M.toggle()
+      end
+    end,
   })
 
   table.insert(items, { title = "-" })
