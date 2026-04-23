@@ -36,3 +36,6 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# Benchmark artifacts (wav clips + spectrograms — not committed, for local A/B listening)
+bench/
