@@ -15,10 +15,19 @@ Transformations, in order:
   6. Sentence / paragraph sentinel injection (for downstream split+cache)
 
 Deliberately stdlib-only so we can run under /usr/bin/python3 (no venv dep).
+pysbd is used for sentence segmentation when available (pip install pysbd),
+with an automatic regex fallback for stdlib-only environments.
 """
 import re
 import sys
 from pathlib import Path
+
+try:
+    import pysbd as _pysbd
+    _PYSBD_SEGMENTER = _pysbd.Segmenter(language="en", clean=False)
+    _HAVE_PYSBD = True
+except ImportError:  # pragma: no cover — fallback path for stdlib-only envs
+    _HAVE_PYSBD = False
 
 HERE = Path(__file__).resolve().parent
 
@@ -44,6 +53,63 @@ _WS_NORMALIZE = str.maketrans({
 
 def normalize_whitespace(text: str) -> str:
     return text.translate(_WS_NORMALIZE)
+
+
+# --- HTML article extraction ---------------------------------------------
+
+# trafilatura is an optional dep installed via `pip install --user trafilatura`.
+# If it's not available we silently skip extraction and let the rest of the
+# pipeline handle whatever text arrives. Graceful-skip keeps the stdlib-only
+# guarantee intact for environments where the user hasn't run `pip install`.
+try:
+    import trafilatura as _trafilatura
+    _HAVE_TRAFILATURA = True
+except ImportError:  # pragma: no cover — optional dep, skip silently
+    _HAVE_TRAFILATURA = False
+
+# Cheap HTML detection. We're looking for patterns that only appear in real
+# HTML — full-document tags, semantic elements, and a high density of closing
+# tags. "if x < 5 and y > 3" has exactly zero `</` occurrences and no tag
+# words, so it never triggers. Markdown with angle-bracket generics might
+# contain one or two `</...>` patterns but not five.
+_HTML_SIGNALS = re.compile(r"<html|<article|<body", re.IGNORECASE)
+_CLOSE_TAG = re.compile(r"</")
+
+
+def _looks_like_html(text: str) -> bool:
+    if _HTML_SIGNALS.search(text):
+        return True
+    return len(_CLOSE_TAG.findall(text)) >= 5
+
+
+def maybe_extract_article(text: str) -> str:
+    """
+    If *text* looks like HTML, run trafilatura.extract() to get clean article
+    prose. Returns Markdown on a successful extraction; returns *text* unchanged
+    when trafilatura is not installed, input is not HTML, or extraction yields
+    nothing useful.
+
+    The downstream strip_markdown() stage handles both Markdown and plain text,
+    so the caller does not need to know which path was taken.
+    """
+    if not _HAVE_TRAFILATURA:
+        return text
+    if not _looks_like_html(text):
+        return text
+    extracted = _trafilatura.extract(
+        text,
+        output_format="markdown",
+        include_comments=False,
+        include_tables=False,
+    )
+    # Fall back to original if extraction returns nothing or the result is
+    # suspiciously short compared to the input (trafilatura occasionally
+    # returns a fragment for malformed snippets).
+    if extracted is None:
+        return text
+    if len(text) > 500 and len(extracted) < 100:
+        return text
+    return extracted
 
 
 # --- Markdown -------------------------------------------------------------
@@ -244,6 +310,144 @@ def normalize_dashes(text: str) -> str:
     return text
 
 
+# --- Numbers -------------------------------------------------------------
+#
+# Spell out numerals, currency, ordinals, percentages, and integers with
+# thousands separators so Kokoro receives words rather than glyphs. Runs
+# AFTER dash normalization (dashes → commas) and BEFORE the pronunciation
+# dictionary so dict entries can still act on the spelled-out output.
+#
+# Optional: if num2words is not installed (e.g. on a fresh /usr/bin/python3
+# without user-site packages), the function degrades to a no-op passthrough
+# so the rest of the pipeline keeps working.
+
+try:
+    import num2words as _num2words
+    _NUMBERS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _NUMBERS_AVAILABLE = False
+
+
+def _year_words(y: int) -> str:
+    """Return the spoken form of a 4-digit year.
+
+    1100–1999 and 2010–2099: split hi/lo (e.g. 2026 → "twenty twenty-six").
+    1000–1099 and 2000–2009: full cardinal (e.g. 2001 → "two thousand and one").
+    Exact centuries: "nineteen hundred" etc. (except 2000 → "two thousand").
+    """
+    hi = y // 100
+    lo = y % 100
+    if y <= 1099 or (2000 <= y <= 2009):
+        return _num2words.num2words(y)
+    elif lo == 0:
+        return _num2words.num2words(hi) + " hundred"
+    else:
+        return _num2words.num2words(hi) + " " + _num2words.num2words(lo)
+
+
+# Pattern to find 4-digit years in the range 1100–2029.
+_YEAR_BARE = re.compile(r"\b(1[1-9]\d{2}|20[0-2]\d)\b")
+# Preceding words that signal a year is being used as a year.
+_YEAR_TRIGGER_BEFORE = re.compile(
+    r"(?:in|since|until|before|after|around|by|from|through|during|circa|year|ca\.?|c\.)\s+$",
+    re.IGNORECASE,
+)
+# Following text that signals a year reading is correct.
+_YEAR_TRIGGER_AFTER = re.compile(
+    r"^\s*(?:AD|BC|CE|BCE\b|[,\.]\s|\s+(?:was|is|will|are|saw|marks|marked|began|ended|started|witnessed))",
+    re.IGNORECASE,
+)
+
+# Currency: optional space after $, comma-grouped digits, optional cents.
+_CURRENCY_RE = re.compile(r"\$\s?[\d,]+(?:\.\d{1,2})?")
+# Ordinals: digits followed immediately by st/nd/rd/th.
+_ORDINAL_RE = re.compile(r"\b(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
+# Percentages: digits (with optional decimal) immediately before %.
+_PERCENT_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s?%")
+# Integers with comma thousands-separators (at least one comma group).
+_THOUSANDS_RE = re.compile(r"\b\d{1,3}(?:,\d{3})+\b")
+
+
+def _replace_currency(m: re.Match) -> str:
+    raw = m.group(0).lstrip("$").replace(",", "").strip()
+    if "." in raw:
+        dollar_str, cent_str = raw.split(".", 1)
+        dollars = int(dollar_str) if dollar_str else 0
+        cents = int(cent_str.ljust(2, "0")[:2])
+    else:
+        dollars = int(raw)
+        cents = 0
+    dw = _num2words.num2words(dollars)
+    dollar_label = "dollar" if dollars == 1 else "dollars"
+    if cents:
+        cw = _num2words.num2words(cents)
+        cent_label = "cent" if cents == 1 else "cents"
+        return f"{dw} {dollar_label} and {cw} {cent_label}"
+    return f"{dw} {dollar_label}"
+
+
+def _replace_ordinal(m: re.Match) -> str:
+    return _num2words.num2words(int(m.group(1)), to="ordinal")
+
+
+def _replace_percent(m: re.Match) -> str:
+    n = m.group(1)
+    val = float(n) if "." in n else int(n)
+    return _num2words.num2words(val) + " percent"
+
+
+def _replace_thousands(m: re.Match) -> str:
+    return _num2words.num2words(int(m.group(0).replace(",", "")))
+
+
+def normalize_numbers(text: str) -> str:
+    """Spell out numbers, currency, ordinals, and percentages in *text*.
+
+    Order of substitution:
+      1. Currency (``$1,234.56``) — must go first so the comma-grouped
+         digits don't get consumed by the thousands rule.
+      2. Ordinals (``3rd``, ``21st``) — must go before bare integers so
+         ``3rd`` isn't turned into ``3 rd``.
+      3. Percentages (``42%``).
+      4. Years (``2026``) — only when context suggests a calendar year.
+      5. Comma-grouped integers (``1,234``).
+
+    If ``num2words`` is not installed, returns *text* unchanged.
+    """
+    if not _NUMBERS_AVAILABLE:
+        return text
+
+    # 1. Currency
+    text = _CURRENCY_RE.sub(_replace_currency, text)
+
+    # 2. Ordinals
+    text = _ORDINAL_RE.sub(_replace_ordinal, text)
+
+    # 3. Percentages
+    text = _PERCENT_RE.sub(_replace_percent, text)
+
+    # 4. Years — context-sensitive substitution. We snapshot the string
+    #    before substitution so before/after slices stay stable throughout
+    #    the re.sub pass (re.sub passes original match positions to the
+    #    callable, but `text` inside the closure must refer to the *same*
+    #    string the regex was run against).
+    _year_source = text
+
+    def _replace_year(m: re.Match) -> str:
+        before = _year_source[: m.start()]
+        after = _year_source[m.end() :]
+        if _YEAR_TRIGGER_BEFORE.search(before) or _YEAR_TRIGGER_AFTER.match(after):
+            return _year_words(int(m.group(1)))
+        return m.group(0)
+
+    text = _YEAR_BARE.sub(_replace_year, _year_source)
+
+    # 5. Comma-grouped integers (run after years so "1,900" isn't eaten first)
+    text = _THOUSANDS_RE.sub(_replace_thousands, text)
+
+    return text
+
+
 # --- Pronunciation dictionary --------------------------------------------
 
 def load_pronunciations(path: Path) -> list[tuple[str, str]]:
@@ -379,7 +583,34 @@ def merge_short_sentences(text: str) -> str:
     return SENTENCE_SENTINEL.join(parts)
 
 
-def split_sentences(text: str) -> str:
+def _split_sentences_pysbd(text: str) -> str:
+    """Split sentences using pysbd, preserving paragraph boundaries and sentinels."""
+    # Split on paragraph boundaries first, preserving inter-paragraph separators.
+    # We use re.split with a capturing group so we know where boundaries were.
+    parts = _PARAGRAPH_BOUNDARY.split(text)
+
+    result_sentences: list[str] = []
+    for para_idx, para in enumerate(parts):
+        if not para:
+            continue
+        # Segment this paragraph into sentences.
+        raw_sentences = _PYSBD_SEGMENTER.segment(para)
+        # Strip trailing whitespace pysbd may leave; drop empties.
+        sentences = [s.strip() for s in raw_sentences]
+        sentences = [s for s in sentences if s]
+        if not sentences:
+            continue
+        if para_idx > 0:
+            # Prefix first sentence of each non-first paragraph with the
+            # paragraph sentinel so downstream sees the longer-pause marker.
+            sentences[0] = PARAGRAPH_SENTINEL + sentences[0]
+        result_sentences.extend(sentences)
+
+    return SENTENCE_SENTINEL.join(result_sentences)
+
+
+def _split_sentences_regex(text: str) -> str:
+    """Regex-based sentence splitter — stdlib fallback when pysbd is absent."""
     # Paragraph first: replace the blank-line run with a sentence sentinel
     # (so sentence-level splitting still sees the boundary) plus a paragraph
     # prefix (so the next sentence carries "longer pause before me").
@@ -389,6 +620,14 @@ def split_sentences(text: str) -> str:
     # \x1c deliberately not in the whitespace class — it survives as the
     # paragraph prefix on the next surviving sentinel.
     text = re.sub(rf"\x1d({_WS}*\x1d)+", SENTENCE_SENTINEL, text)
+    return text
+
+
+def split_sentences(text: str) -> str:
+    if _HAVE_PYSBD:
+        text = _split_sentences_pysbd(text)
+    else:
+        text = _split_sentences_regex(text)
     # If a paragraph marker ends up at the very start of the output (the
     # selection began with a blank line), there is no "before" to pause
     # against — drop leading markers.
@@ -399,9 +638,11 @@ def split_sentences(text: str) -> str:
 def main() -> int:
     text = sys.stdin.read()
     text = normalize_whitespace(text)
+    text = maybe_extract_article(text)
     text = strip_markdown(text)
     text = clean_web_artifacts(text)
     text = normalize_dashes(text)
+    text = normalize_numbers(text)
     rules = load_pronunciations(HERE / "pronunciations.txt")
     text = apply_pronunciations(text, rules)
     text = split_sentences(text)

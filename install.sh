@@ -122,6 +122,22 @@ echo "installing deps into venv..."
 "$REPO/kokoro/venv/bin/pip" install --upgrade pip >/dev/null
 "$REPO/kokoro/venv/bin/pip" install -r "$REPO/kokoro/requirements.txt"
 
+# pysbd is used by preprocess.py, which runs under /usr/bin/python3 (not the
+# venv Python above). Install it to the user site for the system interpreter.
+# preprocess.py has a regex fallback so this failure is non-fatal.
+/usr/bin/python3 -m pip install --user --quiet pysbd \
+  || echo "WARN: pysbd install failed — preprocess.py will use regex fallback"
+
+# trafilatura powers HTML article extraction in preprocess.py. Optional —
+# preprocess.py skips extraction gracefully if the import fails.
+/usr/bin/python3 -m pip install --user --quiet trafilatura lxml_html_clean \
+  || echo "WARN: trafilatura install failed — HTML article extraction will be skipped (non-fatal)"
+
+# num2words + inflect power number/currency/ordinal spell-out in preprocess.py.
+# Optional — preprocess.py has a no-op passthrough when these are absent.
+/usr/bin/python3 -m pip install --user --quiet num2words inflect \
+  || echo "WARN: num2words/inflect install failed — number spell-out will be skipped (non-fatal)"
+
 # --- 3. Model weights ---
 bash "$REPO/kokoro/download-model.sh"
 
