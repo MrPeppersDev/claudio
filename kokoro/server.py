@@ -429,7 +429,26 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(wav)
 
 
+def _warmup():
+    # onnxruntime JIT-compiles its execution graph lazily on the first
+    # inference, not at model-load. Without this, the first real /speak
+    # after boot pays ~500ms on top of actual synth. A throwaway call on
+    # a short string here amortizes that cost before the socket opens,
+    # so the first user-visible request lands on the warm path.
+    try:
+        default_voice = os.environ.get("KOKORO_VOICE", "af_bella")
+        # Blend specs go through resolve_voice; a bare name passes through
+        # as a string that KOKORO.create() accepts directly.
+        voice = resolve_voice(default_voice.split(",")[0].split(":")[0])
+        t = time.time()
+        KOKORO.create("ready", voice=voice, speed=1.0, lang="en-us")
+        print(f"[kokoro] warmed in {time.time()-t:.2f}s", flush=True)
+    except Exception as e:  # noqa: BLE001 — warm-up must never block startup
+        print(f"[kokoro] warm-up skipped: {e}", flush=True)
+
+
 def main():
+    _warmup()
     server = HTTPServer((HOST, PORT), Handler)
     print(f"[kokoro] listening on http://{HOST}:{PORT}", flush=True)
     try:
