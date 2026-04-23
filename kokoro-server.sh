@@ -67,6 +67,30 @@ cmd_start() {
     return 1
   fi
 
+  # Self-heal: /health failed, but something may still hold the port — an old
+  # server whose event loop is wedged, a crashed worker that leaked the socket,
+  # or a stale PID pointing at a live-but-hung process. If we don't clear them,
+  # the fresh `nohup` below fails to bind and the whole 8s wait times out with
+  # a confusing error. Since /health just said nobody's serving us anyway,
+  # killing port holders is safe; log loudly so post-mortems can see it fired.
+  local stragglers
+  stragglers=$(port_holders)
+  if [ -n "$stragglers" ]; then
+    log "start: /health unhealthy but port $PORT held by: $stragglers — sweeping"
+    echo "$stragglers" | xargs -I{} kill -KILL {} 2>/dev/null || true
+    sleep 0.2
+  fi
+  # Clear a stale PID file if the recorded process is dead, so a later
+  # recorded_pid() doesn't return a ghost.
+  if [ -r "$PID_FILE" ]; then
+    local old_pid
+    old_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
+      log "start: clearing stale pid file (pid=$old_pid not alive)"
+      rm -f "$PID_FILE"
+    fi
+  fi
+
   log "start: launching server"
   nohup "$PYTHON" "$SERVER_PY" >> "$LOG_FILE" 2>&1 &
   local pid=$!
