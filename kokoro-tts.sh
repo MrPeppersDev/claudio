@@ -25,8 +25,18 @@
 #   KOKORO_EQ_Q        EQ Q factor (default: 1.0)
 #   KOKORO_PAD_START_MS leading silence prepended to each synth WAV so the
 #                      first phoneme isn't smushed (default: 150; 0 disables).
-#                      Note: play-stream.py also adds a 200ms pre-roll at
-#                      stream open time to absorb CoreAudio device-init cost.
+#                      Only applied to the FIRST sentence of an utterance —
+#                      later sentences get pad=0 so per-sentence seams don't
+#                      stack into an audible stutter. play-stream.py adds a
+#                      200ms pre-roll at stream open that covers CoreAudio
+#                      warm-up, and by the time sentence 2 starts, the stream
+#                      is already live so there's no cold start to hide.
+#   KOKORO_COALESCE_MAX_CHARS  if a segment is this many chars or fewer, the
+#                      whole segment is synthesized as one Kokoro call instead
+#                      of per-sentence. Bigger single synth = smoother prosody
+#                      across sentence boundaries (Kokoro picks its own breath
+#                      pattern), at the cost of losing sentence-level cache
+#                      granularity for short messages (default: 400; 0 disables).
 #   KOKORO_TAIL_TRIM_MS trailing silence kept after the last audible sample.
 #                      Kokoro bakes ~100-200ms of tail into every utterance.
 #                      Disabled by default because the single-sample threshold
@@ -71,6 +81,7 @@ EQ_FREQ="${KOKORO_EQ_FREQ:-2500}"
 EQ_Q="${KOKORO_EQ_Q:-1.0}"
 PAD_START_MS="${KOKORO_PAD_START_MS:-150}"
 TAIL_TRIM_MS="${KOKORO_TAIL_TRIM_MS:-0}"
+COALESCE_MAX_CHARS="${KOKORO_COALESCE_MAX_CHARS:-400}"
 mkdir -p "$CACHE_DIR"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
@@ -82,10 +93,12 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
 # trim) auto-invalidates stale cache instead of silently mixing pre/post
 # audio.
 sentence_hash() {
+  local text="$1"
+  local pad="$2"
   printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s' \
     "$VOICE" "$SYNTH_SPEED" "$LANG_CODE" \
     "$EQ_GAIN_DB" "$EQ_FREQ" "$EQ_Q" \
-    "$PAD_START_MS" "$TAIL_TRIM_MS" "$1" \
+    "$pad" "$TAIL_TRIM_MS" "$text" \
     | shasum -a 256 | awk '{print $1}'
 }
 
@@ -127,14 +140,17 @@ if [ -z "$TEXT" ]; then
   exit 3
 fi
 
-# Split the target speed between the model and play-stream. Pushing Kokoro to
-# its 2.0x cap forces the model to compress phonemes and syllables muddle; a
-# gentler synth rate keeps prosody clean, and play-stream's pitch-preserving
-# resample_poly covers the rest without blurring consonants.
+# Split the target speed between the model and play-stream. Pushing Kokoro
+# to its 2.0x cap forces the model to compress phonemes and syllables muddle;
+# a gentler synth rate keeps prosody clean, and play-stream's pitch-preserving
+# sox tempo covers the rest without blurring consonants.
 #   effective_speed = SYNTH_SPEED * PLAYBACK_RATE = SPEED
 # Lower KOKORO_SYNTH_CAP → cleaner phonemes, more play-stream stretch.
 # Higher KOKORO_SYNTH_CAP → less play-stream work, more model compression.
-SYNTH_CAP="${KOKORO_SYNTH_CAP:-1.5}"
+# 1.3 picked after listening at 1.5 — Sarah (and most voices) slur words
+# like "Governance" above synth=1.4x. 1.3x synth + 1.54x sox stretch is
+# well within sox's clean-quality range and keeps Kokoro's phonemes crisp.
+SYNTH_CAP="${KOKORO_SYNTH_CAP:-1.3}"
 SYNTH_SPEED=$(awk -v s="$SPEED" -v c="$SYNTH_CAP" 'BEGIN{print (s>c?c:s)}')
 PLAYBACK_RATE=$(awk -v s="$SPEED" -v ss="$SYNTH_SPEED" 'BEGIN{print s/ss}')
 
@@ -212,13 +228,31 @@ hits=0
 misses=0
 playing=0
 first_seg=1
+# Tracks whether we've dispatched any sentence yet in this utterance. Drives
+# the PAD_START_MS decision: only the very first sentence gets leading
+# silence; otherwise per-sentence pads stack up as audible seams.
+first_sentence=1
 for seg_txt in "$WORK_DIR"/seg-*.txt; do
   seg_id=$(basename "$seg_txt" .txt)
   sent_dir="$WORK_DIR/$seg_id.sent"
   mkdir -p "$sent_dir"
-  awk -v RS=$'\x1d' -v dir="$sent_dir" '
-    { out = sprintf("%s/%04d.txt", dir, NR); printf "%s", $0 > out; close(out) }
-  ' "$seg_txt"
+
+  # B: if the segment is short enough, collapse all its sentences into a
+  # single synth call so Kokoro handles sentence-boundary prosody natively.
+  # \x1c (paragraph-start marker) is stripped — a short segment is unlikely
+  # to span paragraphs, and Kokoro infers breath from the text punctuation.
+  # \x1d (sentence separator) becomes a space; sentence-ending periods are
+  # already in the text, so "Foo.\x1dBar." → "Foo. Bar.".
+  seg_chars=$(wc -c < "$seg_txt" | tr -d ' ')
+  if [ "$COALESCE_MAX_CHARS" -gt 0 ] && [ "$seg_chars" -le "$COALESCE_MAX_CHARS" ]; then
+    tr -d $'\x1c' < "$seg_txt" \
+      | awk -v RS=$'\x1d' 'NF { if (seen) printf " "; printf "%s", $0; seen=1 }' \
+      > "$sent_dir/0001.txt"
+  else
+    awk -v RS=$'\x1d' -v dir="$sent_dir" '
+      { out = sprintf("%s/%04d.txt", dir, NR); printf "%s", $0 > out; close(out) }
+    ' "$seg_txt"
+  fi
 
   seg_has_audio=0
   for sent_txt in "$sent_dir"/*.txt; do
@@ -235,7 +269,18 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
     if [ -z "${sent_text//[[:space:]]/}" ]; then
       continue
     fi
-    hash=$(sentence_hash "$sent_text")
+    # A: only the first sentence of the utterance gets PAD_START_MS. Later
+    # sentences use pad=0 — the stream's already running so there's no
+    # CoreAudio warm-up to hide, and extra pads between sentences read as
+    # stutter. Different pads = different cache keys, which is fine: common
+    # phrases end up with both a pad=150 "first" variant and a pad=0
+    # "middle" variant and either hits correctly depending on position.
+    if [ "$first_sentence" -eq 1 ]; then
+      this_pad="$PAD_START_MS"
+    else
+      this_pad=0
+    fi
+    hash=$(sentence_hash "$sent_text" "$this_pad")
     cache_wav="$CACHE_DIR/$hash.wav"
     if [ -f "$cache_wav" ]; then
       touch "$cache_wav"
@@ -249,7 +294,7 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
         --argjson eq_gain_db "$EQ_GAIN_DB" \
         --argjson eq_freq "$EQ_FREQ" \
         --argjson eq_q "$EQ_Q" \
-        --argjson pad_start_ms "$PAD_START_MS" \
+        --argjson pad_start_ms "$this_pad" \
         --argjson tail_trim_ms "$TAIL_TRIM_MS" \
         '{text: $text, voice: $voice, speed: $speed, lang: $lang,
           eq_gain_db: $eq_gain_db, eq_freq: $eq_freq, eq_q: $eq_q,
@@ -303,6 +348,7 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
 
     printf 'PLAY %s\n' "$cache_wav" >&9
     seg_has_audio=1
+    first_sentence=0
   done
   [ "$seg_has_audio" -eq 1 ] && first_seg=0
 done
