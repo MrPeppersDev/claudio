@@ -67,6 +67,21 @@ cmd_start() {
     return 1
   fi
 
+  # Ensure the patched ONNX model (with duration predictor outputs) exists.
+  # patch-model.sh is idempotent: no-op if the patched file is already newer
+  # than the source model.
+  local patch_script="$KOKORO_DIR/patch-model.sh"
+  if [ -x "$patch_script" ]; then
+    log "start: running model patcher"
+    if ! "$patch_script" >> "$LOG_FILE" 2>&1; then
+      log "start: patch-model.sh failed — check $LOG_FILE for details"
+      echo "[kokoro] ERROR: patch-model.sh failed. Check $LOG_FILE." >&2
+      return 1
+    fi
+  else
+    log "start: patch-model.sh not found at $patch_script — skipping (old-style model)"
+  fi
+
   # Self-heal: /health failed, but something may still hold the port — an old
   # server whose event loop is wedged, a crashed worker that leaked the socket,
   # or a stale PID pointing at a live-but-hung process. If we don't clear them,

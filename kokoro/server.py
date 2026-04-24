@@ -31,7 +31,13 @@ from kokoro_onnx import Kokoro
 from scipy.signal import lfilter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(HERE, "kokoro-v1.0.onnx")
+# Use the patched model (exposes duration-predictor outputs) when available.
+# patch-model.sh produces kokoro-v1.0-durations.onnx from kokoro-v1.0.onnx;
+# kokoro-server.sh calls patch-model.sh before launching this process, so
+# the durations model should always be present at startup.
+_MODEL_DURATIONS = os.path.join(HERE, "kokoro-v1.0-durations.onnx")
+_MODEL_ORIGINAL = os.path.join(HERE, "kokoro-v1.0.onnx")
+MODEL_PATH = _MODEL_DURATIONS if os.path.exists(_MODEL_DURATIONS) else _MODEL_ORIGINAL
 VOICES_PATH = os.path.join(HERE, "voices-v1.0.bin")
 
 HOST = os.environ.get("KOKORO_HOST", "127.0.0.1")
@@ -79,6 +85,21 @@ t0 = time.time()
 KOKORO = Kokoro(MODEL_PATH, VOICES_PATH)
 VOICES = set(KOKORO.get_voices())
 print(f"[kokoro] loaded in {time.time()-t0:.2f}s ({len(VOICES)} voices)", flush=True)
+
+# Determine if the loaded model has duration outputs.  We check the session's
+# output names rather than guessing from the filename so this works even if
+# someone points MODEL_PATH at a custom export.
+try:
+    _sess_output_names = [o.name for o in KOKORO.sess.get_outputs()]
+except AttributeError:
+    # Stub/test environment where KOKORO.sess doesn't exist.
+    _sess_output_names = []
+_HAS_DURATION_OUTPUTS = "/encoder/Gather_output_0" in _sess_output_names
+if _HAS_DURATION_OUTPUTS:
+    print("[kokoro] duration predictor outputs detected — timing sidecars enabled", flush=True)
+else:
+    print("[kokoro] WARNING: duration outputs NOT found; timing sidecars disabled. "
+          "Run kokoro/patch-model.sh to enable.", flush=True)
 
 
 # Input bounds for /speak. Picked to cover realistic TTS use without inviting
@@ -441,6 +462,74 @@ def trim_sacrificial_head(samples: np.ndarray, sample_rate: int) -> np.ndarray:
     return samples
 
 
+def synth_with_durations(
+    phonemes: str,
+    voice,
+    speed: float,
+    lang: str,
+):
+    """
+    Synthesize audio from a phoneme string and capture the Gather duration
+    output from the patched model.
+
+    Returns (audio_samples, sample_rate, gather_output_or_None).
+
+    ``gather_output`` is a 1-D INT64 array of per-phoneme frame counts (one
+    entry per phoneme token).  Only available when _HAS_DURATION_OUTPUTS is
+    True; otherwise returns None so callers can fall back gracefully.
+
+    This function replicates the logic of kokoro_onnx.Kokoro._create_audio()
+    but calls sess.run() with explicit output names so we can capture the
+    extra outputs the patched model exposes, without modifying the library.
+    """
+    from kokoro_onnx.config import MAX_PHONEME_LENGTH, SAMPLE_RATE
+
+    # Replicate _create_audio: tokenize, build inputs, run session.
+    phonemes_trunc = phonemes[:MAX_PHONEME_LENGTH]
+    tokens = np.array(KOKORO.tokenizer.tokenize(phonemes_trunc), dtype=np.int64)
+    # Voice style is indexed by token count (length of phoneme sequence).
+    if isinstance(voice, str):
+        voice_style = KOKORO.get_voice_style(voice)
+    else:
+        voice_style = voice
+    voice_for_call = voice_style[len(tokens)]
+    padded_tokens = [[0, *tokens.tolist(), 0]]
+
+    # Build inputs matching the session's expected input names.
+    input_names = [i.name for i in KOKORO.sess.get_inputs()]
+    if "input_ids" in input_names:
+        inputs = {
+            "input_ids": padded_tokens,
+            "style": np.array(voice_for_call, dtype=np.float32),
+            "speed": np.array([speed], dtype=np.int32),
+        }
+    else:
+        inputs = {
+            "tokens": padded_tokens,
+            "style": voice_for_call,
+            "speed": np.ones(1, dtype=np.float32) * speed,
+        }
+
+    if _HAS_DURATION_OUTPUTS:
+        # Request all outputs so we get the duration data alongside audio.
+        outputs = KOKORO.sess.run(None, inputs)
+        # Output order (patched model): [audio, Cast_output_0, Gather_output_0, CumSum_output_0]
+        audio = outputs[0]
+        # Find Gather by position in the session output list.
+        gather_idx = _sess_output_names.index("/encoder/Gather_output_0")
+        gather = np.asarray(outputs[gather_idx], dtype=np.int64).ravel()
+        # The Gather output covers the padded token sequence (with leading/
+        # trailing pad-0 tokens).  Strip those two boundary entries so the
+        # length matches the phoneme token count.
+        if len(gather) == len(tokens) + 2:
+            gather = gather[1:-1]
+    else:
+        audio = KOKORO.sess.run(None, inputs)[0]
+        gather = None
+
+    return audio, SAMPLE_RATE, gather
+
+
 def samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
     pcm = np.clip(samples, -1.0, 1.0)
     pcm = (pcm * 32767.0).astype(np.int16)
@@ -576,6 +665,12 @@ class Handler(BaseHTTPRequestHandler):
             f"{sacrificial_head_word}, {text}" if sacrificial_head_word else text
         )
 
+        # Optional cache path for sidecar writing. When provided, the server
+        # writes cache/<hash>.words.json alongside the WAV on the server's
+        # filesystem. kokoro-tts.sh passes this when it has a definite cache
+        # target path so the sidecar is written atomically with the WAV.
+        cache_path = (payload.get("cache_path") or "").strip()
+
         t0 = time.time()
         try:
             # Phonemize once, then chunk into ≤MAX_PHONEMES_PER_CALL pieces
@@ -585,13 +680,17 @@ class Handler(BaseHTTPRequestHandler):
             phonemes = KOKORO.tokenizer.phonemize(synth_text, lang)
             chunks = chunk_phonemes(phonemes)
             parts = []
+            gather_parts: list[np.ndarray] = []
             for chunk in chunks:
-                part, sr = KOKORO.create(
-                    chunk, voice=voice, speed=speed, lang=lang,
-                    is_phonemes=True,
-                )
+                part, sr, gather = synth_with_durations(chunk, voice, speed, lang)
                 parts.append(part)
+                if gather is not None:
+                    gather_parts.append(gather)
             samples = parts[0] if len(parts) == 1 else np.concatenate(parts)
+            # Concatenate gather outputs across chunks (if multiple).
+            combined_gather = (
+                np.concatenate(gather_parts) if gather_parts else None
+            )
         except Exception as e:
             self._json(500, {"error": f"synth failed: {e}"})
             return
@@ -619,6 +718,35 @@ class Handler(BaseHTTPRequestHandler):
         wav = samples_to_wav(samples, sr)
         t3 = time.time()
         head_trim_ms = (head_trimmed_samples * 1000.0 / sr) if sr else 0.0
+
+        # Compute and write timing sidecar if we have duration data.
+        sidecar_written = False
+        if combined_gather is not None and cache_path:
+            try:
+                from kokoro.timing import compute_word_timings
+                word_timings = compute_word_timings(
+                    source_text=text,
+                    gather_output=combined_gather,
+                    lang=lang,
+                    sample_rate=sr,
+                    pad_start_ms=pad_start_ms,
+                )
+                sidecar = {
+                    "version": 1,
+                    "sample_rate": sr,
+                    "audio_samples": samples.size,
+                    "words": word_timings,
+                }
+                sidecar_path = cache_path.rsplit(".", 1)[0] + ".words.json"
+                tmp_path = sidecar_path + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(sidecar, f, indent=2)
+                os.replace(tmp_path, sidecar_path)
+                sidecar_written = True
+                sys.stderr.write(f"[kokoro] sidecar written: {sidecar_path} ({len(word_timings)} words)\n")
+            except Exception as e:
+                sys.stderr.write(f"[kokoro] WARNING: sidecar write failed: {e}\n")
+
         sys.stderr.write(
             f"[kokoro] synth chars={len(text)} phonemes={len(phonemes)} "
             f"chunks={len(chunks)} voice={voice_spec} speed={speed} "
@@ -627,7 +755,8 @@ class Handler(BaseHTTPRequestHandler):
             f"head_word={sacrificial_head_word or '-'} "
             f"head_trim={head_trim_ms:.0f}ms "
             f"synth={t1-t0:.2f}s eq_time={t2-t1:.3f}s "
-            f"encode={t3-t2:.2f}s bytes={len(wav)}\n"
+            f"encode={t3-t2:.2f}s bytes={len(wav)} "
+            f"sidecar={'yes' if sidecar_written else 'no'}\n"
         )
 
         self.send_response(200)
