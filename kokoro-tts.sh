@@ -6,6 +6,21 @@
 # is managed by kokoro-server.sh, which play-last.sh starts lazily on the
 # first F13 after a reboot.
 #
+# play-stream.py command protocol (fd 9, one line per command):
+#   PLAY <id> <wav>  — play WAV with buffer id (integer, increments per sentence)
+#   EARCON <path>    — play earcon at 1.0x
+#   PAUSE            — soft-pause (stream stays alive, position frozen)
+#   PAUSE <ms>       — backward-compat: insert <ms> of silence
+#   RESUME           — resume after soft-pause
+#   SEEK <ms>        — relative seek in source-domain ms (±)
+#   STOP             — clear queue, halt playback
+#   RATE <float>     — set sox-tempo stretch factor
+#
+# POS output: play-stream.py writes "POS <ms> <id>" lines to stderr at ~20ms
+# cadence while playing. <ms> is in the source WAV's time frame (pre-stretch)
+# so it aligns with the PR-1 timing sidecar word offsets. Filter stderr lines
+# starting with "POS " to consume the playhead position.
+#
 # Env vars:
 #   KOKORO_VOICE       voice name, or a weighted blend (default: af_sarah).
 #                      Blend syntax: "af_bella:70,am_michael:30" — weights
@@ -250,6 +265,10 @@ first_seg=1
 # the PAD_START_MS decision: only the very first sentence gets leading
 # silence; otherwise per-sentence pads stack up as audible seams.
 first_sentence=1
+# Buffer id counter: incremented for each PLAY command so play-stream.py and
+# downstream consumers (RSVP UI / timing sidecar) can identify which sentence
+# is currently playing. Echoed in every POS <ms> <id> message.
+play_id=0
 for seg_txt in "$WORK_DIR"/seg-*.txt; do
   seg_id=$(basename "$seg_txt" .txt)
   sent_dir="$WORK_DIR/$seg_id.sent"
@@ -373,7 +392,8 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
       playing=1
     fi
 
-    printf 'PLAY %s\n' "$cache_wav" >&9
+    play_id=$((play_id + 1))
+    printf 'PLAY %s %s\n' "$play_id" "$cache_wav" >&9
     seg_has_audio=1
     first_sentence=0
   done
