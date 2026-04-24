@@ -13,8 +13,9 @@
     Strip trailing punctuation for length calculation.
     pivot_index = min(max(1, ceil((L-1)/4)), L-1)   (1-based)
     The pivot character is rendered in red; the full word including
-    punctuation is displayed. Left-pad keeps the pivot column fixed
-    regardless of word length so words don't jitter horizontally.
+    punctuation is displayed. The ORP pivot is anchored at the horizontal
+    center of the balloon so the eye doesn't have to hunt for it between
+    words of different lengths.
 -->
 <html>
 <head>
@@ -37,98 +38,103 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-family: -apple-system, "SF Pro Display", "Helvetica Neue", Helvetica, Arial, sans-serif;
-    /* transition managed in JS so we can coordinate with Lua animation */
+    /*
+      Font stack for high-speed reading:
+      SF Pro Text is Apple's default reading-optimized font — open counters,
+      clear i/l/1 distinctions, excellent rendering at mid-sizes. Fallbacks
+      cover older macOS, custom-font-blocked renderers, and edge cases.
+    */
+    font-family: "SF Pro Text", -apple-system, BlinkMacSystemFont,
+                 "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-feature-settings: "ss01", "cv11";   /* flat 6/9 and straight ℓ in SF */
+    -webkit-font-smoothing: antialiased;
     transition: opacity 0.3s ease-out;
   }
 
-  /* Balloon background pill */
+  /*
+    Balloon: warm off-white like a book page, soft drop shadow so it
+    floats above the desktop without needing a hard border. Rounded enough
+    to feel like a speech bubble, not a window.
+  */
   #balloon {
     position: relative;
     width: 100%;
     height: 100%;
-    background: rgba(20, 20, 22, 0.92);
-    border-radius: 12px;
+    background: #F5EEDB;           /* book-page cream */
+    border-radius: 18px;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    /* subtle border so the balloon reads against any desktop */
-    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.10);
+    box-shadow:
+      0 12px 32px rgba(30, 20, 10, 0.18),
+      0 2px 6px  rgba(30, 20, 10, 0.10),
+      inset 0 0 0 1px rgba(120, 90, 40, 0.08);
     gap: 6px;
   }
 
   /*
-    Word display. Fixed-width monospace-like layout to prevent jitter.
-    We use a two-span approach:
-      #word-left  — characters before the pivot, right-aligned, fixed width
-      #word-pivot — the ORP character, colored red, fixed width
-      #word-right — characters after the pivot, left-aligned, fixed width
-    All three sit on one baseline inside a flex row.
+    Word display — three-column flex row with the pivot at dead center.
+    word-left and word-right are equal-weight flex children so the pivot
+    column is always horizontally centered no matter the word length.
   */
   #word-row {
     display: flex;
     flex-direction: row;
     align-items: baseline;
-    /* 48px per "slot" × some reasonable max width; clip overflow */
-    width: 460px;
-    overflow: hidden;
+    width: 92%;
+    max-width: 460px;
   }
 
   #word-left {
-    flex: 0 0 200px;       /* fixed left partition */
+    flex: 1 1 0;              /* grow/shrink equally with word-right */
     text-align: right;
-    font-size: 52px;
+    font-size: 56px;
     font-weight: 500;
-    color: #e8e8e8;
-    letter-spacing: -0.5px;
+    color: #1A1A1A;           /* near-black */
+    letter-spacing: -0.3px;
     line-height: 1.1;
     white-space: nowrap;
+    overflow: hidden;
   }
 
   #word-pivot {
-    flex: 0 0 42px;        /* fixed pivot column */
+    flex: 0 0 auto;           /* size to content; the pivot is one glyph */
+    min-width: 0.6em;         /* keep a visual anchor for narrow glyphs (i, l) */
     text-align: center;
-    font-size: 52px;
+    font-size: 56px;
     font-weight: 600;
-    color: #ff3b30;        /* system red */
-    letter-spacing: -0.5px;
+    color: #C0392B;           /* rich book-red */
+    letter-spacing: -0.3px;
     line-height: 1.1;
     white-space: nowrap;
   }
 
   #word-right {
-    flex: 1;               /* take remaining space */
+    flex: 1 1 0;              /* mirrors word-left */
     text-align: left;
-    font-size: 52px;
+    font-size: 56px;
     font-weight: 500;
-    color: #e8e8e8;
-    letter-spacing: -0.5px;
+    color: #1A1A1A;
+    letter-spacing: -0.3px;
     line-height: 1.1;
     white-space: nowrap;
+    overflow: hidden;
   }
 
-  /* Vertical ORP guide line — subtle, helps the eye lock onto the pivot */
+  /*
+    Vertical ORP guide — faint red line down the pivot column. Helps the
+    eye lock onto the fixation point without being visually noisy.
+  */
   #orp-guide {
     position: absolute;
-    left: calc(200px + 21px);  /* center of pivot column: word-left.width + pivot.width/2 */
-    top: 10%;
-    bottom: 10%;
+    left: 50%;
+    transform: translateX(-50%);
+    top: 14%;
+    bottom: 14%;
     width: 1px;
-    background: rgba(255, 59, 48, 0.25);
-    border-radius: 1px;
+    background: rgba(192, 57, 43, 0.18);
     pointer-events: none;
-  }
-  /* Horizontal baseline guide */
-  #base-guide {
-    position: absolute;
-    left: 20px;
-    right: 20px;
-    height: 1px;
-    background: rgba(255,255,255,0.06);
-    pointer-events: none;
-    /* vertically centered, but offset slightly above center for cap-height */
-    top: calc(50% + 16px);
   }
 
   /* Pause overlay */
@@ -138,23 +144,24 @@
     bottom: 14px;
     left: 50%;
     transform: translateX(-50%);
-    font-size: 13px;
-    color: rgba(255,255,255,0.45);
-    letter-spacing: 0.08em;
+    font-size: 11px;
+    font-weight: 600;
+    color: rgba(80, 60, 30, 0.55);
+    letter-spacing: 0.18em;
     text-transform: uppercase;
   }
 
-  /* When paused, dim the word slightly */
+  /* Dim the word slightly when paused */
   body.paused #word-left,
   body.paused #word-right,
   body.paused #word-pivot {
-    opacity: 0.45;
+    opacity: 0.38;
   }
   body.paused #pause-indicator {
     display: block;
   }
 
-  /* Initial invisible state — Lua fades in via opacity style */
+  /* Initial invisible state — Lua calls rsvpFadeIn after the open animation */
   body {
     opacity: 0;
   }
@@ -163,7 +170,6 @@
 <body>
 <div id="balloon">
   <div id="orp-guide"></div>
-  <div id="base-guide"></div>
   <div id="word-row">
     <span id="word-left"></span>
     <span id="word-pivot"></span>
@@ -208,9 +214,7 @@ function orpIndex(word) {
   var L = stripped.length;
   if (L === 0) return 0;
   if (L === 1) return 0;
-  // 1-based index in stripped string
   var idx1 = Math.min(Math.max(1, Math.ceil((L - 1) / 4)), L - 1);
-  // Convert to 0-based
   return idx1 - 1;
 }
 
@@ -226,7 +230,6 @@ function renderWord(word) {
 
   var pivot = orpIndex(word);
 
-  // Split into three parts: before pivot, pivot char, after pivot
   var before = word.substring(0, pivot);
   var pivotChar = word.substring(pivot, pivot + 1);
   var after = word.substring(pivot + 1);
@@ -241,7 +244,6 @@ function renderWord(word) {
 /**
  * Find the index of the word whose [start_ms, end_ms) range contains `ms`.
  * Returns -1 if no word covers `ms`.
- * Uses binary search since the words array can be several hundred entries.
  */
 function wordIndexAt(words, ms) {
   if (!words || words.length === 0) return -1;
@@ -257,17 +259,12 @@ function wordIndexAt(words, ms) {
       return mid;
     }
   }
-  // ms fell in a gap between words — show the nearest upcoming word
   if (lo < words.length) return lo;
   return -1;
 }
 
 // ── Public JS API (called by Lua via evaluateJavaScript) ─────────────────────
 
-/**
- * rsvpLoad(sidecar_json_string)
- * Parse and store a sidecar. Resets current word to -1.
- */
 window.rsvpLoad = function(jsonString) {
   try {
     _sidecar = JSON.parse(jsonString);
@@ -279,10 +276,6 @@ window.rsvpLoad = function(jsonString) {
   }
 };
 
-/**
- * rsvpLoadBuffer(buffer_id, sidecar_json_string)
- * Register a sidecar for a specific buffer id.
- */
 window.rsvpLoadBuffer = function(bufferId, jsonString) {
   try {
     _bufferSidecars[bufferId] = JSON.parse(jsonString);
@@ -291,12 +284,6 @@ window.rsvpLoadBuffer = function(bufferId, jsonString) {
   }
 };
 
-/**
- * rsvpShowAt(ms, buffer_id)
- * Advance the display to the word at position `ms` in the given buffer's sidecar.
- * If buffer_id is omitted or null, uses the top-level _sidecar.
- * No-ops if the resolved word index is the same as the current one.
- */
 window.rsvpShowAt = function(ms, bufferId) {
   if (_paused) return;
 
@@ -311,7 +298,7 @@ window.rsvpShowAt = function(ms, bufferId) {
   }
 
   var idx = wordIndexAt(words, ms);
-  if (idx === _currentWordIdx) return;   // same word, skip re-render
+  if (idx === _currentWordIdx) return;
   _currentWordIdx = idx;
 
   if (idx >= 0) {
@@ -319,38 +306,21 @@ window.rsvpShowAt = function(ms, bufferId) {
   }
 };
 
-/**
- * rsvpPause()
- * Dim the word and show the pause indicator.
- */
 window.rsvpPause = function() {
   _paused = true;
   document.body.classList.add("paused");
 };
 
-/**
- * rsvpResume()
- * Remove pause indicator and resume advancing on next rsvpShowAt call.
- */
 window.rsvpResume = function() {
   _paused = false;
   document.body.classList.remove("paused");
 };
 
-/**
- * rsvpFadeOut()
- * Fade the entire body to opacity 0 over ~300ms. Lua polls or uses a timer
- * to destroy the webview after the transition completes.
- */
 window.rsvpFadeOut = function() {
   document.body.style.transition = "opacity 0.3s ease-out";
   document.body.style.opacity = "0";
 };
 
-/**
- * rsvpFadeIn()
- * Fade in after the webview is shown (called once by Lua on show).
- */
 window.rsvpFadeIn = function() {
   document.body.style.transition = "opacity 0.2s ease-out";
   document.body.style.opacity = "1";

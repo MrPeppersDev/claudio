@@ -469,6 +469,17 @@ function M.hide()
   destroyWebview()
 end
 
+--- endOfStream()
+--- Called by PR 4 when the play task exits cleanly. The in-stream linger
+--- trigger fires only when onPos sees ms >= last_word.end_ms, but
+--- play-stream can stop emitting POS slightly before that (tail silence,
+--- 400ms pre-roll offset, etc.), so the timer never arms and the balloon
+--- sits on-screen forever. This forces the linger-fade path regardless.
+function M.endOfStream()
+  if not _webview then return end
+  scheduleLingerFadeOut()
+end
+
 --- pause()
 --- Stop advancing words; show the pause indicator.
 function M.pause()

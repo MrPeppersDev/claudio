@@ -352,7 +352,15 @@ local function runPlayScript(args)
         stderrBuffer = ""
       end
       controlFifoPath = nil
-      if code ~= 0 and code ~= 143 then -- 143 = SIGTERM on stop; not an error
+      -- Clean playback finish: trigger the balloon's linger-fade. SIGTERM
+      -- (143, from user Stop) is handled separately in M.toggle where
+      -- rsvp.hide() fires immediately. Non-zero non-143 is a real error;
+      -- we still want the balloon cleared so a crashed task doesn't leave
+      -- it dangling, so hide it directly.
+      if code == 0 or code == 143 then
+        rsvp.endOfStream()
+      else
+        rsvp.hide()
         hs.alert.show("Claudio error (exit " .. code .. ")")
       end
     end,
