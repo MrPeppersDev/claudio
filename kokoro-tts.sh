@@ -202,8 +202,24 @@ STREAM_FIFO=""
 STREAM_PID=""
 # Track whether fd 9 is currently open so cleanup never tries to close it twice.
 STREAM_FD_OPEN=0
+# Control FIFO: optional out-of-band command channel. Hammerspoon (RSVP UI)
+# writes PAUSE/RESUME/SEEK lines to this FIFO and a background reader forwards
+# them to fd 9 (play-stream.py). Path is advertised on stderr via "CTRL <path>"
+# so hs.task's stream callback can pick it up.
+CONTROL_FIFO=""
+CONTROL_READER_PID=""
 
 cleanup() {
+  # Kill the control-fifo forwarder first. It inherited a dup of fd 9, so
+  # until it exits, play-stream.py's stdin still has a writer and won't see
+  # EOF when we close fd 9 below.
+  if [ -n "$CONTROL_READER_PID" ]; then
+    kill "$CONTROL_READER_PID" 2>/dev/null || true
+    wait "$CONTROL_READER_PID" 2>/dev/null || true
+    CONTROL_READER_PID=""
+  fi
+  [ -n "$CONTROL_FIFO" ] && rm -f "$CONTROL_FIFO"
+  CONTROL_FIFO=""
   # Close fd 9 so play-stream.py hits EOF and begins draining.
   if [ "$STREAM_FD_OPEN" -eq 1 ]; then
     exec 9>&- 2>/dev/null || true
@@ -250,6 +266,29 @@ if [ "${KOKORO_NO_PLAY:-0}" != "1" ]; then
   STREAM_FD_OPEN=1
   # Send initial playback rate.
   printf 'RATE %s\n' "$PLAYBACK_RATE" >&9
+
+  # Control FIFO: Hammerspoon's RSVP integration writes PAUSE/RESUME/SEEK
+  # commands here and the subshell forwards them to fd 9. We open our own
+  # write end (fd 11 in the subshell) BEFORE the read loop so the reader
+  # never sees EOF between HS's repeated short-lived writer opens.
+  CONTROL_FIFO=$(mktemp -u "$STATE_DIR/control.XXXXXX")
+  mkfifo "$CONTROL_FIFO"
+  (
+    exec 11>"$CONTROL_FIFO"
+    exec 10<"$CONTROL_FIFO"
+    while IFS= read -r line <&10; do
+      # Only forward the three commands we've agreed on — anything else
+      # would let a compromised HS script drive arbitrary play-stream
+      # commands like STOP or RATE, which isn't that channel's job.
+      case "$line" in
+        PAUSE|RESUME|"SEEK "*) printf '%s\n' "$line" >&9 ;;
+      esac
+    done
+  ) &
+  CONTROL_READER_PID=$!
+  # Advertise the FIFO to whatever's watching stderr (Hammerspoon) so it
+  # knows where to send commands. Emitted once per invocation.
+  printf 'CTRL %s\n' "$CONTROL_FIFO" >&2
 fi
 
 # Interleaved synth + playback. Each iteration resolves its sentence's WAV
@@ -393,6 +432,15 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
     fi
 
     play_id=$((play_id + 1))
+    # Announce the timing sidecar (if written) on stderr so Hammerspoon
+    # can feed it to the RSVP balloon before POS events for this buffer
+    # arrive. The server only writes the .words.json when the patched
+    # model has duration outputs; absence is fine — balloon just stays
+    # empty and later words from a working buffer will populate it.
+    sidecar_path="${cache_wav%.wav}.words.json"
+    if [ -f "$sidecar_path" ]; then
+      printf 'SIDECAR %s %s\n' "$play_id" "$sidecar_path" >&2
+    fi
     printf 'PLAY %s %s\n' "$play_id" "$cache_wav" >&9
     seg_has_audio=1
     first_sentence=0

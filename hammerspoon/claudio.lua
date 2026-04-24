@@ -12,6 +12,17 @@
 
 local M = {}
 
+local rsvp = require("rsvp")
+
+-- RSVP wiring state. Reset on every runPlayScript spawn.
+--   controlFifoPath: path to the command FIFO advertised by kokoro-tts.sh via
+--     its "CTRL <path>" stderr line. Lives only for the duration of one play
+--     task; cleanup() in kokoro-tts.sh unlinks it when the task exits.
+--   stderrBuffer: partial-line accumulator. hs.task stream callbacks deliver
+--     arbitrarily-chunked stderr; we split on \n and flush line-by-line.
+local controlFifoPath = nil
+local stderrBuffer = ""
+
 local HOME = os.getenv("HOME")
 -- CLAUDIO_DIR = repo (scripts, venv, model files). Defaults to the install
 -- location that install.sh created, but overridable so the repo can live
@@ -265,12 +276,101 @@ end
 -- Script runner (async — don't block Hammerspoon on synthesis)
 -- ============================================================
 
+-- Read a sidecar JSON file produced by the Kokoro server. Returns the raw
+-- JSON text (rsvp.feedSidecar does its own decode) or nil if unreadable.
+-- Missing files are expected when the server ran without a patched model —
+-- not an error, just "no word timings available for this buffer."
+local function loadSidecar(path)
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local content = f:read("*a")
+  f:close()
+  return content
+end
+
+-- Append a line (PAUSE / RESUME / SEEK <ms>) to the control FIFO so the
+-- shell subshell forwards it to play-stream.py's fd 9. The subshell holds
+-- its own writer on the FIFO, so our brief open-write-close doesn't collapse
+-- the reader with an EOF. No-op if no job is running (controlFifoPath nil).
+local function writeControl(line)
+  if not controlFifoPath then return end
+  local f = io.open(controlFifoPath, "w")
+  if not f then return end
+  f:write(line .. "\n")
+  f:close()
+end
+
+-- Parse one stderr line from the play task. Protocol:
+--   POS <ms> <buffer_id>      → drive the RSVP word highlight
+--   SIDECAR <buffer_id> <path> → load sidecar JSON, feed to rsvp
+--   CTRL <fifo_path>          → remember the command FIFO path
+-- Any other line (e.g. shell diagnostics) is ignored — play-stream already
+-- logs its own state to play.log, so nothing else on this channel matters.
+local function processStderrLine(line)
+  local prefix = line:sub(1, 4)
+  if prefix == "POS " then
+    local ms_s, id_s = line:match("^POS (%d+) (%d+)$")
+    if ms_s and id_s then
+      rsvp.onPos(tonumber(ms_s), tonumber(id_s))
+    end
+    return
+  end
+  if line:sub(1, 8) == "SIDECAR " then
+    local id_s, path = line:match("^SIDECAR (%d+) (.+)$")
+    if id_s and path then
+      local json = loadSidecar(path)
+      if json then
+        rsvp.feedSidecar(tonumber(id_s), json)
+      end
+    end
+    return
+  end
+  if line:sub(1, 5) == "CTRL " then
+    local path = line:match("^CTRL (.+)$")
+    if path then
+      controlFifoPath = path
+    end
+  end
+end
+
 local function runPlayScript(args)
+  -- Per-run state reset. Leftover controlFifoPath from a prior run would
+  -- point at an already-unlinked FIFO; writing to it is a silent no-op but
+  -- clearer to just drop the reference. Stderr partial-line buffer is also
+  -- per-run: we don't want a half-line from a crashed prior task bleeding
+  -- into the next task's first line.
+  controlFifoPath = nil
+  stderrBuffer = ""
+
   hs.task.new("/bin/bash",
     function(code)
+      -- Flush any trailing unterminated line (normally there isn't one —
+      -- kokoro-tts.sh ends with newline-terminated output — but if the
+      -- task died mid-write we'd miss the last event without this).
+      if stderrBuffer ~= "" then
+        processStderrLine(stderrBuffer)
+        stderrBuffer = ""
+      end
+      controlFifoPath = nil
       if code ~= 0 and code ~= 143 then -- 143 = SIGTERM on stop; not an error
         hs.alert.show("Claudio error (exit " .. code .. ")")
       end
+    end,
+    function(_, _, stderr)
+      -- Stream callback. Buffer stderr chunks and emit complete lines.
+      if stderr and stderr ~= "" then
+        stderrBuffer = stderrBuffer .. stderr
+        while true do
+          local nl = stderrBuffer:find("\n", 1, true)
+          if not nl then break end
+          local line = stderrBuffer:sub(1, nl - 1)
+          stderrBuffer = stderrBuffer:sub(nl + 1)
+          if line ~= "" then
+            processStderrLine(line)
+          end
+        end
+      end
+      return true  -- keep streaming
     end,
     args
   ):start()
@@ -418,6 +518,10 @@ end
 function M.toggle()
   if jobIsRunning() then
     runPlayScript({ PLAY_SCRIPT })
+    -- Stop kills play-stream abruptly — POS events halt and rsvp would sit
+    -- on its last word forever waiting for the linger timer that never
+    -- arms (the linger trigger only fires when POS crosses last_word.end_ms).
+    rsvp.hide()
     return
   end
 
@@ -425,6 +529,10 @@ function M.toggle()
     if selection then
       local tmp = selectionToTempfile(selection)
       if tmp then
+        -- Show the balloon empty; the first SIDECAR event will populate it.
+        -- Delaying this until after the first SIDECAR would leave F13 with
+        -- no visible response for ~500ms-2s of synth time.
+        rsvp.show(nil)
         runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
       end
     elseif hint and hint.pdfPath then
@@ -448,6 +556,7 @@ function M.toggle()
             if f then
               f:write(stdout)
               f:close()
+              rsvp.show(nil)
               runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
             else
               os.remove(tmp)
@@ -782,6 +891,15 @@ function M.start()
   menubar:setTitle("▸")
   -- Dropdown menu. Using a function makes the menu content dynamic each open.
   menubar:setMenu(buildMenu)
+
+  -- RSVP → play-stream command hookup. Set once; the callbacks read the
+  -- current controlFifoPath, which runPlayScript resets per task. No-op if
+  -- no task is running (writeControl bails when controlFifoPath is nil).
+  rsvp.on_pause_request  = function() writeControl("PAUSE") end
+  rsvp.on_resume_request = function() writeControl("RESUME") end
+  rsvp.on_seek_request   = function(delta_ms)
+    writeControl("SEEK " .. tostring(delta_ms))
+  end
 
   watcher = hs.pathwatcher.new(STATE_DIR, function() render() end)
   watcher:start()
