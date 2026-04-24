@@ -409,3 +409,98 @@ class TestAlignmentEdgeCases:
             assert w["start_ms"] <= w["end_ms"], (
                 f"start > end for word {w['text']!r}: {w}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Real-phonemizer tests (skip if espeak unavailable).
+#
+# The stub phonemizer above keeps per-word phonemes as exact substrings of the
+# whole-phrase phonemes, so alignment is trivial and can't exercise the
+# connected-speech fusion ("was a" → wʌzɐ) or the prefix-mismatch cases
+# (per-word "CO2" → kˈoʊ tˈuː vs phrase "CO2" → sˌiːˈoʊ tˈuː) that happen
+# with real espeak. These tests unstub and use the real phonemizer to verify:
+#   1. Every source word gets a contiguous span in the phrase token stream.
+#   2. No phoneme frames are orphaned between adjacent word spans.
+#   3. Fused function words ("a" after "was") get a non-zero span.
+# ---------------------------------------------------------------------------
+
+def _real_phonemizer_available() -> bool:
+    try:
+        import espeakng_loader  # noqa: F401
+        from phonemizer import phonemize  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(
+    not _real_phonemizer_available(),
+    reason="espeakng_loader/phonemizer not installed",
+)
+class TestRealPhonemizer:
+    """Exercise alignment with real espeak output."""
+
+    def _load_real_timing(self):
+        """Unstub phonemizer and reload kokoro.timing against real espeak."""
+        import ctypes
+        import importlib
+        import espeakng_loader
+
+        # Drop stubs FIRST so the real phonemizer package imports cleanly.
+        for mod in list(sys.modules.keys()):
+            if mod == "phonemizer" or mod.startswith("phonemizer."):
+                sys.modules.pop(mod, None)
+
+        os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = (
+            espeakng_loader.get_library_path()
+        )
+        ctypes.cdll.LoadLibrary(espeakng_loader.get_library_path())
+        from phonemizer.backend.espeak.wrapper import EspeakWrapper
+        EspeakWrapper.set_data_path(espeakng_loader.get_data_path())
+        EspeakWrapper.set_library(espeakng_loader.get_library_path())
+
+        return importlib.reload(_timing_module)
+
+    def test_fusion_case_spans_are_contiguous(self):
+        """'for CO2' used to orphan ~3 phoneme frames between them (NW
+        dropped the sˌi prefix of CO2's phrase phonemes because per-word
+        CO2 starts with kˈ). Post-process must snap each word's start to
+        the previous word's end so no frames go unassigned."""
+        t = self._load_real_timing()
+
+        text = "2024 was a big year for CO2 emissions."
+        words = text.split()
+        per = t._phonemize_list(words, "en-us")
+        flat = t._phonemize_phrase(text, "en-us")
+        spans = t._align_words_to_phrase(per, flat)
+
+        assert len(spans) == len(words)
+
+        # Contiguous: spans[i+1][0] == spans[i][1]. No orphan frames.
+        for i in range(len(spans) - 1):
+            assert spans[i + 1][0] == spans[i][1], (
+                f"orphan phoneme frames between {words[i]!r} "
+                f"(span={spans[i]}) and {words[i + 1]!r} "
+                f"(span={spans[i + 1]}): frames "
+                f"[{spans[i][1]},{spans[i + 1][0]}) assigned to neither"
+            )
+
+        # First word starts at 0, last word ends at len(flat).
+        assert spans[0][0] == 0
+        assert spans[-1][1] == len(flat)
+
+    def test_fused_function_word_nonzero_span(self):
+        """'a' after 'was' fuses to wʌzɐ; 'a' must still receive >0 phonemes
+        (not be a zero-width placeholder)."""
+        t = self._load_real_timing()
+        text = "it was a big year"
+        words = text.split()
+        per = t._phonemize_list(words, "en-us")
+        flat = t._phonemize_phrase(text, "en-us")
+        spans = t._align_words_to_phrase(per, flat)
+
+        # Find the 'a' span (index 2).
+        a_span = spans[2]
+        assert a_span[1] > a_span[0], (
+            f"'a' got zero-width span {a_span} — fusion not handled"
+        )

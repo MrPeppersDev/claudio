@@ -289,13 +289,14 @@ def _align_words_to_phrase(
 
         spans.append((start, end))
 
-    # Post-process: ensure strictly non-decreasing ends and that the last
-    # word's end reaches total_ft (so audio_samples matches).
-    # Also ensure start <= end for each span.
+    # Post-process: snap every word's start to the previous word's end so
+    # orphaned phoneme frames (NW gaps between aligned spans) get absorbed
+    # by the following word rather than silently dropped. Without this,
+    # e.g. "for CO2" leaves ~3 frames of the leading `sˌi` unassigned.
     fixed: list[tuple[int, int]] = []
     cursor = 0
     for i, (s, e) in enumerate(spans):
-        s = max(s, cursor)
+        s = cursor
         e = max(e, s)
         fixed.append((s, e))
         cursor = e
