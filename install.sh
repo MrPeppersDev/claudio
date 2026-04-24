@@ -7,6 +7,8 @@
 #
 # What this does:
 #   1. Symlinks hammerspoon/claudio.lua  → ~/.hammerspoon/claudio.lua
+#      Plus rsvp.lua and rsvp.html for the RSVP balloon UI (claudio.lua
+#      does `require("rsvp")`, and rsvp.lua loads rsvp.html by path).
 #   2. Creates a Python >= 3.10 venv and installs kokoro dependencies.
 #      (Prefers 3.12. Override with CLAUDIO_PYTHON=/path/to/python if needed.)
 #   3. Downloads the Kokoro model weights + voices (one-time, ~340 MB).
@@ -75,6 +77,8 @@ link() {
   echo "linked $dest -> $src"
 }
 link "$REPO/hammerspoon/claudio.lua"             "$HOME/.hammerspoon/claudio.lua"
+link "$REPO/hammerspoon/rsvp.lua"                "$HOME/.hammerspoon/rsvp.lua"
+link "$REPO/hammerspoon/rsvp.html"               "$HOME/.hammerspoon/rsvp.html"
 
 # --- 2. Python venv + Kokoro deps ---
 # Find a Python >= 3.10 — kokoro-onnx supports 3.10+. We prefer 3.12 because
