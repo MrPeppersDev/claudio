@@ -59,6 +59,18 @@
 #                      — the previous single-sample threshold ate release
 #                      bursts from t/p/k whose amplitude sits below 0.005.
 #                      (default: 40; 0 disables — keep Kokoro's native tail)
+#   KOKORO_AUDIO_LEAD_MS  fixed POS compensation in ms. Override for the
+#                      auto-detected sounddevice OutputStream.latency.
+#                      Subtracted from emitted source_ms so POS reflects
+#                      what's AT THE SPEAKER, not what's been written to
+#                      the ring buffer. Guarantees the RSVP visual onset
+#                      lands AT or AFTER the audio onset — Kim et al.
+#                      (2024, AJSLP) found audio lagging behind visual
+#                      measurably hurts comprehension; audio leading or
+#                      matching is the only safe direction. Default:
+#                      auto-detect via OutputStream.latency (~20-30 ms on
+#                      CoreAudio). Clamped to [0, 200]. Set to a number
+#                      to pin it, or leave unset.
 #   KOKORO_SACRIFICIAL_WORD  throwaway prefix word. Kokoro's first-token
 #                      warm-up eats the initial consonant of every sentence,
 #                      so we synth "banana, {real_text}" and the server cuts

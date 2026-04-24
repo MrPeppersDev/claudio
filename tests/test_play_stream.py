@@ -289,6 +289,57 @@ class TestPosMath:
         assert abs(expected - (pos / SAMPLE_RATE * 1000.0 * tempo)) < 0.001
 
 
+class TestAudioLeadCompensation:
+    """Verify audio-leads-visual POS compensation (Kim et al. 2024).
+
+    The adjustment is: adjusted_ms = source_ms - latency_s * 1000 * tempo.
+
+    When latency=0, no shift.
+    When latency=25ms and tempo=1.54, shift = 38.5 source-ms.
+    Negative adjusted values must be skipped (audio hasn't hit speaker yet).
+    """
+
+    def _adjust(self, source_ms: float, latency_s: float, tempo: float) -> float:
+        return source_ms - latency_s * 1000.0 * tempo
+
+    def test_zero_latency_is_identity(self):
+        """With latency=0 the adjustment is a no-op."""
+        assert self._adjust(1000.0, 0.0, 1.54) == 1000.0
+
+    def test_positive_latency_shifts_left(self):
+        """Positive latency makes adjusted POS smaller (speaker behind write)."""
+        assert self._adjust(1000.0, 0.025, 1.54) == 1000.0 - 38.5
+
+    def test_tempo_scales_compensation(self):
+        """Compensation scales with tempo: same wall-clock latency is more
+        source-domain ms at higher tempos."""
+        lat = 0.025
+        at_1x = self._adjust(1000.0, lat, 1.0)
+        at_2x = self._adjust(1000.0, lat, 2.0)
+        # At 2x tempo, each wall-clock ms covers 2 source-domain ms, so the
+        # same ring-buffer latency corresponds to 2x as many source ms.
+        assert (1000.0 - at_2x) == 2 * (1000.0 - at_1x)
+
+    def test_early_samples_go_negative(self):
+        """First ~latency*tempo ms of a buffer produce negative adjusted_ms
+        and should be suppressed so visual doesn't flash pre-audio."""
+        # At the moment pos=0 is written (source_ms=0), that sample will
+        # play in `latency` seconds. The adjusted value is negative.
+        lat = 0.025
+        tempo = 1.54
+        assert self._adjust(0.0, lat, tempo) < 0
+        # And for small source_ms values below latency * tempo, still negative.
+        assert self._adjust(20.0, lat, tempo) < 0
+        # Above latency * tempo (= 38.5 ms), adjusted is positive.
+        assert self._adjust(50.0, lat, tempo) > 0
+
+    def test_module_has_latency_global(self):
+        """Module exposes _STREAM_OUTPUT_LATENCY_S as a float, defaulting 0."""
+        assert hasattr(_ps, "_STREAM_OUTPUT_LATENCY_S")
+        assert isinstance(_ps._STREAM_OUTPUT_LATENCY_S, float)
+        assert _ps._STREAM_OUTPUT_LATENCY_S >= 0.0
+
+
 # ---------------------------------------------------------------------------
 # 3. Smoke test (optional — skipped if no audio device)
 # ---------------------------------------------------------------------------

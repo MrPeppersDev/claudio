@@ -96,6 +96,20 @@ EDGE_FADE_MS = 3      # linear fade-in/out applied to every PLAY/EARCON buffer
                       # eliminates the discontinuity.
 POS_CADENCE_S = 0.020  # ~20 ms between POS emissions while playing
 
+# Audio-leads-visual compensation (Kim et al. 2024, AJSLP).
+# When _play_buffer writes a chunk, POS is naturally emitted against the
+# write offset — but those samples are sitting in the CoreAudio ring
+# buffer and haven't reached the speaker yet. Meanwhile the pipe→Lua→JS
+# render pipeline adds its own latency. If ring > pipe, visual flashes
+# BEFORE audio plays (the worst desync case per Kim 2024 — comprehension
+# drops measurably). Compensating POS by the stream's output latency
+# makes POS reflect speaker time, guaranteeing visual always lags audio.
+#
+# sounddevice exposes OutputStream.latency (seconds) once the stream is
+# open. On macOS CoreAudio with default blocksize this is typically
+# 20-30 ms. We cache it at startup.
+_STREAM_OUTPUT_LATENCY_S: float = 0.0
+
 # ---- shared state (protected by _lock) ----------------------------------------
 
 _lock = threading.Lock()
@@ -321,12 +335,28 @@ def _play_buffer(buffer_id: int, samples: np.ndarray, tempo_factor: float) -> No
         _stream_write(chunk)
         pos = end
 
-        # Emit POS in source-domain time.
-        # source_ms = pos * 1000 * tempo_factor / SAMPLE_RATE
+        # Emit POS in source-domain time, compensated for audio-leads-visual.
+        #
+        # Raw: source_ms = pos * 1000 * tempo_factor / SAMPLE_RATE.
+        #      This is the position of the just-WRITTEN sample, which is
+        #      sitting in CoreAudio's ring buffer and hasn't played yet.
+        #
+        # Compensated: subtract the ring-buffer latency converted to
+        #      source-domain ms. Result = source position currently AT THE
+        #      SPEAKER. Downstream visual-pipeline latency then lands
+        #      visual onset slightly AFTER audio onset — the direction
+        #      Kim et al. 2024 found protects comprehension.
+        #
+        # During the first ~latency*tempo ms of a buffer the adjusted value
+        # is negative — that audio isn't at the speaker yet. Skip those so
+        # rsvp doesn't flash a word before its sound plays.
         source_ms = pos / SAMPLE_RATE * 1000.0 * tempo_factor
-        if int(source_ms) != last_pos_emit:
-            _emit_pos(source_ms, buffer_id)
-            last_pos_emit = int(source_ms)
+        adjusted_ms = source_ms - _STREAM_OUTPUT_LATENCY_S * 1000.0 * tempo_factor
+        if adjusted_ms < 0:
+            continue
+        if int(adjusted_ms) != last_pos_emit:
+            _emit_pos(adjusted_ms, buffer_id)
+            last_pos_emit = int(adjusted_ms)
 
 
 # ---- signal handling ----------------------------------------------------------
@@ -349,6 +379,8 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 def main() -> None:
     global _stream, _rate, _paused, _stop_requested, _seek_delta_samples
 
+    global _STREAM_OUTPUT_LATENCY_S
+
     # Open the stream once for the entire session.
     _stream = sd.OutputStream(
         samplerate=SAMPLE_RATE,
@@ -357,6 +389,23 @@ def main() -> None:
         blocksize=0,   # let sounddevice choose an appropriate block size
     )
     _stream.start()
+
+    # Cache the output latency for POS compensation. Post-start() this is a
+    # float (seconds). Belt-and-braces: env var override (tunable without a
+    # code change) and a floor of 0 / ceiling of 0.2 s (200 ms) against bad
+    # backends reporting nonsense.
+    lat_env = os.environ.get("KOKORO_AUDIO_LEAD_MS")
+    if lat_env:
+        try:
+            _STREAM_OUTPUT_LATENCY_S = max(0.0, min(0.2, float(lat_env) / 1000.0))
+        except ValueError:
+            _STREAM_OUTPUT_LATENCY_S = 0.0
+    else:
+        raw = getattr(_stream, "latency", 0.0) or 0.0
+        try:
+            _STREAM_OUTPUT_LATENCY_S = max(0.0, min(0.2, float(raw)))
+        except (TypeError, ValueError):
+            _STREAM_OUTPUT_LATENCY_S = 0.0
 
     # Start the player thread as daemon so it exits when main() returns.
     player = threading.Thread(target=_player_loop, daemon=True)
