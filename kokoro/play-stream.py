@@ -358,6 +358,25 @@ def _play_buffer(buffer_id: int, samples: np.ndarray, tempo_factor: float) -> No
             _emit_pos(adjusted_ms, buffer_id)
             last_pos_emit = int(adjusted_ms)
 
+    # End-of-buffer catch-up. The compensated POS stream stops
+    # `latency*tempo` source-ms short of the buffer's true end — otherwise the
+    # last word's visual would fire before its audio. That leaves the RSVP
+    # balloon frozen on whichever word contains that final POS while audio
+    # plays through the remaining ~latency*tempo ms of already-buffered
+    # samples. Schedule one final uncompensated POS at source_ms_end, delayed
+    # by the same compensation, so it lands at the speaker simultaneously
+    # with audio's actual end — advancing the balloon's final word without
+    # violating audio-leads-visual.
+    final_source_ms = total / SAMPLE_RATE * 1000.0 * tempo_factor
+    final_delay_s = _STREAM_OUTPUT_LATENCY_S * tempo_factor
+    if final_delay_s > 0.0:
+        threading.Timer(
+            final_delay_s,
+            lambda sm=final_source_ms, bid=buffer_id: _emit_pos(sm, bid),
+        ).start()
+    else:
+        _emit_pos(final_source_ms, buffer_id)
+
 
 # ---- signal handling ----------------------------------------------------------
 
