@@ -35,7 +35,7 @@ These are the kinds of things that cost hours to rediscover if you don't know th
 - **3ms linear edge fade** on every PLAY buffer. Kokoro WAVs can end/begin at non-zero amplitude; direct concatenation makes an audible DC-step click (woodblock-ish). 3ms fade-in + fade-out is inaudible as a pause but eliminates the discontinuity.
 - **Windowed-RMS tail trim with 60ms dwell**. Single-sample threshold trims ate unvoiced stop releases (t/p/k sit at 0.01–0.04 RMS but their release bursts are brief). The dwell requirement preserves them while still trimming dead air.
 - **Coalesce short paragraphs** (`KOKORO_COALESCE_MAX_CHARS`, default 400). Per-sentence synth loses Kokoro's paragraph-level prosody — short paragraphs synth as one unit to keep natural breath patterns.
-- **Cache key includes every synthesis-affecting knob**. Voice, synth speed, lang, EQ, pad, tail-trim, sacrificial word, and text. Toggling any env var auto-invalidates stale cache entries — never "why is this sentence the old voice?" again.
+- **Cache key includes every synthesis-affecting knob AND a `SYNTH_VERSION`**. Knobs: voice, synth speed, lang, EQ, pad, tail-trim, sacrificial word, text. Toggling any env var auto-invalidates stale entries. For changes that don't show up as env vars — server-side algorithm edits (e.g. sacrificial-head detector, tail-trim logic, timing-sidecar schema) — bump `SYNTH_VERSION` in `kokoro-tts.sh` in the same commit; the bump-history comment next to the variable explains why each bump happened. Rule of thumb: if your edit to `kokoro/server.py` changes output samples (or sidecar shape) for identical input, bump it.
 - **Server binds loopback only** by default; `KOKORO_ALLOW_REMOTE=1` is the explicit opt-in. No auth.
 
 ## Env vars

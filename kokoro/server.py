@@ -141,13 +141,26 @@ TAIL_RMS_DWELL_FRAMES = 6  # 60ms
 # owns the word (typically "banana"); we just find the comma gap and cut.
 #
 # Search window: how far into the audio we'll look for the post-prefix gap.
-# "banana," at 1.3x speed is ~450ms; widen to 1500ms to tolerate slower voices
-# and extra-long prefix words. If no gap is found in this window, we fail
-# open (return samples unchanged) rather than mangle.
 HEAD_TRIM_SEARCH_MS = 1500
-# Dwell required to consider the post-prefix pause "real" — same 60ms as the
-# tail trim so stop bursts inside the prefix don't fool the detector.
-HEAD_TRIM_DWELL_FRAMES = 6  # 60ms
+# Dwell required to recognize a silent run as the post-prefix gap. 20ms is
+# tight enough to catch comma gaps that get compressed at fast synth speeds
+# (e.g. 1.3x+) where the gap is often only 30-50ms.
+HEAD_TRIM_DWELL_FRAMES = 2  # 20ms
+# Relative silence threshold: a frame counts as silent if its RMS is below
+# max(TAIL_RMS_THRESHOLD, peak_rms * HEAD_TRIM_REL_THRESHOLD). The peak is
+# over the search window. Relative-to-peak adapts to voice loudness so fast
+# or quiet synth still has a detectable trough at the comma; the absolute
+# floor prevents all-silent input from picking a nonsense "peak".
+HEAD_TRIM_REL_THRESHOLD = 0.15
+# Min/max cut position bounds (at 1x synth speed — scaled by `speed` at call
+# time). Min protects the body of the prefix word from being chopped if the
+# detector fires on an intra-word dip. Max prevents the detector from walking
+# past a missed comma gap into a natural intra-utterance pause (after e.g.
+# "Pros:" or "Cons:") and chopping the real first word. Numbers sized for
+# the default prefix "banana": ~430ms at 1x, +150ms comma = gap ends ~580ms,
+# with a generous tail to accommodate voice/speed variance.
+HEAD_TRIM_MIN_CUT_AT_1X_MS = 430
+HEAD_TRIM_MAX_CUT_AT_1X_MS = 950
 
 
 class ValidationError(ValueError):
@@ -414,21 +427,38 @@ def trim_tail_silence(samples: np.ndarray, sample_rate: int, target_ms: float) -
     return samples[:end]
 
 
-def trim_sacrificial_head(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+def trim_sacrificial_head(
+    samples: np.ndarray,
+    sample_rate: int,
+    speed: float = 1.0,
+) -> np.ndarray:
     """
     Drop the sacrificial prefix word from the head of ``samples``.
 
-    The client has asked Kokoro to synthesize ``"banana, {real_text}"``. The
-    prefix warms Kokoro's acoustic model so the first consonant of
-    ``real_text`` is fully formed. We now need to cut the prefix off the
-    front. The comma after the prefix produces a detectable prosodic gap
-    — we find the first run of at least ``HEAD_TRIM_DWELL_FRAMES`` silent
-    frames that's preceded by at least one audible frame, and cut at the
-    end of that silent run.
+    The client has asked Kokoro to synthesize ``"banana, {real_text}"``.
+    The prefix warms Kokoro's acoustic model so the first consonant of
+    ``real_text`` is fully formed. This function finds the comma-gap at
+    the end of the prefix and cuts there.
 
-    Fails open: if no gap is found within ``HEAD_TRIM_SEARCH_MS`` we return
-    ``samples`` unchanged. Audible "banana," in playback is the signal that
-    the detector needs tuning — better than silent garbling.
+    RMS-based detection with three guardrails:
+
+    * **Relative threshold** — a frame is "silent" if its RMS is below
+      ``max(TAIL_RMS_THRESHOLD, peak_rms * HEAD_TRIM_REL_THRESHOLD)``.
+      Adapts to voice loudness: a compressed or quiet comma gap still
+      reads as a clear trough.
+    * **Min cut position** — ignore triggers before
+      ``HEAD_TRIM_MIN_CUT_AT_1X_MS / speed`` ms. Protects the body of
+      the prefix word from being chopped if an intra-word nasal/schwa
+      dip crosses the threshold.
+    * **Max cut position** — once we pass ``HEAD_TRIM_MAX_CUT_AT_1X_MS /
+      speed`` ms without triggering, fail open. A gap found past that
+      point is almost certainly an intra-utterance pause after the real
+      first word (e.g. after "Pros:") — cutting there would chop the
+      word out. Better to leak "banana," than to silently eat "Pros".
+
+    Fails open on ambiguity: return ``samples`` unchanged rather than
+    chop the real first word. Audible "banana," leaking through is the
+    signal that the detector needs tuning — better than silent garbling.
     """
     if samples.size == 0:
         return samples
@@ -444,21 +474,37 @@ def trim_sacrificial_head(samples: np.ndarray, sample_rate: int) -> np.ndarray:
     window = samples[:search_frames * frame].astype(np.float64)
     rms = np.sqrt(np.mean(window.reshape(search_frames, frame) ** 2, axis=1))
 
+    peak = float(rms.max()) if rms.size else 0.0
+    threshold = max(TAIL_RMS_THRESHOLD, peak * HEAD_TRIM_REL_THRESHOLD)
+
+    speed_scale = max(speed, 0.1)  # guard against zero/negative
+    min_cut_frame = (
+        int(round(HEAD_TRIM_MIN_CUT_AT_1X_MS * sample_rate / 1000.0 / speed_scale))
+        // frame
+    )
+    max_cut_frame = (
+        int(round(HEAD_TRIM_MAX_CUT_AT_1X_MS * sample_rate / 1000.0 / speed_scale))
+        // frame
+    )
+
     seen_audible = False
     silent_run = 0
     for i in range(search_frames):
-        if rms[i] > TAIL_RMS_THRESHOLD:
+        if rms[i] > threshold:
             seen_audible = True
             silent_run = 0
-        else:
-            if seen_audible:
-                silent_run += 1
-                if silent_run >= HEAD_TRIM_DWELL_FRAMES:
-                    # Gap confirmed. Cut at the end of this silent run so
-                    # playback starts cleanly at the next audible sample.
-                    cut = (i + 1) * frame
-                    return samples[cut:]
-    # No gap found in the search window — fail open.
+            continue
+        if not seen_audible:
+            continue
+        silent_run += 1
+        if silent_run < HEAD_TRIM_DWELL_FRAMES:
+            continue
+        cut_frame = i + 1
+        if cut_frame > max_cut_frame:
+            return samples
+        if cut_frame < min_cut_frame:
+            continue
+        return samples[cut_frame * frame:]
     return samples
 
 
@@ -699,7 +745,7 @@ class Handler(BaseHTTPRequestHandler):
         head_trimmed_samples = 0
         if sacrificial_head_word:
             before = samples.size
-            samples = trim_sacrificial_head(samples, sr)
+            samples = trim_sacrificial_head(samples, sr, speed=speed)
             head_trimmed_samples = before - samples.size
         # Trim before pad so the pad length is exactly what the client asked
         # for regardless of how much native tail Kokoro baked in.

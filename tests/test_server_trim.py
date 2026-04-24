@@ -59,9 +59,13 @@ import unittest.mock  # noqa: E402 — after stubs
 import numpy as np  # noqa: E402
 from kokoro.server import (  # noqa: E402
     trim_tail_silence,
+    trim_sacrificial_head,
     TAIL_RMS_THRESHOLD,
     TAIL_RMS_FRAME_SAMPLES,
     TAIL_RMS_DWELL_FRAMES,
+    HEAD_TRIM_DWELL_FRAMES,
+    HEAD_TRIM_MIN_CUT_AT_1X_MS,
+    HEAD_TRIM_MAX_CUT_AT_1X_MS,
 )
 
 # Convenience: Kokoro's native sample rate.
@@ -218,3 +222,159 @@ class TestTrims:
             f"Not idempotent: once={once.size} twice={twice.size}"
         )
         np.testing.assert_array_equal(once, twice)
+
+
+# ---------------------------------------------------------------------------
+# trim_sacrificial_head tests
+#
+# The detector's job is to find the post-prefix comma gap and cut there. It
+# runs under three guardrails: relative RMS threshold (% of peak), min/max
+# cut-position bounds (scaled by synth speed), and a dwell requirement. The
+# tests below exercise the combinations that actually come up in production:
+# detecting a compressed comma gap, ignoring intra-prefix dips, and failing
+# open when the first qualifying gap is past the real first word.
+# ---------------------------------------------------------------------------
+
+class TestTrimSacrificialHead:
+    # Speed=1.0 keeps the arithmetic readable — min_cut = 430ms, max_cut =
+    # 800ms, so a "gap at 480ms" is unambiguously post-prefix and a "gap at
+    # 850ms" is unambiguously past-the-real-word.
+    DEFAULT_SPEED = 1.0
+
+    def test_empty_input(self):
+        """Empty array → return immediately."""
+        empty = np.array([], dtype=np.float32)
+        result = trim_sacrificial_head(empty, SR, speed=self.DEFAULT_SPEED)
+        assert result.size == 0
+        assert result is empty
+
+    def test_signal_shorter_than_dwell(self):
+        """A signal shorter than the dwell window → return unchanged."""
+        sig = _tone(10)  # 10ms, well under dwell=30ms
+        result = trim_sacrificial_head(sig, SR, speed=self.DEFAULT_SPEED)
+        assert result is sig
+
+    def test_basic_gap_detected(self):
+        """
+        Classic shape: prefix audible, comma gap, real word audible. The cut
+        should land inside the comma gap so the returned array starts with
+        (at most) a little leading silence and then the real word.
+        """
+        prefix = _tone(500)      # 500ms of "banana"
+        gap = _silence(100)      # 100ms comma gap
+        word = _tone(400, freq=660)
+        sig = np.concatenate([prefix, gap, word])
+
+        result = trim_sacrificial_head(sig, SR, speed=self.DEFAULT_SPEED)
+
+        # Result must be shorter than input (we cut something).
+        assert result.size < sig.size
+        # The cut should happen somewhere inside the comma gap, i.e. the
+        # returned prefix should be << the original 500ms prefix.
+        #   sig.size - result.size ≈ samples cut from the head.
+        cut_ms = (sig.size - result.size) * 1000.0 / SR
+        assert 430 <= cut_ms <= 600, (
+            f"Cut at {cut_ms:.0f}ms — expected between min_cut (430ms) "
+            f"and end of comma gap (~600ms)."
+        )
+
+    def test_compressed_gap_still_detected(self):
+        """
+        At fast synth the comma gap can compress to 40-50ms — narrower than
+        the old 60ms dwell but still above the 30ms dwell. The detector
+        should still fire.
+        """
+        prefix = _tone(500)
+        gap = _silence(40)    # compressed — above 30ms dwell, below old 60ms
+        word = _tone(400, freq=660)
+        sig = np.concatenate([prefix, gap, word])
+
+        result = trim_sacrificial_head(sig, SR, speed=self.DEFAULT_SPEED)
+        assert result.size < sig.size, (
+            "Compressed 40ms comma gap should still trigger a trim"
+        )
+
+    def test_intra_prefix_dip_ignored(self):
+        """
+        A silent dip *inside* the prefix word (before min_cut_frame) must
+        not cause a cut. The real comma gap further in should be what
+        triggers the trim.
+
+        Layout: 150ms loud, 40ms dip, 250ms loud (total 440ms "banana"),
+        then 100ms real comma gap, then the real word. Without the
+        min-cut guardrail, the 40ms dip at 150-190ms would have fired a
+        cut inside the prefix.
+        """
+        loud_a = _tone(150)
+        dip = _silence(40)
+        loud_b = _tone(250)
+        gap = _silence(100)
+        word = _tone(400, freq=660)
+        sig = np.concatenate([loud_a, dip, loud_b, gap, word])
+
+        result = trim_sacrificial_head(sig, SR, speed=self.DEFAULT_SPEED)
+
+        cut_ms = (sig.size - result.size) * 1000.0 / SR
+        # Cut must be beyond min_cut_at_1x (430ms), not around the dip (~190ms).
+        assert cut_ms >= HEAD_TRIM_MIN_CUT_AT_1X_MS, (
+            f"Cut at {cut_ms:.0f}ms fell inside the prefix — the intra-word "
+            f"dip at ~190ms should not have triggered a cut."
+        )
+
+    def test_no_gap_fails_open(self):
+        """All audible through the search window → samples returned unchanged."""
+        sig = _tone(1200)
+        result = trim_sacrificial_head(sig, SR, speed=self.DEFAULT_SPEED)
+        assert result is sig
+
+    def test_late_gap_fails_open(self):
+        """
+        First qualifying silent run lives past max_cut. Cutting there would
+        chop the real first word out (this is the "pros/cons got skipped"
+        failure mode when the comma gap was missed). Detector must fail
+        open instead.
+
+        Layout: long audible stretch (prefix + real first word run together
+        — comma gap below threshold), then a pause. The pause has to start
+        past HEAD_TRIM_MAX_CUT_AT_1X_MS for the safety net to trip.
+        """
+        audible = _tone(HEAD_TRIM_MAX_CUT_AT_1X_MS + 100)  # past max_cut
+        late_gap = _silence(200)
+        trailing = _tone(300, freq=660)
+        sig = np.concatenate([audible, late_gap, trailing])
+
+        result = trim_sacrificial_head(sig, SR, speed=self.DEFAULT_SPEED)
+        assert result is sig, (
+            "Late gap (past max_cut) should fail open, not cut — cutting "
+            "there would eat the real first word."
+        )
+
+    def test_speed_scales_cut_bounds(self):
+        """
+        At higher synth speed the prefix takes less real time. min_cut and
+        max_cut both scale inversely. A gap that would fail open at 1.0x
+        (because it's past max_cut=800ms) should still fail open at 2.0x
+        (max_cut=400ms) — just for a different reason — but a gap at 500ms
+        that fails open at 1.0x should *not* fail open at 1.0x where it's
+        clearly inside the expected window. This test specifically checks
+        that doubling speed moves min_cut down: a gap ending at ~260ms
+        that's *ignored* at 1.0x (inside min_cut=430ms) gets *cut* at 2.0x
+        (min_cut=215ms).
+        """
+        prefix = _tone(200)   # 200ms — half the 1x prefix duration
+        gap = _silence(80)    # comma gap ending at 280ms
+        word = _tone(400, freq=660)
+        sig = np.concatenate([prefix, gap, word])
+
+        # At 1.0x the gap at 200-280ms is well inside min_cut=430ms — no cut.
+        at_1x = trim_sacrificial_head(sig, SR, speed=1.0)
+        assert at_1x is sig, (
+            "Gap inside 1x min_cut region should not be cut at 1.0x"
+        )
+        # At 2.0x min_cut = 215ms. The gap starts at 200ms; dwell (30ms) is
+        # met at ~230ms, past min_cut. Should cut.
+        at_2x = trim_sacrificial_head(sig, SR, speed=2.0)
+        assert at_2x.size < sig.size, (
+            "At 2.0x speed the scaled min_cut should allow cutting the "
+            "~280ms gap."
+        )
