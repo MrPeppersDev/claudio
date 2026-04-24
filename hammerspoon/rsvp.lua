@@ -89,7 +89,6 @@ local SEEK_DELTA_MS = 2000
 -- ── State ─────────────────────────────────────────────────────────────────────
 
 local _webview      = nil    -- hs.webview instance (nil when hidden)
-local _keyTap       = nil    -- hs.eventtap for Space/Esc/←/→ scoped to webview focus
 local _lingerTimer  = nil    -- hs.timer: fires after LINGER_SECS to begin fade-out
 local _animTimer    = nil    -- hs.timer: used during animate-in
 local _pollTimer    = nil    -- hs.timer: polls window.__claudio_q for button clicks
@@ -291,6 +290,8 @@ local POLL_INTERVAL = 0.20
 local function dispatchCmd(cmd)
   if cmd == "toggle_pause" then
     if _isPaused then M.resume() else M.pause() end
+  elseif cmd == "pause_only" then
+    if not _isPaused then M.pause() end
   elseif cmd == "seek_back" then
     if M.on_seek_request then M.on_seek_request(-SEEK_DELTA_MS) end
   elseif cmd == "seek_fwd" then
@@ -351,10 +352,6 @@ local function destroyWebview()
     _animTimer:stop()
     _animTimer = nil
   end
-  if _keyTap then
-    _keyTap:stop()
-    _keyTap = nil
-  end
   if _webview then
     _webview:delete()
     _webview = nil
@@ -377,49 +374,11 @@ local function beginFadeOut()
   end)
 end
 
--- True when our webview is the currently-focused window. Used to gate the
--- keyDown eventtap so Space/Esc/←/→ only act on the balloon when the user
--- has clicked it; otherwise keys pass through unchanged to whatever app
--- they were typing in.
-local function isWebviewFocused()
-  if not _webview then return false end
-  local ok, win = pcall(function() return _webview:hswindow() end)
-  if not ok or not win then return false end
-  local focused = hs.window.focusedWindow()
-  return focused ~= nil and focused:id() == win:id()
-end
-
--- Install a keyDown eventtap that only swallows Space/Esc/←/→ when the
--- webview is focused. Previous implementation used hs.hotkey.new({}, ...)
--- which unconditionally stole those keys whenever the balloon was visible —
--- meaning user couldn't type a space in any app until the balloon went
--- away. hs.eventtap lets us return false to pass the key through.
-local function registerHotkeys()
-  if _keyTap then _keyTap:stop() end
-  local km = hs.keycodes.map
-  _keyTap = hs.eventtap.new({ hs.eventtap.event.types.keyDown }, function(event)
-    if not isWebviewFocused() then return false end
-    local kc = event:getKeyCode()
-    if kc == km.space then
-      if _isPaused then M.resume() else M.pause() end
-      return true
-    end
-    if kc == km.escape then
-      M.pause()
-      return true
-    end
-    if kc == km.left then
-      if M.on_seek_request then M.on_seek_request(-SEEK_DELTA_MS) end
-      return true
-    end
-    if kc == km.right then
-      if M.on_seek_request then M.on_seek_request(SEEK_DELTA_MS) end
-      return true
-    end
-    return false
-  end)
-  _keyTap:start()
-end
+-- Space/Esc/←/→ are handled via JS keydown listeners in rsvp.html that push
+-- commands into the same __claudio_q queue the hover buttons use. The Lua
+-- side picks them up through startPolling()/dispatchCmd. Scope is identical
+-- to the buttons — only fires while the webview content has focus, so keys
+-- pass through to other apps unchanged when the balloon isn't focused.
 
 -- ── Linger + last-word detection ─────────────────────────────────────────────
 
@@ -497,8 +456,8 @@ function M.show(sidecar_path, opts)
   _webview:windowStyle(wm.borderless)
   _webview:transparent(true)
   _webview:bringToFront(true)
-  -- Required for the webview to become firstResponder on click, which the
-  -- scoped Space/Esc/←/→ eventtap needs via isWebviewFocused().
+  -- Required so clicks make the webview content firstResponder; without it
+  -- the JS keydown listener for Space/Esc/←/→ never fires.
   if _webview.allowTextEntry then _webview:allowTextEntry(true) end
 
   -- Fires once when the HTML has finished loading (triggered by the
@@ -527,12 +486,11 @@ function M.show(sidecar_path, opts)
 
     if anchorMode then
       -- Anchor mode: balloon is already at final rect. Just fade in the
-      -- content (CSS transition handles it) and arm the hotkeys. No grow
+      -- content (CSS transition handles it) and start polling. No grow
       -- animation — a pop-in at cursor/selection position reads as more
       -- deliberate than a bubble unfurling from somewhere else.
       _webview:frame(targetRect)
       jsCall("window.rsvpFadeIn")
-      registerHotkeys()
       startPolling()
       return
     end
@@ -565,8 +523,6 @@ function M.show(sidecar_path, opts)
         _webview:frame(targetRect)
         _animTimer = nil
         jsCall("window.rsvpFadeIn")
-        -- Register hotkeys now that balloon is fully visible.
-        registerHotkeys()
         startPolling()
       end
     end

@@ -599,6 +599,29 @@ function __claudio_push(cmd) { window.__claudio_q.push(cmd); }
   if (x) x.addEventListener("click", function(e) { e.preventDefault(); __claudio_push("close"); });
 })();
 
+// Keyboard shortcuts. Scope is the webview content — the browser only
+// delivers keydown to the focused frame, so once the user clicks the
+// balloon (making it firstResponder) keys flow here. When the user is
+// elsewhere, keys go to whatever app they were typing in. Replaces an
+// hs.eventtap that gated on hs.window.focusedWindow(), which doesn't
+// resolve correctly for hs.webview clicks.
+document.addEventListener("keydown", function(e) {
+  var k = e.key;
+  if (k === " " || e.code === "Space") {
+    e.preventDefault();
+    __claudio_push("toggle_pause");
+  } else if (k === "Escape") {
+    e.preventDefault();
+    __claudio_push("pause_only");
+  } else if (k === "ArrowLeft") {
+    e.preventDefault();
+    __claudio_push("seek_back");
+  } else if (k === "ArrowRight") {
+    e.preventDefault();
+    __claudio_push("seek_fwd");
+  }
+});
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 
 renderWord("—");
