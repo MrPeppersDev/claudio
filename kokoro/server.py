@@ -112,6 +112,22 @@ TAIL_RMS_FRAME_SAMPLES = 240  # 10ms @ 24000 Hz
 # as long as the silence after them hasn't accumulated 60ms yet.
 TAIL_RMS_DWELL_FRAMES = 6  # 60ms
 
+# Sacrificial head-word trim. Kokoro drops the first consonant/syllable of
+# a sentence (the acoustic model "warms up" on the first token). The client
+# can send a throwaway prefix word plus comma — "banana, recap." — and the
+# server trims the prefix off before returning audio, so the playback starts
+# mid-utterance at the real first word with full attack intact. The caller
+# owns the word (typically "banana"); we just find the comma gap and cut.
+#
+# Search window: how far into the audio we'll look for the post-prefix gap.
+# "banana," at 1.3x speed is ~450ms; widen to 1500ms to tolerate slower voices
+# and extra-long prefix words. If no gap is found in this window, we fail
+# open (return samples unchanged) rather than mangle.
+HEAD_TRIM_SEARCH_MS = 1500
+# Dwell required to consider the post-prefix pause "real" — same 60ms as the
+# tail trim so stop bursts inside the prefix don't fool the detector.
+HEAD_TRIM_DWELL_FRAMES = 6  # 60ms
+
 
 class ValidationError(ValueError):
     """Raised when a /speak payload field is out of range or malformed."""
@@ -377,6 +393,54 @@ def trim_tail_silence(samples: np.ndarray, sample_rate: int, target_ms: float) -
     return samples[:end]
 
 
+def trim_sacrificial_head(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    """
+    Drop the sacrificial prefix word from the head of ``samples``.
+
+    The client has asked Kokoro to synthesize ``"banana, {real_text}"``. The
+    prefix warms Kokoro's acoustic model so the first consonant of
+    ``real_text`` is fully formed. We now need to cut the prefix off the
+    front. The comma after the prefix produces a detectable prosodic gap
+    — we find the first run of at least ``HEAD_TRIM_DWELL_FRAMES`` silent
+    frames that's preceded by at least one audible frame, and cut at the
+    end of that silent run.
+
+    Fails open: if no gap is found within ``HEAD_TRIM_SEARCH_MS`` we return
+    ``samples`` unchanged. Audible "banana," in playback is the signal that
+    the detector needs tuning — better than silent garbling.
+    """
+    if samples.size == 0:
+        return samples
+
+    frame = TAIL_RMS_FRAME_SAMPLES
+    search_frames = min(
+        samples.size // frame,
+        int(round(HEAD_TRIM_SEARCH_MS * sample_rate / 1000.0)) // frame,
+    )
+    if search_frames <= HEAD_TRIM_DWELL_FRAMES:
+        return samples
+
+    window = samples[:search_frames * frame].astype(np.float64)
+    rms = np.sqrt(np.mean(window.reshape(search_frames, frame) ** 2, axis=1))
+
+    seen_audible = False
+    silent_run = 0
+    for i in range(search_frames):
+        if rms[i] > TAIL_RMS_THRESHOLD:
+            seen_audible = True
+            silent_run = 0
+        else:
+            if seen_audible:
+                silent_run += 1
+                if silent_run >= HEAD_TRIM_DWELL_FRAMES:
+                    # Gap confirmed. Cut at the end of this silent run so
+                    # playback starts cleanly at the next audible sample.
+                    cut = (i + 1) * frame
+                    return samples[cut:]
+    # No gap found in the search window — fail open.
+    return samples
+
+
 def samples_to_wav(samples: np.ndarray, sample_rate: int) -> bytes:
     pcm = np.clip(samples, -1.0, 1.0)
     pcm = (pcm * 32767.0).astype(np.int16)
@@ -441,9 +505,20 @@ class Handler(BaseHTTPRequestHandler):
         text = (payload.get("text") or "").strip()
         voice_spec = payload.get("voice") or "af_bella"
         lang = payload.get("lang") or "en-gb"
+        sacrificial_head_word = (payload.get("sacrificial_head_word") or "").strip()
 
         if not text:
             self._json(400, {"error": "text required"})
+            return
+        # Keep the sacrificial word small and alphabetic — it runs through
+        # Kokoro as-is, and anything exotic (punctuation, digits, multi-word
+        # phrases) defeats the "one extra token of acoustic warm-up" trick.
+        if sacrificial_head_word and (
+            len(sacrificial_head_word) > 32
+            or not sacrificial_head_word.replace("-", "").isalpha()
+        ):
+            self._json(400, {"error": "sacrificial_head_word must be a single "
+                                      "alphabetic word ≤32 chars"})
             return
         if len(text) > MAX_TEXT_CHARS:
             self._json(400, {"error": f"text: {len(text)} chars exceeds "
@@ -493,13 +568,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": str(e)})
             return
 
+        # Prepend a throwaway word so Kokoro's first-token warm-up is spent
+        # on the prefix instead of on the real first consonant. We trim the
+        # prefix audio off after synthesis. The comma gives us a detectable
+        # prosodic pause to cut at.
+        synth_text = (
+            f"{sacrificial_head_word}, {text}" if sacrificial_head_word else text
+        )
+
         t0 = time.time()
         try:
             # Phonemize once, then chunk into ≤MAX_PHONEMES_PER_CALL pieces
             # so we never trip Kokoro-82M's 510-phoneme IndexError on long
             # unpunctuated spans. Short inputs → one chunk → single create()
             # call, identical to the old path.
-            phonemes = KOKORO.tokenizer.phonemize(text, lang)
+            phonemes = KOKORO.tokenizer.phonemize(synth_text, lang)
             chunks = chunk_phonemes(phonemes)
             parts = []
             for chunk in chunks:
@@ -514,6 +597,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         t1 = time.time()
         samples = peaking_eq(samples, sr, eq_freq, eq_gain_db, eq_q)
+        head_trimmed_samples = 0
+        if sacrificial_head_word:
+            before = samples.size
+            samples = trim_sacrificial_head(samples, sr)
+            head_trimmed_samples = before - samples.size
         # Trim before pad so the pad length is exactly what the client asked
         # for regardless of how much native tail Kokoro baked in.
         if tail_trim_ms > 0:
@@ -530,11 +618,14 @@ class Handler(BaseHTTPRequestHandler):
         t2 = time.time()
         wav = samples_to_wav(samples, sr)
         t3 = time.time()
+        head_trim_ms = (head_trimmed_samples * 1000.0 / sr) if sr else 0.0
         sys.stderr.write(
             f"[kokoro] synth chars={len(text)} phonemes={len(phonemes)} "
             f"chunks={len(chunks)} voice={voice_spec} speed={speed} "
             f"eq={eq_gain_db}dB@{eq_freq}Hz pad={pad_start_ms}ms "
             f"trim={tail_trim_ms}ms "
+            f"head_word={sacrificial_head_word or '-'} "
+            f"head_trim={head_trim_ms:.0f}ms "
             f"synth={t1-t0:.2f}s eq_time={t2-t1:.3f}s "
             f"encode={t3-t2:.2f}s bytes={len(wav)}\n"
         )
