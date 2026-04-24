@@ -286,14 +286,16 @@ if [ "${KOKORO_NO_PLAY:-0}" != "1" ]; then
   printf 'RATE %s\n' "$PLAYBACK_RATE" >&9
 
   # Control FIFO: Hammerspoon's RSVP integration writes PAUSE/RESUME/SEEK
-  # commands here and the subshell forwards them to fd 9. We open our own
-  # write end (fd 11 in the subshell) BEFORE the read loop so the reader
-  # never sees EOF between HS's repeated short-lived writer opens.
+  # commands here and the subshell forwards them to fd 9. The subshell opens
+  # the FIFO O_RDWR on fd 10 (bash `<>` redirect) so that (a) it doesn't
+  # block waiting for an external writer and (b) `read <&10` never sees EOF
+  # between HS's brief open/write/close cycles. The previous split-fd
+  # approach (exec 11>FIFO; exec 10<FIFO) deadlocked at line 1: O_WRONLY on
+  # a FIFO blocks until an O_RDONLY exists, which was the very next line.
   CONTROL_FIFO=$(mktemp -u "$STATE_DIR/control.XXXXXX")
   mkfifo "$CONTROL_FIFO"
   (
-    exec 11>"$CONTROL_FIFO"
-    exec 10<"$CONTROL_FIFO"
+    exec 10<>"$CONTROL_FIFO"
     while IFS= read -r line <&10; do
       # Only forward the three commands we've agreed on — anything else
       # would let a compromised HS script drive arbitrary play-stream
