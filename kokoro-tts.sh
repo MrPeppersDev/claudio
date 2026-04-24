@@ -468,6 +468,20 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
   [ "$seg_has_audio" -eq 1 ] && first_seg=0
 done
 
+# Kill the control-fifo forwarder first. It inherited a dup of fd 9 when
+# backgrounded, so play-stream.py won't see EOF on stdin until this subshell
+# also exits — even after we close our own fd 9 below. Without this kill,
+# `wait "$STREAM_PID"` blocks forever, the script never returns to its
+# caller, and Hammerspoon's task-exit callback never fires (so the RSVP
+# balloon never gets its linger-fade signal).
+if [ -n "$CONTROL_READER_PID" ]; then
+  kill "$CONTROL_READER_PID" 2>/dev/null || true
+  wait "$CONTROL_READER_PID" 2>/dev/null || true
+  CONTROL_READER_PID=""
+fi
+[ -n "$CONTROL_FIFO" ] && rm -f "$CONTROL_FIFO"
+CONTROL_FIFO=""
+
 # Close fd 9 so play-stream.py sees EOF, drains, and exits cleanly.
 if [ "$STREAM_FD_OPEN" -eq 1 ]; then
   exec 9>&-
