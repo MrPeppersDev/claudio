@@ -772,6 +772,8 @@ function M.start()
   if menubar then return end
   hs.fs.mkdir(STATE_DIR)
   menubar = hs.menubar.new()
+  -- Expose for rsvp.lua to find the icon's screen position.
+  M._menubar = menubar
   menubar:setTitle("▸")
   -- Dropdown menu. Using a function makes the menu content dynamic each open.
   menubar:setMenu(buildMenu)
@@ -800,7 +802,7 @@ function M.start()
 end
 
 function M.stop()
-  if menubar then menubar:delete(); menubar = nil end
+  if menubar then menubar:delete(); menubar = nil; M._menubar = nil end
   if watcher then watcher:stop(); watcher = nil end
   if audioWatcher then
     hs.audiodevice.watcher.stop()
