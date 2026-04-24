@@ -35,8 +35,9 @@
 #                      whole segment is synthesized as one Kokoro call instead
 #                      of per-sentence. Bigger single synth = smoother prosody
 #                      across sentence boundaries (Kokoro picks its own breath
-#                      pattern), at the cost of losing sentence-level cache
-#                      granularity for short messages (default: 400; 0 disables).
+#                      pattern) AND fewer sacrificial-word prepends per
+#                      utterance, at the cost of losing sentence-level cache
+#                      granularity for short messages (default: 700; 0 disables).
 #   KOKORO_TAIL_TRIM_MS trailing silence kept after the last audible frame.
 #                      Uses windowed-RMS energy detection with a 60ms dwell
 #                      so unvoiced closing consonants (t/p/k) survive intact
@@ -87,7 +88,7 @@ EQ_FREQ="${KOKORO_EQ_FREQ:-2500}"
 EQ_Q="${KOKORO_EQ_Q:-1.0}"
 PAD_START_MS="${KOKORO_PAD_START_MS:-150}"
 TAIL_TRIM_MS="${KOKORO_TAIL_TRIM_MS:-40}"
-COALESCE_MAX_CHARS="${KOKORO_COALESCE_MAX_CHARS:-400}"
+COALESCE_MAX_CHARS="${KOKORO_COALESCE_MAX_CHARS:-700}"
 SACRIFICIAL_WORD="${KOKORO_SACRIFICIAL_WORD-banana}"
 mkdir -p "$CACHE_DIR"
 
@@ -105,7 +106,10 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
 #   2 — RSVP timing sidecar: patched ONNX model + .words.json written beside
 #       every cached WAV. Bumping here forces re-synth so all cache entries
 #       gain sidecars.
-SYNTH_VERSION=2
+#   3 — Sacrificial-head trim rework: relative RMS threshold + 20ms dwell
+#       + min/max cut-position guardrails. Old WAVs may have "banana,"
+#       leakage baked in from the prior detector — bump to force re-synth.
+SYNTH_VERSION=3
 sentence_hash() {
   local text="$1"
   local pad="$2"
