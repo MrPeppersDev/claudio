@@ -303,7 +303,12 @@ local function captureSelection(cb)
 
   local prevCount = hs.pasteboard.changeCount()
   local prevContents = hs.pasteboard.getContents()
-  hs.eventtap.keyStroke({ "cmd" }, "c", 0)
+  -- 10 ms delay between keydown and keyup. Zero works in most apps but
+  -- browsers (Chromium/WebKit) sometimes miss Cmd+C because the modifier
+  -- up-event races the character through a different handler path, so
+  -- the renderer never sees "cmd still down when c arrived." 10 ms is
+  -- imperceptible on F13 press but reliable across Chrome/Safari/Firefox.
+  hs.eventtap.keyStroke({ "cmd" }, "c", 10000)
 
   -- Poll the pasteboard for the copy to land. Cmd+C dispatch is async and
   -- per-app latency varies: AX-capable text fields respond in ~20-50 ms,
@@ -788,7 +793,7 @@ function M.start()
   -- new one probably isn't welcome to hear a chunk of text suddenly read
   -- aloud. Only fires when a job is actually running, so this never
   -- interferes with casual device switching while idle.
-  audioWatcher = hs.audiodevice.watcher.setWatcherCallback(function(event)
+  audioWatcher = hs.audiodevice.watcher.setCallback(function(event)
     if event == "dOut" and jobIsRunning() then
       runPlayScript({ PLAY_SCRIPT })
       hs.alert.show("Claudio paused — output device changed")
