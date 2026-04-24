@@ -561,16 +561,33 @@ def synth_with_durations(
         outputs = KOKORO.sess.run(None, inputs)
         # Output order (patched model): [audio, Cast_output_0, Gather_output_0, CumSum_output_0]
         audio = outputs[0]
+        if audio.ndim > 1:
+            audio = audio.squeeze()
         # Find Gather by position in the session output list.
         gather_idx = _sess_output_names.index("/encoder/Gather_output_0")
         gather = np.asarray(outputs[gather_idx], dtype=np.int64).ravel()
-        # The Gather output covers the padded token sequence (with leading/
-        # trailing pad-0 tokens).  Strip those two boundary entries so the
-        # length matches the phoneme token count.
+        # The Gather output covers the padded token sequence: [pad-0,
+        # phon1..phonN, pad-0]. Those boundary pad-0 tokens produce real
+        # audio samples (the model emits silence for them). Strip them from
+        # gather AND cut the corresponding samples off the audio — this
+        # mirrors what kokoro_onnx's KOKORO.create() does via librosa.trim()
+        # on the non-durations path, and it's exact (the model's own
+        # duration predictor says how many frames each boundary consumes).
+        # Without this, trim_sacrificial_head sees ~100-200ms of extra head
+        # silence and the banana+comma gap pushes past its max-cut guardrail
+        # — detector fails open and "banana," plays audibly.
         if len(gather) == len(tokens) + 2:
+            head_samples = int(gather[0]) * 600
+            tail_samples = int(gather[-1]) * 600
+            n = audio.shape[0]
+            head_samples = min(head_samples, n)
+            tail_samples = min(tail_samples, n - head_samples)
+            audio = audio[head_samples : n - tail_samples]
             gather = gather[1:-1]
     else:
         audio = KOKORO.sess.run(None, inputs)[0]
+        if audio.ndim > 1:
+            audio = audio.squeeze()
         gather = None
 
     return audio, SAMPLE_RATE, gather

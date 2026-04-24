@@ -124,7 +124,15 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
 #   3 — Sacrificial-head trim rework: relative RMS threshold + 20ms dwell
 #       + min/max cut-position guardrails. Old WAVs may have "banana,"
 #       leakage baked in from the prior detector — bump to force re-synth.
-SYNTH_VERSION=3
+#   4 — Strip pad-0 boundary silence in synth_with_durations. The patched-
+#       model path bypassed kokoro_onnx's built-in librosa-trim step,
+#       leaving ~100-200ms of leading silence. That silence pushed the
+#       banana+comma gap past trim_sacrificial_head's max-cut guardrail →
+#       "banana," leaked audibly on every synth. Now cut the boundary
+#       pad-0 audio using the duration predictor's own frame counts (exact,
+#       frame-aligned). v3 WAVs have silence+banana baked in — bump to
+#       re-synth and re-sidecar.
+SYNTH_VERSION=4
 sentence_hash() {
   local text="$1"
   local pad="$2"
