@@ -81,7 +81,7 @@ local ANCHOR_GAP = 12
 local SCREEN_PAD = 12
 
 -- How long (seconds) to linger after the last word before fade-out.
-local LINGER_SECS = 5.0
+local LINGER_SECS = 2.0
 
 -- Keyboard scrub increment (milliseconds per ← / → keypress).
 local SEEK_DELTA_MS = 2000
