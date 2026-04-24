@@ -73,6 +73,13 @@ local ANIMATE_OUT_MS  = 300    -- fade-out duration (CSS handles this)
 -- Gap between the bottom of the menubar icon and the top of the balloon (px).
 local ICON_GAP = 4
 
+-- Gap between the anchor (selected text rect) and the balloon edge when
+-- positioning in "above the selection" / "below the selection" mode.
+local ANCHOR_GAP = 12
+
+-- Screen-edge safety margin when clamping balloon position.
+local SCREEN_PAD = 12
+
 -- How long (seconds) to linger after the last word before fade-out.
 local LINGER_SECS = 2.0
 
@@ -187,6 +194,50 @@ local function balloonStartRect(iconFrame, targetRect)
     w = BALLOON_WIDTH,
     h = 2,
   }
+end
+
+-- Pick the screen that best contains a given rect's center point. Falls back
+-- to mainScreen() if hs.screen.find isn't available or nothing matches.
+local function screenForRect(r)
+  local cx = r.x + r.w / 2
+  local cy = r.y + r.h / 2
+  local ok, found = pcall(hs.screen.find, hs.geometry.point(cx, cy))
+  if ok and found then return found end
+  for _, s in ipairs(hs.screen.allScreens()) do
+    local sf = s:fullFrame()
+    if cx >= sf.x and cx <= sf.x + sf.w
+       and cy >= sf.y and cy <= sf.y + sf.h then
+      return s
+    end
+  end
+  return hs.screen.mainScreen()
+end
+
+-- Compute the target balloon rect anchored relative to a screen-space
+-- selection bounding rect. Prefers "above the anchor" so the balloon
+-- doesn't cover the text the user is still reading; falls through to
+-- "below" if above would clip off the top of the screen.
+local function balloonTargetRectForAnchor(anchorRect)
+  local screen = screenForRect(anchorRect)
+  local sf = screen:frame()   -- usable area (excludes menu bar + Dock)
+
+  local bx = anchorRect.x + anchorRect.w / 2 - BALLOON_WIDTH / 2
+  local by_above = anchorRect.y - BALLOON_HEIGHT - ANCHOR_GAP
+  local by_below = anchorRect.y + anchorRect.h + ANCHOR_GAP
+
+  local by
+  if by_above >= sf.y + SCREEN_PAD then
+    by = by_above
+  else
+    by = by_below
+  end
+
+  bx = math.max(sf.x + SCREEN_PAD,
+                math.min(bx, sf.x + sf.w - BALLOON_WIDTH - SCREEN_PAD))
+  by = math.max(sf.y + SCREEN_PAD,
+                math.min(by, sf.y + sf.h - BALLOON_HEIGHT - SCREEN_PAD))
+
+  return { x = bx, y = by, w = BALLOON_WIDTH, h = BALLOON_HEIGHT }
 end
 
 -- Call a JS function on the webview (fire-and-forget; errors logged to console).
@@ -319,11 +370,16 @@ end
 
 -- ── Public API ────────────────────────────────────────────────────────────────
 
---- show(sidecar_path)
+--- show(sidecar_path, opts)
 --- Load sidecar JSON, create the webview, animate it open.
 --- sidecar_path may be nil (start empty; PR 4 will call feedSidecar before
 --- the first POS events arrive).
-function M.show(sidecar_path)
+--- opts is an optional table:
+---   opts.anchor = { x, y, w, h }   -- screen-space rect around the user's
+---     focused text (selection bounds or mouse cursor). When present, the
+---     balloon positions itself just above (or below, if above clips) that
+---     rect instead of under the menubar icon.
+function M.show(sidecar_path, opts)
   -- If already visible, just reload with new sidecar.
   if _webview then
     M.hide()
@@ -349,10 +405,20 @@ function M.show(sidecar_path)
     end
   end
 
-  -- Determine icon position.
-  local iconFrame  = menubarFrame()
-  local targetRect = balloonTargetRect(iconFrame)
-  local startRect  = balloonStartRect(iconFrame, targetRect)
+  -- Decide where to place the balloon. Anchor mode (selection/mouse rect)
+  -- pops in at final size with a fade; menubar mode grows from the icon.
+  local anchor     = opts and opts.anchor
+  local targetRect
+  local startRect
+  local anchorMode = anchor ~= nil
+  if anchorMode then
+    targetRect = balloonTargetRectForAnchor(anchor)
+    startRect  = targetRect   -- pop-in; CSS handles the fade
+  else
+    local iconFrame = menubarFrame()
+    targetRect = balloonTargetRect(iconFrame)
+    startRect  = balloonStartRect(iconFrame, targetRect)
+  end
 
   -- Create webview starting at collapsed height.
   local wm = hs.webview.windowMasks
@@ -392,9 +458,20 @@ function M.show(sidecar_path)
       end
     end
 
-    -- Animate open: grow from startRect to targetRect over ANIMATE_IN_MS.
-    -- hs.webview:setFrameWithAnimation is not available in all builds;
-    -- use hs.animate via hs.timer steps for compatibility.
+    if anchorMode then
+      -- Anchor mode: balloon is already at final rect. Just fade in the
+      -- content (CSS transition handles it) and arm the hotkeys. No grow
+      -- animation — a pop-in at cursor/selection position reads as more
+      -- deliberate than a bubble unfurling from somewhere else.
+      _webview:frame(targetRect)
+      jsCall("window.rsvpFadeIn")
+      registerHotkeys()
+      return
+    end
+
+    -- Menubar mode: grow from iconFrame collapsed rect to targetRect over
+    -- ANIMATE_IN_MS. hs.webview:setFrameWithAnimation is not available in
+    -- all builds; use hs.timer steps for compatibility.
     local steps     = 10
     local stepSecs  = (ANIMATE_IN_MS / 1000) / steps
     local step      = 0

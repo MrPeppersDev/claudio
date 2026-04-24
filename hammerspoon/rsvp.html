@@ -9,13 +9,17 @@
     window.rsvpResume()                    -- remove pause indicator
     window.rsvpFadeOut()                   -- fade to 0 opacity (~300ms)
 
-  ORP (Optimal Recognition Point) heuristic (Spritz-style):
+  Layout model (what changed from earlier versions):
+    The word is rendered as a single text-aligned line — the ORP pivot
+    character is colored red for fixation, but the whole word is visually
+    centered. The prior fixed-pivot-column approach was technically correct
+    Spritz-style RSVP but made long words feel visually off-balance in a
+    wide bubble. Horizontal balance reads as more polished, and the color
+    cue still signals the fixation point without geometric anchoring.
+
+  ORP (Optimal Recognition Point) heuristic:
     Strip trailing punctuation for length calculation.
     pivot_index = min(max(1, ceil((L-1)/4)), L-1)   (1-based)
-    The pivot character is rendered in red; the full word including
-    punctuation is displayed. The ORP pivot is anchored at the horizontal
-    center of the balloon so the eye doesn't have to hunt for it between
-    words of different lengths.
 -->
 <html>
 <head>
@@ -35,133 +39,124 @@
   }
 
   body {
-    display: flex;
-    align-items: center;
-    justify-content: center;
     /*
-      Font stack for high-speed reading:
-      SF Pro Text is Apple's default reading-optimized font — open counters,
-      clear i/l/1 distinctions, excellent rendering at mid-sizes. Fallbacks
-      cover older macOS, custom-font-blocked renderers, and edge cases.
+      Font stack optimized for fast reading:
+      SF Pro Text is Apple's reading-optimized companion to SF Pro Display —
+      open counters, unambiguous i/l/1, tuned for mid-size rendering.
+      Fallbacks cover older macOS and custom-font-blocked renderers.
     */
     font-family: "SF Pro Text", -apple-system, BlinkMacSystemFont,
-                 "Helvetica Neue", Helvetica, Arial, sans-serif;
-    font-feature-settings: "ss01", "cv11";   /* flat 6/9 and straight ℓ in SF */
+                 "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-feature-settings: "ss01", "cv11", "tnum";
     -webkit-font-smoothing: antialiased;
-    transition: opacity 0.3s ease-out;
+    -moz-osx-font-smoothing: grayscale;
+    transition: opacity 220ms cubic-bezier(0.4, 0, 0.2, 1);
   }
 
   /*
-    Balloon: warm off-white like a book page, soft drop shadow so it
-    floats above the desktop without needing a hard border. Rounded enough
-    to feel like a speech bubble, not a window.
+    Balloon: warm book-page cream with a refined, layered shadow.
+    The double-shadow creates soft ambient depth without a heavy drop
+    shadow. 1px inner stroke gives the edge definition that enterprise
+    surfaces (Linear, Notion, Vercel) use to avoid looking flat.
   */
   #balloon {
-    position: relative;
-    width: 100%;
-    height: 100%;
-    background: #F5EEDB;           /* book-page cream */
-    border-radius: 18px;
+    position: absolute;
+    inset: 8px;                         /* outer margin for shadow spread */
+    background: #F6EFDC;                /* book-page cream */
+    border-radius: 14px;
+    box-shadow:
+      0 1px 2px   rgba(28, 22, 10, 0.06),
+      0 8px 20px  rgba(28, 22, 10, 0.14),
+      0 24px 48px rgba(28, 22, 10, 0.08),
+      inset 0 0 0 1px rgba(60, 42, 18, 0.08);
+    display: grid;
+    grid-template-rows: 1fr auto;       /* word area + status strip */
+  }
+
+  /*
+    Word area: full-bleed single row, contents centered.
+    The word is ONE horizontally-centered block. Pivot coloring is done
+    inline via nested spans, not flex columns — so a long word and a
+    short word both sit at the optical center of the bubble.
+  */
+  #word-area {
     display: flex;
-    flex-direction: column;
     align-items: center;
     justify-content: center;
-    box-shadow:
-      0 12px 32px rgba(30, 20, 10, 0.18),
-      0 2px 6px  rgba(30, 20, 10, 0.10),
-      inset 0 0 0 1px rgba(120, 90, 40, 0.08);
-    gap: 6px;
-  }
-
-  /*
-    Word display — three-column flex row with the pivot at dead center.
-    word-left and word-right are equal-weight flex children so the pivot
-    column is always horizontally centered no matter the word length.
-  */
-  #word-row {
-    display: flex;
-    flex-direction: row;
-    align-items: baseline;
-    width: 92%;
-    max-width: 460px;
-  }
-
-  #word-left {
-    flex: 1 1 0;              /* grow/shrink equally with word-right */
-    text-align: right;
-    font-size: 56px;
-    font-weight: 500;
-    color: #1A1A1A;           /* near-black */
-    letter-spacing: -0.3px;
-    line-height: 1.1;
-    white-space: nowrap;
+    padding: 0 32px;
+    min-width: 0;
     overflow: hidden;
   }
 
-  #word-pivot {
-    flex: 0 0 auto;           /* size to content; the pivot is one glyph */
-    min-width: 0.6em;         /* keep a visual anchor for narrow glyphs (i, l) */
+  #word {
+    font-size: 60px;
+    font-weight: 500;
+    line-height: 1.0;
+    letter-spacing: -0.015em;
+    color: #1A1613;                     /* warm near-black */
+    white-space: nowrap;
     text-align: center;
-    font-size: 56px;
-    font-weight: 600;
-    color: #C0392B;           /* rich book-red */
-    letter-spacing: -0.3px;
-    line-height: 1.1;
-    white-space: nowrap;
   }
 
-  #word-right {
-    flex: 1 1 0;              /* mirrors word-left */
-    text-align: left;
-    font-size: 56px;
-    font-weight: 500;
-    color: #1A1A1A;
-    letter-spacing: -0.3px;
-    line-height: 1.1;
-    white-space: nowrap;
-    overflow: hidden;
+  #word .pivot {
+    color: #B23A2B;                     /* book-red, dialed down from pure red */
+    font-weight: 600;
   }
 
   /*
-    Vertical ORP guide — faint red line down the pivot column. Helps the
-    eye lock onto the fixation point without being visually noisy.
+    Status strip: hairline row along the bottom. Carries the progress
+    bar and an optional state label. 26px keeps it visible without
+    dominating the word area.
   */
-  #orp-guide {
-    position: absolute;
-    left: 50%;
-    transform: translateX(-50%);
-    top: 14%;
-    bottom: 14%;
-    width: 1px;
-    background: rgba(192, 57, 43, 0.18);
-    pointer-events: none;
+  #status {
+    position: relative;
+    height: 26px;
+    border-top: 1px solid rgba(60, 42, 18, 0.10);
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 
-  /* Pause overlay */
-  #pause-indicator {
-    display: none;
+  #progress-track {
     position: absolute;
-    bottom: 14px;
-    left: 50%;
-    transform: translateX(-50%);
-    font-size: 11px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 2px;
+    background: rgba(60, 42, 18, 0.06);
+  }
+
+  #progress-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg,
+      rgba(178, 58, 43, 0.55),
+      rgba(178, 58, 43, 0.85));
+    transition: width 180ms linear;
+    border-radius: 0 1px 1px 0;
+  }
+
+  #status-label {
+    font-size: 10px;
     font-weight: 600;
-    color: rgba(80, 60, 30, 0.55);
-    letter-spacing: 0.18em;
+    letter-spacing: 0.14em;
     text-transform: uppercase;
+    color: rgba(60, 42, 18, 0.45);
+    font-feature-settings: "tnum";
+    user-select: none;
+    visibility: hidden;                 /* shown only when paused */
   }
 
-  /* Dim the word slightly when paused */
-  body.paused #word-left,
-  body.paused #word-right,
-  body.paused #word-pivot {
+  /* Paused state */
+  body.paused #word {
     opacity: 0.38;
+    transition: opacity 160ms ease-out;
   }
-  body.paused #pause-indicator {
-    display: block;
+  body.paused #status-label {
+    visibility: visible;
   }
 
-  /* Initial invisible state — Lua calls rsvpFadeIn after the open animation */
+  /* Initial invisible state — Lua calls rsvpFadeIn once the frame is placed */
   body {
     opacity: 0;
   }
@@ -169,13 +164,13 @@
 </head>
 <body>
 <div id="balloon">
-  <div id="orp-guide"></div>
-  <div id="word-row">
-    <span id="word-left"></span>
-    <span id="word-pivot"></span>
-    <span id="word-right"></span>
+  <div id="word-area">
+    <div id="word"></div>
   </div>
-  <div id="pause-indicator">paused</div>
+  <div id="status">
+    <span id="status-label">paused</span>
+    <div id="progress-track"><div id="progress-fill"></div></div>
+  </div>
 </div>
 
 <script>
@@ -183,68 +178,72 @@
 
 // ── State ────────────────────────────────────────────────────────────────────
 
-var _sidecar = null;          // parsed sidecar JSON (words array)
-var _currentWordIdx = -1;     // index into _sidecar.words of the current word
+var _sidecar = null;
+var _currentWordIdx = -1;
 var _paused = false;
 
-// Buffer-id → sidecar map (for multi-buffer sessions fed by PR 4)
 var _bufferSidecars = {};
 var _currentBufferId = null;
 
 // ── ORP helpers ──────────────────────────────────────────────────────────────
 
-/**
- * Strip trailing punctuation characters from a string for length calculation.
- * The characters we strip: . , ! ? : ; " ' ) ] }
- */
 function stripTrailingPunct(s) {
   return s.replace(/[.,!?:;"'\)\]}’”]+$/, "");
 }
 
-/**
- * Compute the 0-based ORP pivot index for a word string.
- * Uses the stripped form for length, but the pivot maps into the *full* string.
- *
- * Heuristic: pivot_index (1-based) = min(max(1, ceil((L-1)/4)), L-1)
- *            where L = stripped word length
- * Returns 0-based index into the full word string.
- */
 function orpIndex(word) {
   var stripped = stripTrailingPunct(word);
   var L = stripped.length;
-  if (L === 0) return 0;
-  if (L === 1) return 0;
+  if (L <= 1) return 0;
   var idx1 = Math.min(Math.max(1, Math.ceil((L - 1) / 4)), L - 1);
   return idx1 - 1;
 }
 
-// ── Word rendering ───────────────────────────────────────────────────────────
+// ── Rendering ────────────────────────────────────────────────────────────────
 
 function renderWord(word) {
+  var el = document.getElementById("word");
   if (!word || word === "") {
-    document.getElementById("word-left").textContent  = "";
-    document.getElementById("word-pivot").textContent = "";
-    document.getElementById("word-right").textContent = "";
+    el.textContent = "";
     return;
   }
-
   var pivot = orpIndex(word);
-
   var before = word.substring(0, pivot);
   var pivotChar = word.substring(pivot, pivot + 1);
   var after = word.substring(pivot + 1);
 
-  document.getElementById("word-left").textContent  = before;
-  document.getElementById("word-pivot").textContent = pivotChar;
-  document.getElementById("word-right").textContent = after;
+  // Build DOM via textContent on spans (not innerHTML) — text may contain
+  // characters that would be interpreted as markup, and we never want
+  // sidecar-fed content to reach the HTML parser.
+  el.textContent = "";
+  if (before) {
+    var b = document.createElement("span");
+    b.textContent = before;
+    el.appendChild(b);
+  }
+  if (pivotChar) {
+    var p = document.createElement("span");
+    p.className = "pivot";
+    p.textContent = pivotChar;
+    el.appendChild(p);
+  }
+  if (after) {
+    var a = document.createElement("span");
+    a.textContent = after;
+    el.appendChild(a);
+  }
+}
+
+function updateProgress(ms, words) {
+  if (!words || words.length === 0) return;
+  var lastEnd = words[words.length - 1].end_ms;
+  if (!lastEnd || lastEnd <= 0) return;
+  var pct = Math.max(0, Math.min(100, (ms / lastEnd) * 100));
+  document.getElementById("progress-fill").style.width = pct + "%";
 }
 
 // ── Sidecar binary search ────────────────────────────────────────────────────
 
-/**
- * Find the index of the word whose [start_ms, end_ms) range contains `ms`.
- * Returns -1 if no word covers `ms`.
- */
 function wordIndexAt(words, ms) {
   if (!words || words.length === 0) return -1;
   var lo = 0, hi = words.length - 1;
@@ -271,6 +270,7 @@ window.rsvpLoad = function(jsonString) {
     _currentWordIdx = -1;
     _currentBufferId = null;
     renderWord("");
+    document.getElementById("progress-fill").style.width = "0%";
   } catch(e) {
     console.error("rsvpLoad: parse error", e);
   }
@@ -297,6 +297,8 @@ window.rsvpShowAt = function(ms, bufferId) {
     return;
   }
 
+  updateProgress(ms, words);
+
   var idx = wordIndexAt(words, ms);
   if (idx === _currentWordIdx) return;
   _currentWordIdx = idx;
@@ -317,18 +319,17 @@ window.rsvpResume = function() {
 };
 
 window.rsvpFadeOut = function() {
-  document.body.style.transition = "opacity 0.3s ease-out";
+  document.body.style.transition = "opacity 300ms cubic-bezier(0.4, 0, 0.2, 1)";
   document.body.style.opacity = "0";
 };
 
 window.rsvpFadeIn = function() {
-  document.body.style.transition = "opacity 0.2s ease-out";
+  document.body.style.transition = "opacity 180ms cubic-bezier(0.4, 0, 0.2, 1)";
   document.body.style.opacity = "1";
 };
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 
-// Start with an em dash placeholder so the fixed-width layout is visible
 renderWord("—");
 </script>
 </body>

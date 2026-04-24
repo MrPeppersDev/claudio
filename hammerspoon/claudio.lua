@@ -398,6 +398,43 @@ local function axSelection()
   return nil
 end
 
+-- Compute a screen-space anchor rect for "where the user's attention is."
+-- Preference order:
+--   1. AX bounds for the focused element's selected text range — precise rect
+--      around the actual highlighted glyphs. Works in TextEdit, Safari, Notes,
+--      VS Code, most native apps. Falls through silently when the focused
+--      element doesn't implement AXBoundsForRange (some Electron, Chromium
+--      renderers).
+--   2. Mouse cursor position — users who drag to highlight end with the mouse
+--      hovering at the end of the selection, so this is a good proxy.
+--   3. nil — rsvp.lua falls back to menubar-anchored positioning.
+-- Returns a rect { x, y, w, h } in global screen coordinates, or nil.
+local function selectionAnchorRect()
+  local okCall, sys = pcall(hs.axuielement.systemWideElement)
+  if okCall and sys then
+    local focused = sys:attributeValue("AXFocusedUIElement")
+    if focused then
+      local range = focused:attributeValue("AXSelectedTextRange")
+      if range then
+        local ok_bounds, bounds = pcall(function()
+          return focused:parameterizedAttributeValue("AXBoundsForRange", range)
+        end)
+        if ok_bounds and type(bounds) == "table"
+           and bounds.x and bounds.y and bounds.w and bounds.h
+           and bounds.w > 0 and bounds.h > 0 then
+          return { x = bounds.x, y = bounds.y, w = bounds.w, h = bounds.h }
+        end
+      end
+    end
+  end
+  local ok_mouse, p = pcall(hs.mouse.absolutePosition)
+  if ok_mouse and p and p.x and p.y then
+    -- Treat as a tiny rect so rsvp.lua's above/below fallback logic still works.
+    return { x = p.x - 8, y = p.y - 12, w = 16, h = 24 }
+  end
+  return nil
+end
+
 local function captureSelection(cb)
   local frontApp = hs.application.frontmostApplication()
   local frontName = frontApp and frontApp:name() or "?"
@@ -533,6 +570,11 @@ function M.toggle()
     return
   end
 
+  -- Snapshot the anchor rect *before* captureSelection goes async. The AX
+  -- and mouse state is most reliable in the instant the user presses F13;
+  -- after the Cmd+C fallback path runs, focus and selection can shift.
+  local anchor = selectionAnchorRect()
+
   captureSelection(function(selection, hint)
     if selection then
       local tmp = selectionToTempfile(selection)
@@ -540,7 +582,7 @@ function M.toggle()
         -- Show the balloon empty; the first SIDECAR event will populate it.
         -- Delaying this until after the first SIDECAR would leave F13 with
         -- no visible response for ~500ms-2s of synth time.
-        rsvp.show(nil)
+        rsvp.show(nil, { anchor = anchor })
         runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
       end
     elseif hint and hint.pdfPath then
@@ -564,7 +606,7 @@ function M.toggle()
             if f then
               f:write(stdout)
               f:close()
-              rsvp.show(nil)
+              rsvp.show(nil, { anchor = anchor })
               runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
             else
               os.remove(tmp)
