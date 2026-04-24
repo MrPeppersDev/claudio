@@ -107,7 +107,11 @@ cmd_start() {
   fi
 
   log "start: launching server"
-  nohup "$PYTHON" "$SERVER_PY" >> "$LOG_FILE" 2>&1 &
+  # PYTHONPATH=repo root so server.py can `from kokoro.timing import ...`.
+  # Without this, running `python kokoro/server.py` only puts kokoro/ on
+  # sys.path, and the timing-sidecar import fails at request time.
+  PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    nohup "$PYTHON" "$SERVER_PY" >> "$LOG_FILE" 2>&1 &
   local pid=$!
   echo "$pid" > "$PID_FILE"
 
