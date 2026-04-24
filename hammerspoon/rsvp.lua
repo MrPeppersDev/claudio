@@ -82,7 +82,7 @@ local SEEK_DELTA_MS = 2000
 -- ── State ─────────────────────────────────────────────────────────────────────
 
 local _webview      = nil    -- hs.webview instance (nil when hidden)
-local _hotkeys      = {}     -- list of hs.hotkey bindings active while balloon is visible
+local _keyTap       = nil    -- hs.eventtap for Space/Esc/←/→ scoped to webview focus
 local _lingerTimer  = nil    -- hs.timer: fires after LINGER_SECS to begin fade-out
 local _animTimer    = nil    -- hs.timer: used during animate-in
 local _htmlPath     = nil    -- absolute path to rsvp.html
@@ -229,17 +229,17 @@ local function cancelLinger()
   end
 end
 
--- Destroy the webview and clean up all hotkeys/timers.
+-- Destroy the webview and clean up the eventtap/timers.
 local function destroyWebview()
   cancelLinger()
   if _animTimer then
     _animTimer:stop()
     _animTimer = nil
   end
-  for _, hk in ipairs(_hotkeys) do
-    hk:delete()
+  if _keyTap then
+    _keyTap:stop()
+    _keyTap = nil
   end
-  _hotkeys = {}
   if _webview then
     _webview:delete()
     _webview = nil
@@ -262,34 +262,48 @@ local function beginFadeOut()
   end)
 end
 
--- Register hotkeys that are only active while the balloon is visible.
+-- True when our webview is the currently-focused window. Used to gate the
+-- keyDown eventtap so Space/Esc/←/→ only act on the balloon when the user
+-- has clicked it; otherwise keys pass through unchanged to whatever app
+-- they were typing in.
+local function isWebviewFocused()
+  if not _webview then return false end
+  local ok, win = pcall(function() return _webview:hswindow() end)
+  if not ok or not win then return false end
+  local focused = hs.window.focusedWindow()
+  return focused ~= nil and focused:id() == win:id()
+end
+
+-- Install a keyDown eventtap that only swallows Space/Esc/←/→ when the
+-- webview is focused. Previous implementation used hs.hotkey.new({}, ...)
+-- which unconditionally stole those keys whenever the balloon was visible —
+-- meaning user couldn't type a space in any app until the balloon went
+-- away. hs.eventtap lets us return false to pass the key through.
 local function registerHotkeys()
-  -- Esc → pause
-  table.insert(_hotkeys, hs.hotkey.new({}, "escape", function()
-    M.pause()
-  end))
-
-  -- Space → resume
-  table.insert(_hotkeys, hs.hotkey.new({}, "space", function()
-    M.resume()
-  end))
-
-  -- ← → scrub
-  table.insert(_hotkeys, hs.hotkey.new({}, "left", function()
-    if M.on_seek_request then
-      M.on_seek_request(-SEEK_DELTA_MS)
+  if _keyTap then _keyTap:stop() end
+  local km = hs.keycodes.map
+  _keyTap = hs.eventtap.new({ hs.eventtap.event.types.keyDown }, function(event)
+    if not isWebviewFocused() then return false end
+    local kc = event:getKeyCode()
+    if kc == km.space then
+      if _isPaused then M.resume() else M.pause() end
+      return true
     end
-  end))
-
-  table.insert(_hotkeys, hs.hotkey.new({}, "right", function()
-    if M.on_seek_request then
-      M.on_seek_request(SEEK_DELTA_MS)
+    if kc == km.escape then
+      M.pause()
+      return true
     end
-  end))
-
-  for _, hk in ipairs(_hotkeys) do
-    hk:enable()
-  end
+    if kc == km.left then
+      if M.on_seek_request then M.on_seek_request(-SEEK_DELTA_MS) end
+      return true
+    end
+    if kc == km.right then
+      if M.on_seek_request then M.on_seek_request(SEEK_DELTA_MS) end
+      return true
+    end
+    return false
+  end)
+  _keyTap:start()
 end
 
 -- ── Linger + last-word detection ─────────────────────────────────────────────
@@ -353,31 +367,15 @@ function M.show(sidecar_path)
   _webview:windowStyle(wm.borderless)
   _webview:transparent(true)
   _webview:bringToFront(true)
-  -- Block link clicks / form navigation: any navigation attempt other than
-  -- our initial file:// load returns false (blocked).
-  _webview:navigationCallback(function(action, wv, navID, url)
-    -- Allow the initial HTML load, block everything else.
-    if action == "didFinishNavigation" or action == "didStartProvisionalNavigation" then
-      return true
-    end
-    if action == "navigating" then
-      -- Our own file:// load is always permitted.
-      if url and url:sub(1, 7) == "file://" then return true end
-      return false
-    end
-    return true
-  end)
 
-  -- Load the HTML file.
-  local url = "file://" .. htmlPath()
-  _webview:url(url)
-
-  _webview:show()
-
-  -- Once the page is loaded, inject sidecar and fade in.
-  -- hs.webview doesn't expose a reliable onload callback in all versions,
-  -- so we use a short timer to let the page settle before injecting JS.
-  hs.timer.doAfter(0.15, function()
+  -- Fires once when the HTML has finished loading (triggered by the
+  -- navigationCallback didFinishNavigation event, or by the safety-net
+  -- timer if that event doesn't reach us). Idempotent via _pageReadyFired
+  -- so double-fire is a no-op.
+  local pageReadyFired = false
+  local function onPageReady()
+    if pageReadyFired then return end
+    pageReadyFired = true
     if not _webview then return end
 
     -- Feed the top-level sidecar into the page.
@@ -428,6 +426,40 @@ function M.show(sidecar_path)
     end
 
     _animTimer = hs.timer.doAfter(stepSecs, doStep)
+  end
+
+  -- Block link clicks / form navigation and watch for the page-load
+  -- completion that tells us it's safe to inject JS. Our page is a single
+  -- inline-script file:// load, so by the time didFinishNavigation fires
+  -- the window.rsvp* functions are defined.
+  _webview:navigationCallback(function(action, wv, navID, url)
+    if action == "didFinishNavigation" then
+      onPageReady()
+      return true
+    end
+    if action == "didStartProvisionalNavigation" then
+      return true
+    end
+    if action == "navigating" then
+      -- Our own file:// load is always permitted.
+      if url and url:sub(1, 7) == "file://" then return true end
+      return false
+    end
+    return true
+  end)
+
+  -- Load the HTML file.
+  local url = "file://" .. htmlPath()
+  _webview:url(url)
+
+  _webview:show()
+
+  -- Safety net: some Hammerspoon builds don't deliver didFinishNavigation
+  -- for file:// URLs. If that happens, fire the ready path ourselves after
+  -- a bounded wait. Bigger than the old 150 ms so the navigation callback
+  -- is the winning path in the common case; still imperceptible on F13.
+  hs.timer.doAfter(0.5, function()
+    if not pageReadyFired then onPageReady() end
   end)
 end
 
