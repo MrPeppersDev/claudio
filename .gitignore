@@ -23,6 +23,8 @@ kokoro/venv/
 # Downloaded model weights (fetched by kokoro/download-model.sh)
 kokoro/kokoro-v1.0.onnx
 kokoro/voices-v1.0.bin
+# Patched model produced by kokoro/patch-model.sh (derived artifact, not committed)
+kokoro/kokoro-v1.0-durations.onnx
 
 # Python
 .venv/
