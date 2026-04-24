@@ -15,11 +15,15 @@
     * Design tokens live in :root so the palette, radii, and motion
       vocabulary are one place instead of 12. Adjust there, everywhere
       inherits.
-    * Monochrome surface with ONE accent color, used as a warmth gradient
-      centered on the fixation anchor: the anchor letter is full accent,
-      its immediate neighbors are blended toward ink. Progress bar uses
-      neutral ink tone so the fixation zone stays the only place color
-      is "talking back" visually — editorial discipline, not a bug.
+    * Monochrome surface with ONE accent color on the fixation anchor
+      letter only. Progress bar uses a neutral ink tone so the anchor
+      stays the only place color is "talking back" visually. A graded
+      opacity / warmth-gradient variant was tried and removed — no
+      peer-reviewed work from 2021-2026 validates graded-emphasis
+      treatments for RSVP. Snell & Grainger 2021 showed parafoveal
+      preview is suppressed in RSVP, so edge-graded treatments have no
+      theoretical basis either. Single anchor char is the research-
+      safe default.
     * Motion uses a single easing and two durations (fast / slow).
     * prefers-reduced-motion disables all transitions — the balloon is
       primarily a reading aid and flash-animation motion is the thing
@@ -204,19 +208,6 @@
   #word-right  { text-align: left;   padding-left:  0.06em; }
 
   /*
-    Warmth gradient: the letter immediately adjacent to the anchor on
-    each side is rendered in a blend toward the accent, not full accent.
-    This produces a three-glyph warmth arc rather than a single bright
-    character. Research on the perceptual span (Rayner et al.) shows
-    the eye picks up letters ±3-4 positions from the fixation point, so
-    graded emphasis across the fixation region more closely matches how
-    the visual system actually processes the word.
-  */
-  .adjacent {
-    color: color-mix(in oklch, var(--accent) 55%, var(--ink));
-  }
-
-  /*
     Progress hairline: 2px along the very bottom edge, INSIDE the
     border-radius, inset from each corner so the fill bar doesn't
     ever touch the rounded edge. Neutral ink tint, not red — the
@@ -394,51 +385,24 @@ function anchorIndex(word) {
 
 // ── Rendering ────────────────────────────────────────────────────────────────
 
-function appendText(parent, text, className) {
-  if (!text) return;
-  var span = document.createElement("span");
-  if (className) span.className = className;
-  // textContent, never innerHTML — sidecar text comes from user-provided
-  // source material and must not reach the HTML parser.
-  span.textContent = text;
-  parent.appendChild(span);
-}
-
 function renderWord(word) {
   var leftEl   = document.getElementById("word-left");
   var anchorEl = document.getElementById("word-anchor");
   var rightEl  = document.getElementById("word-right");
 
-  leftEl.textContent = "";
-  anchorEl.textContent = "";
-  rightEl.textContent = "";
-
-  if (!word) return;
+  // textContent, never innerHTML — sidecar text comes from user-provided
+  // source material and must not reach the HTML parser.
+  if (!word) {
+    leftEl.textContent   = "";
+    anchorEl.textContent = "";
+    rightEl.textContent  = "";
+    return;
+  }
 
   var idx = anchorIndex(word);
-  var before    = word.substring(0, idx);
-  var anchor    = word.substring(idx, idx + 1);
-  var after     = word.substring(idx + 1);
-
-  // Warmth gradient: the character immediately adjacent to the anchor
-  // on each side gets the `.adjacent` class (blended toward accent).
-  // Remaining characters stay ink. Produces a 3-glyph warmth arc
-  // rather than a single highlighted character.
-  if (before.length > 1) {
-    appendText(leftEl, before.substring(0, before.length - 1), null);
-  }
-  if (before.length > 0) {
-    appendText(leftEl, before.charAt(before.length - 1), "adjacent");
-  }
-
-  anchorEl.textContent = anchor;
-
-  if (after.length > 0) {
-    appendText(rightEl, after.charAt(0), "adjacent");
-  }
-  if (after.length > 1) {
-    appendText(rightEl, after.substring(1), null);
-  }
+  leftEl.textContent   = word.substring(0, idx);
+  anchorEl.textContent = word.substring(idx, idx + 1);
+  rightEl.textContent  = word.substring(idx + 1);
 }
 
 function updateProgress(ms, words) {
