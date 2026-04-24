@@ -487,22 +487,34 @@ def trim_sacrificial_head(
         // frame
     )
 
-    seen_audible = False
-    silent_run = 0
+    # Kokoro's ONNX model emits ~400 ms of leading silence before the first
+    # phoneme (a model-warm-up artifact, independent of KOKORO_PAD_START_MS).
+    # That silence shifts the entire banana-prefix window rightward on the
+    # time axis, so min/max cut bounds measured from WAV t=0 reject the real
+    # gap as "past max". Anchor the bounds to the first audible frame instead
+    # — the bounds are semantically about "how far through banana are we",
+    # not "how far into the WAV".
+    first_audible = -1
     for i in range(search_frames):
         if rms[i] > threshold:
-            seen_audible = True
+            first_audible = i
+            break
+    if first_audible < 0:
+        return samples
+
+    silent_run = 0
+    for i in range(first_audible, search_frames):
+        if rms[i] > threshold:
             silent_run = 0
-            continue
-        if not seen_audible:
             continue
         silent_run += 1
         if silent_run < HEAD_TRIM_DWELL_FRAMES:
             continue
         cut_frame = i + 1
-        if cut_frame > max_cut_frame:
+        offset_frames = cut_frame - first_audible
+        if offset_frames > max_cut_frame:
             return samples
-        if cut_frame < min_cut_frame:
+        if offset_frames < min_cut_frame:
             continue
         return samples[cut_frame * frame:]
     return samples

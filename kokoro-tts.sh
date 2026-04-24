@@ -136,7 +136,13 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
 #   3 — Sacrificial-head trim rework: relative RMS threshold + 20ms dwell
 #       + min/max cut-position guardrails. Old WAVs may have "banana,"
 #       leakage baked in from the prior detector — bump to force re-synth.
-SYNTH_VERSION=3
+#   4 — Sacrificial-head bounds anchored to first audible frame. Kokoro ONNX
+#       emits ~400 ms of leading silence before the first phoneme, which
+#       shifted the banana window past the max_cut guardrail (measured from
+#       WAV t=0), so the comma gap was rejected and "banana" leaked through.
+#       Bounds now measure from first_audible; old WAVs have the leak baked
+#       in — bump to force re-synth.
+SYNTH_VERSION=4
 sentence_hash() {
   local text="$1"
   local pad="$2"
