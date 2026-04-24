@@ -397,13 +397,52 @@ end
 -- Selection capture (AX → Cmd+C → copy-on-select terminal fallback)
 -- ============================================================
 
+-- Pull the selected text via Accessibility without touching the keyboard
+-- or clipboard. Avoiding Cmd+C matters when other apps (e.g. Wispr Flow)
+-- watch clipboard changes or intercept keyDown events, because that round-
+-- trip introduces cross-app contention that can make F13 feel frozen.
+--
+-- Tries, in order:
+--   1. AXSelectedText on the focused element — the obvious path, works
+--      in native Cocoa apps (TextEdit, Notes, Safari native views).
+--   2. AXStringForRange(AXSelectedTextRange) on the focused element —
+--      Chromium/Electron renderers expose this where AXSelectedText is
+--      empty. VS Code, Chrome, Arc, Cursor, Slack all fall here.
+--   3. Walk up the parent chain once in case the focus landed on a
+--      wrapper element rather than the text view that owns the
+--      selection (common in custom text widgets and some Electron apps).
+--
+-- Returns the selected string, or nil if every path came up dry.
 local function axSelection()
   local okCall, sys = pcall(hs.axuielement.systemWideElement)
   if not okCall or not sys then return nil end
   local focused = sys:attributeValue("AXFocusedUIElement")
   if not focused then return nil end
-  local text = focused:attributeValue("AXSelectedText")
-  if type(text) == "string" and #text > 0 then return text end
+
+  local function tryElement(el)
+    if not el then return nil end
+    local ok, text = pcall(function() return el:attributeValue("AXSelectedText") end)
+    if ok and type(text) == "string" and #text > 0 then return text end
+    local okr, range = pcall(function() return el:attributeValue("AXSelectedTextRange") end)
+    if okr and range then
+      local okq, str = pcall(function()
+        return el:parameterizedAttributeValue("AXStringForRange", range)
+      end)
+      if okq and type(str) == "string" and #str > 0 then return str end
+    end
+    return nil
+  end
+
+  local text = tryElement(focused)
+  if text then return text end
+
+  -- Second chance: focus landed on a wrapper; try the parent once.
+  local okP, parent = pcall(function() return focused:attributeValue("AXParent") end)
+  if okP and parent then
+    text = tryElement(parent)
+    if text then return text end
+  end
+
   return nil
 end
 
