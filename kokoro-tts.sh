@@ -43,6 +43,12 @@
 #                      — the previous single-sample threshold ate release
 #                      bursts from t/p/k whose amplitude sits below 0.005.
 #                      (default: 40; 0 disables — keep Kokoro's native tail)
+#   KOKORO_SACRIFICIAL_WORD  throwaway prefix word. Kokoro's first-token
+#                      warm-up eats the initial consonant of every sentence,
+#                      so we synth "banana, {real_text}" and the server cuts
+#                      the prefix off. Must be a single alphabetic word ≤32
+#                      chars. Set to empty string to disable.
+#                      (default: banana)
 #
 # Owned by play-last.sh via job.pid; writes state={synth,play} to the state
 # file; play-stream.py is a long-lived child — the parent's pkill -P tears
@@ -82,23 +88,24 @@ EQ_Q="${KOKORO_EQ_Q:-1.0}"
 PAD_START_MS="${KOKORO_PAD_START_MS:-150}"
 TAIL_TRIM_MS="${KOKORO_TAIL_TRIM_MS:-40}"
 COALESCE_MAX_CHARS="${KOKORO_COALESCE_MAX_CHARS:-400}"
+SACRIFICIAL_WORD="${KOKORO_SACRIFICIAL_WORD-banana}"
 mkdir -p "$CACHE_DIR"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
 
-# Hash key: voice|synth_speed|lang|eq_*|pad_start_ms|tail_trim_ms|text. Any
-# change in those produces different audio, so they all go into the key.
-# Null bytes between fields prevent "ab|c" colliding with "a|bc". Every
-# synthesis-affecting knob is mixed in, so toggling any env var (EQ, pad,
-# trim) auto-invalidates stale cache instead of silently mixing pre/post
-# audio.
+# Hash key: voice|synth_speed|lang|eq_*|pad_start_ms|tail_trim_ms|
+# sacrificial_word|text. Any change in those produces different audio, so
+# they all go into the key. Null bytes between fields prevent "ab|c"
+# colliding with "a|bc". Every synthesis-affecting knob is mixed in, so
+# toggling any env var (EQ, pad, trim, sacrificial word) auto-invalidates
+# stale cache instead of silently mixing pre/post audio.
 sentence_hash() {
   local text="$1"
   local pad="$2"
-  printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s' \
+  printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s' \
     "$VOICE" "$SYNTH_SPEED" "$LANG_CODE" \
     "$EQ_GAIN_DB" "$EQ_FREQ" "$EQ_Q" \
-    "$pad" "$TAIL_TRIM_MS" "$text" \
+    "$pad" "$TAIL_TRIM_MS" "$SACRIFICIAL_WORD" "$text" \
     | shasum -a 256 | awk '{print $1}'
 }
 
@@ -290,6 +297,7 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
         --arg text "$sent_text" \
         --arg voice "$VOICE" \
         --arg lang "$LANG_CODE" \
+        --arg sacrificial_head_word "$SACRIFICIAL_WORD" \
         --argjson speed "$SYNTH_SPEED" \
         --argjson eq_gain_db "$EQ_GAIN_DB" \
         --argjson eq_freq "$EQ_FREQ" \
@@ -298,7 +306,8 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
         --argjson tail_trim_ms "$TAIL_TRIM_MS" \
         '{text: $text, voice: $voice, speed: $speed, lang: $lang,
           eq_gain_db: $eq_gain_db, eq_freq: $eq_freq, eq_q: $eq_q,
-          pad_start_ms: $pad_start_ms, tail_trim_ms: $tail_trim_ms}')
+          pad_start_ms: $pad_start_ms, tail_trim_ms: $tail_trim_ms,
+          sacrificial_head_word: $sacrificial_head_word}')
       HTTP_CODE=$(curl -sS -o "$cache_wav.tmp" -w '%{http_code}' \
         --max-time 120 \
         -X POST "$URL/speak" \
