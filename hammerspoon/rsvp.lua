@@ -145,10 +145,26 @@ local function balloonTargetRect(iconFrame)
   local bx = iconFrame.x + iconFrame.w / 2 - BALLOON_WIDTH / 2
   local by = iconFrame.y + iconFrame.h + ICON_GAP
 
-  -- Clamp to the screen containing the icon.
-  -- hs.screen.find() accepts a point.
-  local screen = hs.screen.find({ x = iconFrame.x + iconFrame.w/2, y = iconFrame.y })
-               or hs.screen.mainScreen()
+  -- Find the screen that contains the icon's center point.
+  -- hs.screen.find() with a geometry rect/point works in Hammerspoon >= 0.9.79.
+  -- Wrap in pcall; if it fails (older build) fall through to mainScreen().
+  local iconCenterX = iconFrame.x + iconFrame.w / 2
+  local screen
+  local ok_find, found = pcall(hs.screen.find, hs.geometry.point(iconCenterX, iconFrame.y))
+  if ok_find and found then
+    screen = found
+  else
+    -- Fallback: iterate all screens and find the one whose frame contains the point.
+    for _, s in ipairs(hs.screen.allScreens()) do
+      local r = s:fullFrame()
+      if iconCenterX >= r.x and iconCenterX <= r.x + r.w
+         and iconFrame.y >= r.y and iconFrame.y <= r.y + r.h then
+        screen = s
+        break
+      end
+    end
+  end
+  screen = screen or hs.screen.mainScreen()
   local sf = screen:frame()  -- usable area (below menu bar)
 
   -- Clamp horizontal position to screen bounds.
@@ -163,12 +179,13 @@ local function balloonTargetRect(iconFrame)
 end
 
 -- Compute the starting rect for the animate-in (collapsed at icon height).
+-- Use h=2 (not 0) so WKWebView creates a valid backing surface.
 local function balloonStartRect(iconFrame, targetRect)
   return {
     x = targetRect.x,
     y = iconFrame.y + iconFrame.h + ICON_GAP,
     w = BALLOON_WIDTH,
-    h = 0,
+    h = 2,
   }
 end
 
@@ -298,8 +315,9 @@ function M.show(sidecar_path)
     M.hide()
   end
 
-  -- Reset state.
-  _bufferSidecars  = {}
+  -- Reset per-session state. Note: _bufferSidecars is NOT reset here so that
+  -- feedSidecar() can be called before show() (the test harness does this).
+  -- destroyWebview() resets _bufferSidecars on hide/cleanup.
   _activeSidecar   = nil
   _activeBufferId  = nil
   _isPaused        = false
@@ -333,11 +351,22 @@ function M.show(sidecar_path)
   end
 
   _webview:windowStyle(wm.borderless)
-  _webview:allowTextEntry(false)
   _webview:transparent(true)
   _webview:bringToFront(true)
-  _webview:allowNewWindows(false)
-  _webview:allowNavigationFrom(nil)
+  -- Block link clicks / form navigation: any navigation attempt other than
+  -- our initial file:// load returns false (blocked).
+  _webview:navigationCallback(function(action, wv, navID, url)
+    -- Allow the initial HTML load, block everything else.
+    if action == "didFinishNavigation" or action == "didStartProvisionalNavigation" then
+      return true
+    end
+    if action == "navigating" then
+      -- Our own file:// load is always permitted.
+      if url and url:sub(1, 7) == "file://" then return true end
+      return false
+    end
+    return true
+  end)
 
   -- Load the HTML file.
   local url = "file://" .. htmlPath()
@@ -351,9 +380,18 @@ function M.show(sidecar_path)
   hs.timer.doAfter(0.15, function()
     if not _webview then return end
 
-    -- Feed the sidecar into the page.
+    -- Feed the top-level sidecar into the page.
     if sidecarJson then
       jsCall("window.rsvpLoad", sidecarJson)
+    end
+
+    -- Push any per-buffer sidecars that were fed via feedSidecar() before
+    -- show() was called. The test harness does this: feedSidecar then show.
+    for bid, sc in pairs(_bufferSidecars) do
+      local ok_enc, json_str = pcall(hs.json.encode, sc)
+      if ok_enc and json_str then
+        jsCall("window.rsvpLoadBuffer", tostring(bid), json_str)
+      end
     end
 
     -- Animate open: grow from startRect to targetRect over ANIMATE_IN_MS.
