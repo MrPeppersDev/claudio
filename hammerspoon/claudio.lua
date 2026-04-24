@@ -289,15 +289,24 @@ local function loadSidecar(path)
 end
 
 -- Append a line (PAUSE / RESUME / SEEK <ms>) to the control FIFO so the
--- shell subshell forwards it to play-stream.py's fd 9. The subshell holds
--- its own writer on the FIFO, so our brief open-write-close doesn't collapse
--- the reader with an EOF. No-op if no job is running (controlFifoPath nil).
+-- shell subshell forwards it to play-stream.py's fd 9. Uses hs.task so the
+-- write happens off the main thread — if the FIFO has no reader (stale job,
+-- dead subshell), a direct io.open(fifo, "w") would block HS's main loop
+-- indefinitely. The shell redirect still blocks in its own process but that
+-- process is detached from HS, and the hs.timer cleans it up after 500 ms.
+-- Whitelist is enforced on the shell side (PAUSE|RESUME|"SEEK "*) so
+-- line contents can't drive arbitrary commands even with shell escaping.
 local function writeControl(line)
   if not controlFifoPath then return end
-  local f = io.open(controlFifoPath, "w")
-  if not f then return end
-  f:write(line .. "\n")
-  f:close()
+  local t = hs.task.new("/bin/sh", nil, {
+    "-c", [[printf '%s\n' "$1" > "$2" 2>/dev/null]],
+    "--", line, controlFifoPath,
+  })
+  if not t then return end
+  t:start()
+  hs.timer.doAfter(0.5, function()
+    if t and t:isRunning() then t:terminate() end
+  end)
 end
 
 -- Parse one stderr line from the play task. Protocol:
