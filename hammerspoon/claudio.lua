@@ -998,6 +998,13 @@ function M.start()
   rsvp.on_seek_request   = function(delta_ms)
     writeControl("SEEK " .. tostring(delta_ms))
   end
+  -- × button in the balloon: same semantics as F13-during-playback — stop
+  -- the TTS job (if any) and clear the balloon. Without the stop, audio
+  -- keeps playing after the balloon disappears.
+  rsvp.on_close_request  = function()
+    if jobIsRunning() then runPlayScript({ PLAY_SCRIPT }) end
+    rsvp.hide()
+  end
 
   watcher = hs.pathwatcher.new(STATE_DIR, function() render() end)
   watcher:start()

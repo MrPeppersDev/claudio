@@ -81,7 +81,7 @@ local ANCHOR_GAP = 12
 local SCREEN_PAD = 12
 
 -- How long (seconds) to linger after the last word before fade-out.
-local LINGER_SECS = 2.0
+local LINGER_SECS = 5.0
 
 -- Keyboard scrub increment (milliseconds per ← / → keypress).
 local SEEK_DELTA_MS = 2000
@@ -92,6 +92,7 @@ local _webview      = nil    -- hs.webview instance (nil when hidden)
 local _keyTap       = nil    -- hs.eventtap for Space/Esc/←/→ scoped to webview focus
 local _lingerTimer  = nil    -- hs.timer: fires after LINGER_SECS to begin fade-out
 local _animTimer    = nil    -- hs.timer: used during animate-in
+local _pollTimer    = nil    -- hs.timer: polls window.__claudio_q for button clicks
 local _htmlPath     = nil    -- absolute path to rsvp.html
 
 -- Per-buffer sidecar cache: buffer_id (number) → parsed sidecar table
@@ -112,6 +113,7 @@ local _lastPosMs = nil
 M.on_pause_request  = nil    -- function()
 M.on_resume_request = nil    -- function()
 M.on_seek_request   = nil    -- function(delta_ms)
+M.on_close_request  = nil    -- function()  -- user clicked × button
 
 -- ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -272,6 +274,67 @@ local function jsCall(fn, ...)
   end)
 end
 
+-- ── Hover-button bridge ─────────────────────────────────────────────────────
+--
+-- rsvp.html buttons push command strings onto window.__claudio_q. We poll
+-- that queue every ~80 ms, drain it, and dispatch. This was the fallback
+-- after the rsvp:// URL-scheme approach failed — WKWebView either swallows
+-- unknown schemes or fires the navigationCallback too late to intercept.
+
+-- Polling cadence for window.__claudio_q. 200 ms gives "imperceptible"
+-- button latency (well under the 300 ms reaction-time threshold) while
+-- halving main-thread contention vs. 80 ms — important because POS events
+-- from play-stream.py parse on the same main thread, and any contention
+-- shows up as audio/RSVP drift.
+local POLL_INTERVAL = 0.20
+
+local function dispatchCmd(cmd)
+  if cmd == "toggle_pause" then
+    if _isPaused then M.resume() else M.pause() end
+  elseif cmd == "seek_back" then
+    if M.on_seek_request then M.on_seek_request(-SEEK_DELTA_MS) end
+  elseif cmd == "seek_fwd" then
+    if M.on_seek_request then M.on_seek_request(SEEK_DELTA_MS) end
+  elseif cmd == "close" then
+    if M.on_close_request then
+      M.on_close_request()
+    else
+      M.hide()
+    end
+  end
+end
+
+local function startPolling()
+  if _pollTimer then return end
+  -- Keep the JS a single expression — WKWebView evaluates in script-tag
+  -- context, so a top-level `return` is a syntax error. The trailing
+  -- expression is what gets returned to Lua.
+  local js = "var q=window.__claudio_q||[];window.__claudio_q=[];JSON.stringify(q)"
+  _pollTimer = hs.timer.doEvery(POLL_INTERVAL, function()
+    if not _webview then return end
+    _webview:evaluateJavaScript(js, function(result, err)
+      -- Some HS/WebKit versions hand back a sentinel err table with code=0
+      -- on success. Treat as a real error only when we also have no result.
+      if err and not result then return end
+      if not result then return end
+      local s = tostring(result)
+      if s == "" or s == "[]" then return end
+      local ok, cmds = pcall(hs.json.decode, s)
+      if not ok or type(cmds) ~= "table" then return end
+      for _, cmd in ipairs(cmds) do
+        if type(cmd) == "string" then dispatchCmd(cmd) end
+      end
+    end)
+  end)
+end
+
+local function stopPolling()
+  if _pollTimer then
+    _pollTimer:stop()
+    _pollTimer = nil
+  end
+end
+
 -- Cancel any pending linger timer.
 local function cancelLinger()
   if _lingerTimer then
@@ -283,6 +346,7 @@ end
 -- Destroy the webview and clean up the eventtap/timers.
 local function destroyWebview()
   cancelLinger()
+  stopPolling()
   if _animTimer then
     _animTimer:stop()
     _animTimer = nil
@@ -433,6 +497,9 @@ function M.show(sidecar_path, opts)
   _webview:windowStyle(wm.borderless)
   _webview:transparent(true)
   _webview:bringToFront(true)
+  -- Required for the webview to become firstResponder on click, which the
+  -- scoped Space/Esc/←/→ eventtap needs via isWebviewFocused().
+  if _webview.allowTextEntry then _webview:allowTextEntry(true) end
 
   -- Fires once when the HTML has finished loading (triggered by the
   -- navigationCallback didFinishNavigation event, or by the safety-net
@@ -466,6 +533,7 @@ function M.show(sidecar_path, opts)
       _webview:frame(targetRect)
       jsCall("window.rsvpFadeIn")
       registerHotkeys()
+      startPolling()
       return
     end
 
@@ -499,6 +567,7 @@ function M.show(sidecar_path, opts)
         jsCall("window.rsvpFadeIn")
         -- Register hotkeys now that balloon is fully visible.
         registerHotkeys()
+        startPolling()
       end
     end
 

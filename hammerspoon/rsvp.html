@@ -258,6 +258,46 @@
   }
 
   /*
+    Hover-revealed control bar. Centered along the bottom, above the
+    progress hairline. Invisible until the pointer enters the balloon,
+    then fades in. Buttons dispatch into window.__claudio_q — a plain
+    JS array that Lua polls via evaluateJavaScript every ~80 ms.
+  */
+  #controls {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 20px;
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--dur-fast) var(--ease);
+  }
+  #balloon:hover #controls { opacity: 1; pointer-events: auto; }
+  body.paused #controls   { opacity: 1; pointer-events: auto; }
+
+  #controls button {
+    appearance: none;
+    -webkit-appearance: none;
+    border: 1px solid rgba(60, 42, 18, 0.18);
+    background: rgba(246, 239, 220, 0.82);
+    color: var(--ink);
+    font-family: var(--font-stack);
+    font-size: 14px;
+    line-height: 1;
+    padding: 6px 10px;
+    min-width: 34px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease),
+                transform var(--dur-fast) var(--ease);
+  }
+  #controls button:hover  { background: rgba(241, 232, 206, 0.95); }
+  #controls button:active { transform: translateY(1px); }
+
+  /*
     Respect user's motion preferences. The balloon is a reading aid;
     animated fades and progress-bar tweening are precisely the motions
     a motion-sensitive user needs quieted. Kill durations to near-zero
@@ -283,6 +323,12 @@
     </div>
   </div>
   <div id="pause-dot"></div>
+  <div id="controls">
+    <button id="btn-back"  type="button" aria-label="Back">&#x2190;</button>
+    <button id="btn-pause" type="button" aria-label="Pause">&#x23F8;</button>
+    <button id="btn-fwd"   type="button" aria-label="Forward">&#x2192;</button>
+    <button id="btn-close" type="button" aria-label="Close">&#x2715;</button>
+  </div>
   <div id="progress-track"><div id="progress-fill"></div></div>
 </div>
 
@@ -510,11 +556,15 @@ window.rsvpShowAt = function(ms, bufferId) {
 window.rsvpPause = function() {
   _paused = true;
   document.body.classList.add("paused");
+  var btn = document.getElementById("btn-pause");
+  if (btn) { btn.innerHTML = "&#x25B6;"; btn.setAttribute("aria-label", "Resume"); }
 };
 
 window.rsvpResume = function() {
   _paused = false;
   document.body.classList.remove("paused");
+  var btn = document.getElementById("btn-pause");
+  if (btn) { btn.innerHTML = "&#x23F8;"; btn.setAttribute("aria-label", "Pause"); }
 };
 
 window.rsvpFadeOut = function() {
@@ -526,6 +576,28 @@ window.rsvpFadeIn = function() {
   document.body.style.transition = "opacity 180ms cubic-bezier(0.4, 0, 0.2, 1)";
   document.body.style.opacity = "1";
 };
+
+// ── Lua bridge: command queue ───────────────────────────────────────────────
+//
+// Buttons push command strings here; Lua polls this array every ~80 ms via
+// evaluateJavaScript, drains it, and dispatches. A plain array + polling is
+// used instead of a custom URL scheme because WKWebView swallows unknown-
+// scheme navigation silently (tried rsvp:// — navigationCallback either
+// doesn't fire for it or fires too late to block the load).
+
+window.__claudio_q = [];
+function __claudio_push(cmd) { window.__claudio_q.push(cmd); }
+
+(function wireButtons() {
+  var b = document.getElementById("btn-back");
+  var p = document.getElementById("btn-pause");
+  var f = document.getElementById("btn-fwd");
+  var x = document.getElementById("btn-close");
+  if (b) b.addEventListener("click", function(e) { e.preventDefault(); __claudio_push("seek_back"); });
+  if (p) p.addEventListener("click", function(e) { e.preventDefault(); __claudio_push("toggle_pause"); });
+  if (f) f.addEventListener("click", function(e) { e.preventDefault(); __claudio_push("seek_fwd"); });
+  if (x) x.addEventListener("click", function(e) { e.preventDefault(); __claudio_push("close"); });
+})();
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 
