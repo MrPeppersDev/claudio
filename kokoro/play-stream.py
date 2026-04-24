@@ -3,24 +3,72 @@
 
 Reads commands from stdin (one per line) and writes audio samples into a
 single long-lived OutputStream.  Keeping the stream open across sentences
-means CoreAudio initialises once (during the 200ms silent pre-roll) so the
+means CoreAudio initialises once (during the 400ms silent pre-roll) so the
 very first word is never clipped.
 
 Protocol (each stdin line is one command):
-  PLAY <absolute-path>   — time-stretch and play the WAV at the current RATE
-  EARCON <absolute-path> — play the file at 1.0x (no stretching); resamples
-                           to 24 kHz if needed (handles .aiff earcons)
-  PAUSE <ms>             — insert <ms> of silence into the stream
-  RATE <float>           — set playback rate for subsequent PLAY commands
+
+  PLAY <id> <absolute-path>  — time-stretch and play the WAV at the current
+                               RATE; <id> is an integer buffer identifier
+                               (incremented by kokoro-tts.sh per sentence) and
+                               is echoed in every POS message for this buffer.
+                               Backward-compat: PLAY <absolute-path> (no id)
+                               is accepted and treated as id=0.
+  EARCON <absolute-path>     — play the file at 1.0x (no stretching); resamples
+                               to 24 kHz if needed (handles .aiff earcons).
+  PAUSE                      — soft pause: halt buffer consumption without
+                               closing the stream. The stream stays alive and
+                               silent; POS emission pauses (position doesn't
+                               advance). No-op if already paused.
+                               NOTE: PAUSE <ms> (old form) now inserts silence
+                               as before for backward compatibility when arg is
+                               a positive integer; bare PAUSE is the soft-pause.
+  RESUME                     — resume consumption after PAUSE. No-op if not
+                               paused.
+  SEEK <ms>                  — jump by ±ms relative to current playhead within
+                               the currently-playing buffer. Clamped to
+                               [0, buffer_duration]. Cross-buffer seeks are
+                               out of scope and silently ignored (clamp only).
+  STOP                       — clear the audio queue and halt playback. The
+                               stream stays alive (PLAY can restart it).
+  RATE <float>               — set playback rate for subsequent PLAY commands.
+
+POS output (stderr, distinctive prefix so kokoro-tts.sh can tee/filter it):
+
+  POS <ms> <id>
+
+  Emitted at ~20 ms cadence while playing.  <ms> is the playhead position
+  in the currently-playing WAV's own time frame (pre-sox-tempo stretch), so
+  it matches the word-offset timestamps written by the PR-1 timing sidecar.
+
+  Formula: ms = pos_stretched * 1000 * tempo_factor / SAMPLE_RATE
+  where pos_stretched = stretched samples consumed so far and
+  tempo_factor = current RATE (the sox tempo argument).
+  Derivation: sox tempo R compresses source duration by R, so each stretched
+  sample corresponds to R source samples; multiply (not divide) to recover
+  source time.
+
+  POS emission drops to 0 Hz during PAUSE.
+  When a new PLAY starts, POS resets to 0 for that buffer's time frame.
+
+Design note — stderr vs fd-10:
+  Using stderr with a "POS " prefix is the least-invasive channel: no new fd
+  plumbing needed in kokoro-tts.sh, and the shell caller can tee stderr to a
+  pipe while keeping the prefix as a disambiguator.  PR 3 (RSVP UI) should
+  read from the stderr pipe and filter lines that start with "POS ".
 
 Exits cleanly on stdin EOF or SIGTERM.
 """
 
 import io
 import os
+import queue
 import signal
 import subprocess
 import sys
+import threading
+import time
+from typing import Optional
 
 import numpy as np
 import sounddevice as sd
@@ -46,10 +94,26 @@ EDGE_FADE_MS = 3      # linear fade-in/out applied to every PLAY/EARCON buffer
                       # produces an audible DC click at every sentence seam.
                       # 3 ms on each side is inaudible as a pause but
                       # eliminates the discontinuity.
+POS_CADENCE_S = 0.020  # ~20 ms between POS emissions while playing
+
+# ---- shared state (protected by _lock) ----------------------------------------
+
+_lock = threading.Lock()
+_paused = False          # soft-pause flag; player thread checks this
+_seek_delta_samples: Optional[int] = None  # pending relative seek; set by SEEK cmd
+_stop_requested = False  # STOP command sets this; player thread clears it
+
+# ---- audio queue --------------------------------------------------------------
+# Each item is one of:
+#   ("samples", buffer_id: int, samples: np.ndarray, tempo_factor: float)
+#   ("silence", ms: int)
+# The player thread drains this.
+
+_audio_queue: queue.Queue = queue.Queue()
 
 # ---- globals ------------------------------------------------------------------
 
-_stream: sd.OutputStream | None = None
+_stream: Optional[sd.OutputStream] = None
 _rate: float = 1.0   # updated by RATE commands
 
 
@@ -107,7 +171,7 @@ def _stretch(samples: np.ndarray, rate: float) -> np.ndarray:
     return stretched.astype(np.float32)
 
 
-def _silence(ms: int) -> np.ndarray:
+def _silence_samples(ms: int) -> np.ndarray:
     n = int(SAMPLE_RATE * ms / 1000)
     return np.zeros(n, dtype=np.float32)
 
@@ -125,12 +189,144 @@ def _edge_fade(samples: np.ndarray, ms: int = EDGE_FADE_MS) -> np.ndarray:
     return samples
 
 
-def _write(samples: np.ndarray) -> None:
-    """Block-write samples into the stream."""
+def _stream_write(samples: np.ndarray) -> None:
+    """Block-write samples into the stream (called from player thread only)."""
     global _stream
     if _stream is None or len(samples) == 0:
         return
     _stream.write(samples)
+
+
+# ---- POS emission -------------------------------------------------------------
+
+def _emit_pos(ms_float: float, buffer_id: int) -> None:
+    """Write a POS line to stderr. Using stderr with a 'POS ' prefix so the
+    shell caller can tee stderr to a pipe and filter on the prefix."""
+    print(f"POS {int(ms_float)} {buffer_id}", file=sys.stderr, flush=True)
+
+
+# ---- player thread ------------------------------------------------------------
+
+_CHUNK_SAMPLES = int(SAMPLE_RATE * POS_CADENCE_S)  # ~480 samples @ 24kHz → 20ms
+
+
+def _player_loop() -> None:
+    """Drain _audio_queue and write samples to the stream.
+
+    Runs in a dedicated daemon thread so the main thread can keep reading
+    stdin commands.  Soft-pause is implemented by spinning without consuming
+    queue items (the stream stays alive and silent via zero-writes).
+    """
+    global _stream, _stop_requested
+
+    while True:
+        # Check for STOP first — clears queue and continues.
+        with _lock:
+            if _stop_requested:
+                _drain_queue()
+                _stop_requested = False
+                continue
+
+        # Check pause — spin-wait with tiny sleep to avoid busy-loop.
+        with _lock:
+            paused = _paused
+        if paused:
+            # Write a small silence chunk to keep the stream alive.
+            _stream_write(_silence_samples(int(POS_CADENCE_S * 1000)))
+            continue
+
+        # Try to get the next item.
+        try:
+            item = _audio_queue.get(timeout=POS_CADENCE_S)
+        except queue.Empty:
+            continue
+
+        kind = item[0]
+
+        if kind == "silence":
+            _, ms = item
+            _stream_write(_silence_samples(ms))
+            _audio_queue.task_done()
+
+        elif kind == "samples":
+            _, buffer_id, samples, tempo_factor = item
+            _play_buffer(buffer_id, samples, tempo_factor)
+            _audio_queue.task_done()
+
+
+def _drain_queue() -> None:
+    """Empty the audio queue (called under _lock from player thread)."""
+    while not _audio_queue.empty():
+        try:
+            _audio_queue.get_nowait()
+            _audio_queue.task_done()
+        except queue.Empty:
+            break
+
+
+def _play_buffer(buffer_id: int, samples: np.ndarray, tempo_factor: float) -> None:
+    """Play a buffer of (already-stretched) samples in chunks, emitting POS.
+
+    The samples are already time-stretched; the tempo_factor is the sox rate
+    that was applied so we can recover source-domain position.
+
+    Formula derivation:
+      Source WAV: N samples at SAMPLE_RATE → duration = N/SAMPLE_RATE seconds.
+      sox tempo R (R>1 = faster): output has N/R stretched samples.
+      When player has consumed `pos` stretched samples:
+        fraction_complete = pos / (N/R) = pos*R/N
+        source_time_s     = fraction_complete * (N/SAMPLE_RATE)
+                          = pos * R / SAMPLE_RATE
+        source_ms         = pos / SAMPLE_RATE * 1000 * R
+    So: source_ms = pos * 1000 * tempo_factor / SAMPLE_RATE  (MULTIPLY by R).
+
+    SEEK delta: the fd-9 SEEK command is in source-domain ms. Converting to
+    the stretched-sample domain:
+        source_samples = ms * SAMPLE_RATE / 1000
+        stretched_delta = source_samples / tempo_factor  (DIVIDE by R)
+    because each source sample corresponds to 1/R stretched samples.
+    """
+    global _stop_requested, _seek_delta_samples
+
+    pos = 0  # current position in samples array
+    total = len(samples)
+    last_pos_emit = -1  # track when we last emitted a POS
+
+    while pos < total:
+        # Check STOP.
+        with _lock:
+            if _stop_requested:
+                return
+
+        # Check pause — spin-wait, write silence to keep stream alive.
+        with _lock:
+            paused = _paused
+        if paused:
+            _stream_write(_silence_samples(int(POS_CADENCE_S * 1000)))
+            continue
+
+        # Apply any pending seek.
+        with _lock:
+            delta = _seek_delta_samples
+            _seek_delta_samples = None
+        if delta is not None:
+            # delta is in source-domain samples; convert to stretched domain
+            # (source_samples → stretched: divide by tempo_factor)
+            stretched_delta = int(delta / tempo_factor)
+            pos = max(0, min(total, pos + stretched_delta))
+
+        # Write one chunk.
+        end = min(pos + _CHUNK_SAMPLES, total)
+        chunk = samples[pos:end]
+        _stream_write(chunk)
+        pos = end
+
+        # Emit POS in source-domain time.
+        # source_ms = pos * 1000 * tempo_factor / SAMPLE_RATE
+        source_ms = pos / SAMPLE_RATE * 1000.0 * tempo_factor
+        if int(source_ms) != last_pos_emit:
+            _emit_pos(source_ms, buffer_id)
+            last_pos_emit = int(source_ms)
 
 
 # ---- signal handling ----------------------------------------------------------
@@ -151,7 +347,7 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 # ---- main ---------------------------------------------------------------------
 
 def main() -> None:
-    global _stream, _rate
+    global _stream, _rate, _paused, _stop_requested, _seek_delta_samples
 
     # Open the stream once for the entire session.
     _stream = sd.OutputStream(
@@ -162,57 +358,114 @@ def main() -> None:
     )
     _stream.start()
 
-    # 200 ms silent pre-roll: CoreAudio device ramp-up happens here, not
-    # during the first real word.
-    _write(_silence(PRE_ROLL_MS))
+    # Start the player thread as daemon so it exits when main() returns.
+    player = threading.Thread(target=_player_loop, daemon=True)
+    player.start()
+
+    # 400 ms silent pre-roll: CoreAudio device ramp-up happens here, not
+    # during the first real word.  Enqueue as a silence item so it's consumed
+    # by the player thread in the same serialised order as everything else.
+    _audio_queue.put(("silence", PRE_ROLL_MS))
 
     for raw_line in sys.stdin:
         line = raw_line.rstrip("\n")
         if not line:
             continue
 
-        parts = line.split(" ", 1)
+        parts = line.split(" ", 2)
         cmd = parts[0].upper()
-        arg = parts[1] if len(parts) > 1 else ""
 
         if cmd == "RATE":
             try:
-                _rate = float(arg)
+                _rate = float(parts[1]) if len(parts) > 1 else _rate
             except ValueError:
                 pass  # ignore malformed RATE — keep previous value
 
         elif cmd == "PLAY":
-            path = arg.strip()
+            # Accept both:
+            #   PLAY <id> <path>   (new form; id is integer)
+            #   PLAY <path>        (backward-compat; id=0)
+            if len(parts) >= 3:
+                # Three-part: cmd id path
+                try:
+                    buf_id = int(parts[1])
+                    path = parts[2].strip()
+                except ValueError:
+                    # parts[1] is not an integer — treat as old form
+                    buf_id = 0
+                    path = (parts[1] + (" " + parts[2] if len(parts) > 2 else "")).strip()
+            elif len(parts) == 2:
+                # Two-part: PLAY <path>
+                buf_id = 0
+                path = parts[1].strip()
+            else:
+                continue
+
             if not os.path.isfile(path):
                 continue
             try:
-                samples = _read_audio_as_float32(path)
-                stretched = _stretch(samples, _rate)
-                _write(_edge_fade(stretched))
+                raw = _read_audio_as_float32(path)
+                stretched = _stretch(raw, _rate)
+                faded = _edge_fade(stretched)
+                _audio_queue.put(("samples", buf_id, faded, _rate))
             except Exception as exc:
                 print(f"play-stream: PLAY error {path}: {exc}", file=sys.stderr)
 
         elif cmd == "EARCON":
-            path = arg.strip()
+            path = parts[1].strip() if len(parts) > 1 else ""
             if not os.path.isfile(path):
                 continue
             try:
-                samples = _read_audio_as_float32(path)
-                _write(_edge_fade(samples))  # no stretching for earcons
+                raw = _read_audio_as_float32(path)
+                faded = _edge_fade(raw)  # no stretching for earcons
+                # Earcons use tempo_factor=1.0 since they're not stretched.
+                _audio_queue.put(("samples", -1, faded, 1.0))
             except Exception as exc:
                 print(f"play-stream: EARCON error {path}: {exc}", file=sys.stderr)
 
         elif cmd == "PAUSE":
+            # PAUSE with a positive integer arg → backward-compat silence insert.
+            # Bare PAUSE (or non-integer arg) → soft-pause.
+            arg = parts[1].strip() if len(parts) > 1 else ""
             try:
                 ms = int(arg)
+                if ms > 0:
+                    _audio_queue.put(("silence", ms))
+                # else: 0 or negative → treat as soft-pause
+                    continue
+            except ValueError:
+                pass
+            # Soft-pause.
+            with _lock:
+                _paused = True
+
+        elif cmd == "RESUME":
+            with _lock:
+                _paused = False
+
+        elif cmd == "SEEK":
+            # SEEK <ms> — relative seek in source-domain milliseconds.
+            # Positive = forward; negative = backward.
+            # Clamping to [0, buffer_duration] is done in the player thread
+            # where we have the actual buffer length.
+            try:
+                ms = int(parts[1]) if len(parts) > 1 else 0
             except ValueError:
                 ms = 0
-            if ms > 0:
-                _write(_silence(ms))
+            if ms != 0:
+                # Convert source-domain ms to source-domain samples.
+                delta_source_samples = int(ms * SAMPLE_RATE / 1000)
+                with _lock:
+                    _seek_delta_samples = delta_source_samples
+
+        elif cmd == "STOP":
+            with _lock:
+                _stop_requested = True
 
         # else: unknown command — silently ignore for forward-compat
 
-    # stdin EOF: drain the stream then exit cleanly.
+    # stdin EOF: wait for queue to drain, then exit cleanly.
+    _audio_queue.join()
     try:
         _stream.stop()
         _stream.close()
