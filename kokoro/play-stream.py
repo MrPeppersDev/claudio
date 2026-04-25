@@ -312,14 +312,10 @@ def _play_buffer(buffer_id: int, samples: np.ndarray, tempo_factor: float) -> No
             if _stop_requested:
                 return
 
-        # Check pause — spin-wait, write silence to keep stream alive.
-        with _lock:
-            paused = _paused
-        if paused:
-            _stream_write(_silence_samples(int(POS_CADENCE_S * 1000)))
-            continue
-
-        # Apply any pending seek.
+        # Apply any pending seek BEFORE the pause check so seeks issued while
+        # paused take effect immediately (otherwise they'd queue in
+        # _seek_delta_samples and only apply on resume — and successive seeks
+        # would overwrite, so only the last one would survive).
         with _lock:
             delta = _seek_delta_samples
             _seek_delta_samples = None
@@ -328,6 +324,13 @@ def _play_buffer(buffer_id: int, samples: np.ndarray, tempo_factor: float) -> No
             # (source_samples → stretched: divide by tempo_factor)
             stretched_delta = int(delta / tempo_factor)
             pos = max(0, min(total, pos + stretched_delta))
+
+        # Check pause — spin-wait, write silence to keep stream alive.
+        with _lock:
+            paused = _paused
+        if paused:
+            _stream_write(_silence_samples(int(POS_CADENCE_S * 1000)))
+            continue
 
         # Write one chunk.
         end = min(pos + _CHUNK_SAMPLES, total)

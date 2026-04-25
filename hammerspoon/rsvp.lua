@@ -287,6 +287,23 @@ end
 -- shows up as audio/RSVP drift.
 local POLL_INTERVAL = 0.20
 
+-- Advance the balloon's word-highlight to the seek target while paused.
+-- M.onPos early-returns when paused, so without this the audio would seek
+-- but the balloon would stay frozen on the pre-seek word until resume —
+-- which feels like "arrows don't work". When playing, we don't need this
+-- because POS events from play-stream.py drive the visual naturally.
+local function seekVisualWhilePaused(delta_ms)
+  if not _isPaused then return end
+  if _lastPosMs == nil then return end
+  local newPos = math.max(0, _lastPosMs + delta_ms)
+  _lastPosMs = newPos
+  if _activeBufferId ~= nil then
+    jsCall("window.rsvpShowAt", newPos, _activeBufferId)
+  else
+    jsCall("window.rsvpShowAt", newPos)
+  end
+end
+
 local function dispatchCmd(cmd)
   if cmd == "toggle_pause" then
     if _isPaused then M.resume() else M.pause() end
@@ -294,8 +311,10 @@ local function dispatchCmd(cmd)
     if not _isPaused then M.pause() end
   elseif cmd == "seek_back" then
     if M.on_seek_request then M.on_seek_request(-SEEK_DELTA_MS) end
+    seekVisualWhilePaused(-SEEK_DELTA_MS)
   elseif cmd == "seek_fwd" then
     if M.on_seek_request then M.on_seek_request(SEEK_DELTA_MS) end
+    seekVisualWhilePaused(SEEK_DELTA_MS)
   elseif cmd == "close" then
     if M.on_close_request then
       M.on_close_request()
