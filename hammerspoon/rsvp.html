@@ -113,6 +113,7 @@
     -moz-osx-font-smoothing: grayscale;
     opacity: 0;
     transition: opacity 220ms var(--ease);
+    outline: none;
   }
 
   /*
@@ -313,7 +314,7 @@
   }
 </style>
 </head>
-<body>
+<body tabindex="-1">
 <div id="balloon">
   <div id="word-area">
     <div id="word-row">
@@ -599,13 +600,17 @@ function __claudio_push(cmd) { window.__claudio_q.push(cmd); }
   if (x) x.addEventListener("click", function(e) { e.preventDefault(); __claudio_push("close"); });
 })();
 
-// Keyboard shortcuts. Scope is the webview content — the browser only
-// delivers keydown to the focused frame, so once the user clicks the
-// balloon (making it firstResponder) keys flow here. When the user is
-// elsewhere, keys go to whatever app they were typing in. Replaces an
-// hs.eventtap that gated on hs.window.focusedWindow(), which doesn't
-// resolve correctly for hs.webview clicks.
-document.addEventListener("keydown", function(e) {
+// Keyboard shortcuts via window-level keydown. Scope is the webview content
+// — keys only flow here while the body has focus. Body has tabindex=-1 so
+// it's programmatically focusable; we focus on mousedown anywhere in the
+// document so any click on the balloon (button or empty area) puts the
+// keyboard in this webview. Without that, allowTextEntry alone doesn't
+// transfer keyboard focus on click — clicks land on the webview but no
+// document element gets focus, and document-level keydown never fires.
+document.addEventListener("mousedown", function() {
+  document.body.focus();
+});
+window.addEventListener("keydown", function(e) {
   var k = e.key;
   if (k === " " || e.code === "Space") {
     e.preventDefault();
