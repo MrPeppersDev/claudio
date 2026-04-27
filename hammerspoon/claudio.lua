@@ -20,8 +20,15 @@ local rsvp = require("rsvp")
 --     task; cleanup() in kokoro-tts.sh unlinks it when the task exits.
 --   stderrBuffer: partial-line accumulator. hs.task stream callbacks deliver
 --     arbitrarily-chunked stderr; we split on \n and flush line-by-line.
+--   userInitiatedStop: set by M.toggle when the user is stopping in-flight
+--     playback. The dying task's exit callback consumes the flag so a
+--     SIGKILL fallback (exit 9) is treated like a clean SIGTERM rather
+--     than firing an alert. The grace period in play-last.sh's stop path
+--     should make SIGKILL rare, but cleanup work that runs over budget on
+--     a busy system shouldn't surface as a "Claudio error".
 local controlFifoPath = nil
 local stderrBuffer = ""
+local userInitiatedStop = false
 
 local HOME = os.getenv("HOME")
 -- CLAUDIO_DIR = repo (scripts, venv, model files). Defaults to the install
@@ -372,12 +379,24 @@ local function runPlayScript(args)
         stderrBuffer = ""
       end
       controlFifoPath = nil
+      -- Two task callbacks share userInitiatedStop when M.toggle's stop
+      -- branch runs: the stopper task (which just kills the original and
+      -- exits 0) and the original playback task (143 or 9). Snapshot the
+      -- flag first, then clear only on signal-shaped exits (9, 143) — the
+      -- code-0 stopper must not consume what the original is about to
+      -- read. Clearing on 143 too prevents a stranded flag from masking a
+      -- future real code-9 crash.
+      local wasUserStop = userInitiatedStop
+      if wasUserStop and (code == 9 or code == 143) then
+        userInitiatedStop = false
+      end
+      local userStop = wasUserStop and code == 9
       -- Clean playback finish: trigger the balloon's linger-fade. SIGTERM
       -- (143, from user Stop) is handled separately in M.toggle where
       -- rsvp.hide() fires immediately. Non-zero non-143 is a real error;
       -- we still want the balloon cleared so a crashed task doesn't leave
       -- it dangling, so hide it directly.
-      if code == 0 or code == 143 then
+      if code == 0 or code == 143 or userStop then
         rsvp.endOfStream()
       else
         rsvp.hide()
@@ -621,6 +640,9 @@ end
 
 function M.toggle()
   if jobIsRunning() then
+    -- Mark this stop as user-initiated so the dying task's exit callback
+    -- doesn't fire a "Claudio error (exit 9)" alert if SIGKILL is needed.
+    userInitiatedStop = true
     runPlayScript({ PLAY_SCRIPT })
     -- Stop kills play-stream abruptly — POS events halt and rsvp would sit
     -- on its last word forever waiting for the linger timer that never

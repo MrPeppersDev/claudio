@@ -246,7 +246,13 @@ if [ -f "$LOCK_FILE" ]; then
     collect_descendants "$OLD_PID"
     # shellcheck disable=SC2086 # word-split on purpose
     kill -TERM $DESCENDANTS 2>/dev/null || true
-    sleep 0.1
+    # 100ms used to be plenty, but cooperative shutdown in play-stream.py joins
+    # the player thread with a 500ms timeout, plus kokoro-tts.sh's cleanup
+    # trap (FIFO unlink, forwarder kill) takes a few tens of ms. 600ms covers
+    # both with margin so SIGKILL is rarely needed; user-perceived stop is
+    # already instant because play-stream.py's SIGTERM handler aborts the
+    # OutputStream on the first signal.
+    sleep 0.6
     # shellcheck disable=SC2086
     kill -KILL $DESCENDANTS 2>/dev/null || true
     rm -f "$LOCK_FILE"
