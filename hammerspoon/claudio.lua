@@ -298,6 +298,17 @@ end
 -- line contents can't drive arbitrary commands even with shell escaping.
 local function writeControl(line)
   if not controlFifoPath then return end
+  -- Race guard: kokoro-tts.sh's cleanup() unlinks the FIFO when its task
+  -- exits, but its EXIT trap, the play-stream DRAIN_DONE handshake, and a
+  -- late RSVP click all happen on independent timelines. If we shell out
+  -- after the FIFO is gone, `printf > path` creates a *regular* file —
+  -- which then accumulates as control.* turds in $STATE_DIR. Stat first;
+  -- if the path no longer resolves to a named pipe, drop the line on the
+  -- floor. The completion callback in runPlayScript will null out
+  -- controlFifoPath once the task finishes, so subsequent calls bail at
+  -- the nil check above.
+  local attrs = hs.fs.attributes(controlFifoPath)
+  if not attrs or attrs.mode ~= "named pipe" then return end
   local t = hs.task.new("/bin/sh", nil, {
     "-c", [[printf '%s\n' "$1" > "$2" 2>/dev/null]],
     "--", line, controlFifoPath,
