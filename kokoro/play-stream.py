@@ -613,6 +613,15 @@ def main() -> None:
             with _lock:
                 _stop_requested = True
 
+        elif cmd == "EXIT":
+            # Cooperative exit from kokoro-tts.sh teardown. Break out of the
+            # stdin loop so we drain the queue normally and shut down — vs.
+            # SIGTERM, which is fast/abort. The shell sends EXIT *instead of*
+            # closing fd 9 so the control-fifo subshell (which holds a dup of
+            # fd 9) can stay alive through the drain, keeping PAUSE/RESUME/
+            # SEEK working during end-of-playback.
+            break
+
         # else: unknown command — silently ignore for forward-compat
 
     # stdin EOF: wait for queue to drain, then run cooperative shutdown.

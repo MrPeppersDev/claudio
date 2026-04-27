@@ -468,12 +468,25 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
   [ "$seg_has_audio" -eq 1 ] && first_seg=0
 done
 
-# Kill the control-fifo forwarder first. It inherited a dup of fd 9 when
-# backgrounded, so play-stream.py won't see EOF on stdin until this subshell
-# also exits — even after we close our own fd 9 below. Without this kill,
-# `wait "$STREAM_PID"` blocks forever, the script never returns to its
-# caller, and Hammerspoon's task-exit callback never fires (so the RSVP
-# balloon never gets its linger-fade signal).
+# Tell play-stream we're done queueing audio. It will drain its internal
+# queue and exit cleanly. We deliberately do NOT close fd 9 yet, and we
+# leave CONTROL_READER alive — that keeps Hammerspoon's PAUSE/RESUME/SEEK
+# channel functional through the entire end-of-playback drain (~30s for a
+# paragraph). Closing fd 9 first or killing the forwarder first leaves the
+# user with no controls during drain.
+if [ "$STREAM_FD_OPEN" -eq 1 ]; then
+  printf 'EXIT\n' >&9
+fi
+
+# Wait for play-stream.py to finish its queue and exit. CONTROL plumbing
+# is still wired so user controls keep working until this returns.
+if [ -n "$STREAM_PID" ]; then
+  wait "$STREAM_PID" 2>/dev/null || true
+  STREAM_PID=""
+fi
+
+# Now safe to tear down the control plumbing — play-stream is gone, so
+# any stragglers from Hammerspoon would have nowhere useful to go anyway.
 if [ -n "$CONTROL_READER_PID" ]; then
   kill "$CONTROL_READER_PID" 2>/dev/null || true
   wait "$CONTROL_READER_PID" 2>/dev/null || true
@@ -482,15 +495,10 @@ fi
 [ -n "$CONTROL_FIFO" ] && rm -f "$CONTROL_FIFO"
 CONTROL_FIFO=""
 
-# Close fd 9 so play-stream.py sees EOF, drains, and exits cleanly.
+# Close fd 9 (bookkeeping only — play-stream already exited above).
 if [ "$STREAM_FD_OPEN" -eq 1 ]; then
   exec 9>&-
   STREAM_FD_OPEN=0
-fi
-# Wait for the last audio to finish playing before returning to the caller.
-if [ -n "$STREAM_PID" ]; then
-  wait "$STREAM_PID" 2>/dev/null || true
-  STREAM_PID=""
 fi
 
 # Prune only when we actually added bytes. On a pure cache-hit run (the
