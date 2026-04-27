@@ -457,11 +457,29 @@ def _schedule_end_of_buffer_pos(buffer_id: int, samples: np.ndarray,
             lambda sm=final_source_ms, bid=buffer_id: _emit_pos(sm, bid),
         )
         with _pending_timers_lock:
+            # Prune fired timers — otherwise the list grows for the entire
+            # session (one per natural-advance) and _drain_done_ready_unlocked
+            # walks it every 20 ms tick.
+            _pending_timers[:] = [pt for pt in _pending_timers if pt.is_alive()]
             _pending_timers.append(t)
         t.daemon = True
         t.start()
     else:
         _emit_pos(final_source_ms, buffer_id)
+
+
+def _cancel_pending_timers() -> None:
+    """Cancel and clear all pending end-of-buffer Timers. Called when a
+    SEEK lands so stale Timers (scheduled for buffers we've now jumped
+    past or away from) don't emit stray POSs against the new playhead.
+    Safe to call any time."""
+    with _pending_timers_lock:
+        for t in _pending_timers:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        _pending_timers.clear()
 
 
 def _player_loop() -> None:
@@ -505,8 +523,13 @@ def _player_loop() -> None:
         # visual lands exactly where the user seeked to (no audio in flight
         # to lead with).
         if seek_ms is not None and seek_ms != 0:
+            # Seek invalidates any in-flight end-of-buffer Timers; firing
+            # them now would emit a POS for a buffer the user has scrubbed
+            # past, racing the post-seek POS.
+            _cancel_pending_timers()
             with _lock:
                 _resolve_seek_ms_unlocked(seek_ms)
+                playhead_idx_after_seek = _playhead_idx
                 if _playhead_idx < len(_history):
                     buf_id, samples, tempo = _history[_playhead_idx]
                     seek_source_ms = (
@@ -518,7 +541,7 @@ def _player_loop() -> None:
             if buf_id >= 0:
                 _emit_pos(seek_source_ms, buf_id)
                 last_emit_pos = int(seek_source_ms)
-            last_emit_buf_idx = _playhead_idx
+            last_emit_buf_idx = playhead_idx_after_seek
 
         # End-of-playback handshake. Fires only when EXIT was sent AND
         # the queue is empty AND pending Timers are done AND the playhead
@@ -591,10 +614,10 @@ def _player_loop() -> None:
         chunk = samples[offset:end]
         _stream_write(chunk)
         with _lock:
-            # Only advance if no concurrent SEEK landed elsewhere mid-write.
-            if (_playhead_idx == last_emit_buf_idx
-                    and _playhead_offset == offset):
-                _playhead_offset = end
+            # Only the player thread mutates _playhead_idx/offset, and SEEKs
+            # are processed at the top of this loop, so nothing else moved
+            # the playhead between snapshot and here. Just advance.
+            _playhead_offset = end
 
         # Emit POS in source-domain time, compensated for audio-leads-visual.
         # See the original derivation comment retained on the SEEK command.
@@ -644,13 +667,7 @@ def _shutdown() -> None:
     """
     global _stream, _shutdown_requested
     # 1) Cancel any pending POS Timers.
-    with _pending_timers_lock:
-        for t in _pending_timers:
-            try:
-                t.cancel()
-            except Exception:
-                pass
-        _pending_timers.clear()
+    _cancel_pending_timers()
     # 2) Signal the player thread.
     with _lock:
         _shutdown_requested = True
