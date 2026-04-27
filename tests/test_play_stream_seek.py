@@ -43,12 +43,13 @@ _sf_stub.read = MagicMock(return_value=(np.zeros((100,), dtype="float32"), 24000
 _sf_stub.write = MagicMock()
 sys.modules.setdefault("soundfile", _sf_stub)
 
-_scipy_signal = types.ModuleType("scipy.signal")
+# Additive stub: re-use any scipy.signal module already in sys.modules so
+# server-side tests' lfilter and our resample_poly co-exist regardless of
+# collection order (otherwise setdefault no-ops the second installer).
+_scipy_signal = sys.modules.setdefault("scipy.signal", types.ModuleType("scipy.signal"))
 _scipy_signal.resample_poly = lambda x, up, down: x
-_scipy = types.ModuleType("scipy")
+_scipy = sys.modules.setdefault("scipy", types.ModuleType("scipy"))
 _scipy.signal = _scipy_signal
-sys.modules.setdefault("scipy", _scipy)
-sys.modules.setdefault("scipy.signal", _scipy_signal)
 
 _spec.loader.exec_module(_ps)
 

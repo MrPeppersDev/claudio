@@ -164,4 +164,7 @@ run(
 # --- Summary ---
 print()
 print(f"Results: {tests_passed} passed, {tests_failed} failed")
-sys.exit(0 if tests_failed == 0 else 1)
+# sys.exit only on failure so pytest collection (which executes module-level
+# code) doesn't trip on a successful run. Matches test_preprocess_sentences.py.
+if tests_failed:
+    sys.exit(1)

@@ -14,12 +14,14 @@ import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-_scipy_signal = types.ModuleType("scipy.signal")
+# Additive stub: re-use any scipy.signal module already in sys.modules so
+# multiple test files can install their own attributes (lfilter for server
+# tests, resample_poly for play-stream tests) without clobbering each other
+# via setdefault no-ops.
+_scipy_signal = sys.modules.setdefault("scipy.signal", types.ModuleType("scipy.signal"))
 _scipy_signal.lfilter = lambda b, a, x: x
-_scipy = types.ModuleType("scipy")
+_scipy = sys.modules.setdefault("scipy", types.ModuleType("scipy"))
 _scipy.signal = _scipy_signal
-sys.modules.setdefault("scipy", _scipy)
-sys.modules.setdefault("scipy.signal", _scipy_signal)
 
 _kokoro_onnx = types.ModuleType("kokoro_onnx")
 
@@ -93,8 +95,11 @@ class TestFailOpen:
 
 class TestTrims:
     def test_trims_prefix_at_gap(self):
-        prefix = _tone(300)          # "banana"
-        gap = _silence(100)          # post-comma pause, ≥60ms dwell
+        # Prefix must be ≥ HEAD_TRIM_MIN_CUT_AT_1X_MS (430ms) so the cut
+        # offset clears the min-cut guardrail. Real "banana, " prefixes at
+        # 1x speed land in the 430–700ms range; 500ms is a realistic value.
+        prefix = _tone(500)          # "banana, "
+        gap = _silence(100)          # post-comma pause, ≥20ms dwell
         body = _tone(500)            # "recap..."
         samples = np.concatenate([prefix, gap, body])
 
@@ -107,8 +112,8 @@ class TestTrims:
         # for the frame-aligned cut.
         body_ms = out.size * 1000 / SR
         assert body_ms >= (500 - 20), f"body truncated: only {body_ms:.1f}ms remains"
-        # The cut lands at the end of the silent DWELL (60ms into a 100ms
-        # gap), so the first 40ms of the output are still silence — the
+        # The cut lands at the end of the silent DWELL (20ms into a 100ms
+        # gap), so the first 80ms of the output are still silence — the
         # body tone starts right after that. Check a 200ms window so we
         # straddle the leftover silence and land in the body tone.
         early = out[: int(SR * 200 / 1000)]
@@ -128,8 +133,12 @@ class TestTrims:
         assert np.array_equal(once, twice)
 
     def test_short_prefix_then_gap(self):
-        # Very short prefix — the detector still needs to find the gap.
-        prefix = _tone(80)
+        # Prefix at the lower edge of the realistic banana-prefix range —
+        # just past HEAD_TRIM_MIN_CUT_AT_1X_MS (430ms). Verifies the
+        # detector still cuts when the offset clears min_cut by a small
+        # margin (different from the comfortable 500ms in the previous
+        # test).
+        prefix = _tone(440)
         gap = _silence(80)
         body = _tone(400)
         samples = np.concatenate([prefix, gap, body])
