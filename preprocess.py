@@ -165,8 +165,12 @@ _MD_TRANSFORMS = [
 
     # Unordered bullets — strip the marker; the newline already gives a pause.
     (re.compile(r"(?m)^(\s*)[-*+]\s+"), r"\1"),
-    # Ordered list markers — strip "N." prefix.
-    (re.compile(r"(?m)^(\s*)\d+\.\s+"), r"\1"),
+    # Ordered list markers — keep the number so the listener hears "one, two,
+    # three" as they go by, but turn the period into a comma. The period
+    # would otherwise register as an end-of-sentence and (a) drop the number
+    # from the following phrase's prosody and (b) get eaten as a bare
+    # sentence fragment by pysbd in some pathological cases.
+    (re.compile(r"(?m)^(\s*)(\d+)\.\s+"), r"\1\2, "),
 
     # Collapse runs of 3+ blank lines to 2 (avoids long dead-air after
     # large code-block removals).

@@ -12,6 +12,24 @@
 
 local M = {}
 
+local rsvp = require("rsvp")
+
+-- RSVP wiring state. Reset on every runPlayScript spawn.
+--   controlFifoPath: path to the command FIFO advertised by kokoro-tts.sh via
+--     its "CTRL <path>" stderr line. Lives only for the duration of one play
+--     task; cleanup() in kokoro-tts.sh unlinks it when the task exits.
+--   stderrBuffer: partial-line accumulator. hs.task stream callbacks deliver
+--     arbitrarily-chunked stderr; we split on \n and flush line-by-line.
+--   userInitiatedStop: set by M.toggle when the user is stopping in-flight
+--     playback. The dying task's exit callback consumes the flag so a
+--     SIGKILL fallback (exit 9) is treated like a clean SIGTERM rather
+--     than firing an alert. The grace period in play-last.sh's stop path
+--     should make SIGKILL rare, but cleanup work that runs over budget on
+--     a busy system shouldn't surface as a "Claudio error".
+local controlFifoPath = nil
+local stderrBuffer = ""
+local userInitiatedStop = false
+
 local HOME = os.getenv("HOME")
 -- CLAUDIO_DIR = repo (scripts, venv, model files). Defaults to the install
 -- location that install.sh created, but overridable so the repo can live
@@ -265,12 +283,141 @@ end
 -- Script runner (async — don't block Hammerspoon on synthesis)
 -- ============================================================
 
+-- Read a sidecar JSON file produced by the Kokoro server. Returns the raw
+-- JSON text (rsvp.feedSidecar does its own decode) or nil if unreadable.
+-- Missing files are expected when the server ran without a patched model —
+-- not an error, just "no word timings available for this buffer."
+local function loadSidecar(path)
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local content = f:read("*a")
+  f:close()
+  return content
+end
+
+-- Append a line (PAUSE / RESUME / SEEK <ms>) to the control FIFO so the
+-- shell subshell forwards it to play-stream.py's fd 9. Uses hs.task so the
+-- write happens off the main thread — if the FIFO has no reader (stale job,
+-- dead subshell), a direct io.open(fifo, "w") would block HS's main loop
+-- indefinitely. The shell redirect still blocks in its own process but that
+-- process is detached from HS, and the hs.timer cleans it up after 500 ms.
+-- Whitelist is enforced on the shell side (PAUSE|RESUME|"SEEK "*) so
+-- line contents can't drive arbitrary commands even with shell escaping.
+local function writeControl(line)
+  if not controlFifoPath then return end
+  -- Race guard: kokoro-tts.sh's cleanup() unlinks the FIFO when its task
+  -- exits, but its EXIT trap, the play-stream DRAIN_DONE handshake, and a
+  -- late RSVP click all happen on independent timelines. If we shell out
+  -- after the FIFO is gone, `printf > path` creates a *regular* file —
+  -- which then accumulates as control.* turds in $STATE_DIR. Stat first;
+  -- if the path no longer resolves to a named pipe, drop the line on the
+  -- floor. The completion callback in runPlayScript will null out
+  -- controlFifoPath once the task finishes, so subsequent calls bail at
+  -- the nil check above.
+  local attrs = hs.fs.attributes(controlFifoPath)
+  if not attrs or attrs.mode ~= "named pipe" then return end
+  local t = hs.task.new("/bin/sh", nil, {
+    "-c", [[printf '%s\n' "$1" > "$2" 2>/dev/null]],
+    "--", line, controlFifoPath,
+  })
+  if not t then return end
+  t:start()
+  hs.timer.doAfter(0.5, function()
+    if t and t:isRunning() then t:terminate() end
+  end)
+end
+
+-- Parse one stderr line from the play task. Protocol:
+--   POS <ms> <buffer_id>      → drive the RSVP word highlight
+--   SIDECAR <buffer_id> <path> → load sidecar JSON, feed to rsvp
+--   CTRL <fifo_path>          → remember the command FIFO path
+-- Any other line (e.g. shell diagnostics) is ignored — play-stream already
+-- logs its own state to play.log, so nothing else on this channel matters.
+local function processStderrLine(line)
+  local prefix = line:sub(1, 4)
+  if prefix == "POS " then
+    local ms_s, id_s = line:match("^POS (%d+) (%d+)$")
+    if ms_s and id_s then
+      rsvp.onPos(tonumber(ms_s), tonumber(id_s))
+    end
+    return
+  end
+  if line:sub(1, 8) == "SIDECAR " then
+    local id_s, path = line:match("^SIDECAR (%d+) (.+)$")
+    if id_s and path then
+      local json = loadSidecar(path)
+      if json then
+        rsvp.feedSidecar(tonumber(id_s), json)
+      end
+    end
+    return
+  end
+  if line:sub(1, 5) == "CTRL " then
+    local path = line:match("^CTRL (.+)$")
+    if path then
+      controlFifoPath = path
+    end
+  end
+end
+
 local function runPlayScript(args)
+  -- Per-run state reset. Leftover controlFifoPath from a prior run would
+  -- point at an already-unlinked FIFO; writing to it is a silent no-op but
+  -- clearer to just drop the reference. Stderr partial-line buffer is also
+  -- per-run: we don't want a half-line from a crashed prior task bleeding
+  -- into the next task's first line.
+  controlFifoPath = nil
+  stderrBuffer = ""
+
   hs.task.new("/bin/bash",
     function(code)
-      if code ~= 0 and code ~= 143 then -- 143 = SIGTERM on stop; not an error
+      -- Flush any trailing unterminated line (normally there isn't one —
+      -- kokoro-tts.sh ends with newline-terminated output — but if the
+      -- task died mid-write we'd miss the last event without this).
+      if stderrBuffer ~= "" then
+        processStderrLine(stderrBuffer)
+        stderrBuffer = ""
+      end
+      controlFifoPath = nil
+      -- Two task callbacks share userInitiatedStop when M.toggle's stop
+      -- branch runs: the stopper task (which just kills the original and
+      -- exits 0) and the original playback task (143 or 9). Snapshot the
+      -- flag first, then clear only on signal-shaped exits (9, 143) — the
+      -- code-0 stopper must not consume what the original is about to
+      -- read. Clearing on 143 too prevents a stranded flag from masking a
+      -- future real code-9 crash.
+      local wasUserStop = userInitiatedStop
+      if wasUserStop and (code == 9 or code == 143) then
+        userInitiatedStop = false
+      end
+      local userStop = wasUserStop and code == 9
+      -- Clean playback finish: trigger the balloon's linger-fade. SIGTERM
+      -- (143, from user Stop) is handled separately in M.toggle where
+      -- rsvp.hide() fires immediately. Non-zero non-143 is a real error;
+      -- we still want the balloon cleared so a crashed task doesn't leave
+      -- it dangling, so hide it directly.
+      if code == 0 or code == 143 or userStop then
+        rsvp.endOfStream()
+      else
+        rsvp.hide()
         hs.alert.show("Claudio error (exit " .. code .. ")")
       end
+    end,
+    function(_, _, stderr)
+      -- Stream callback. Buffer stderr chunks and emit complete lines.
+      if stderr and stderr ~= "" then
+        stderrBuffer = stderrBuffer .. stderr
+        while true do
+          local nl = stderrBuffer:find("\n", 1, true)
+          if not nl then break end
+          local line = stderrBuffer:sub(1, nl - 1)
+          stderrBuffer = stderrBuffer:sub(nl + 1)
+          if line ~= "" then
+            processStderrLine(line)
+          end
+        end
+      end
+      return true  -- keep streaming
     end,
     args
   ):start()
@@ -280,13 +427,89 @@ end
 -- Selection capture (AX → Cmd+C → copy-on-select terminal fallback)
 -- ============================================================
 
+-- Pull the selected text via Accessibility without touching the keyboard
+-- or clipboard. Avoiding Cmd+C matters when other apps (e.g. Wispr Flow)
+-- watch clipboard changes or intercept keyDown events, because that round-
+-- trip introduces cross-app contention that can make F13 feel frozen.
+--
+-- Tries, in order:
+--   1. AXSelectedText on the focused element — the obvious path, works
+--      in native Cocoa apps (TextEdit, Notes, Safari native views).
+--   2. AXStringForRange(AXSelectedTextRange) on the focused element —
+--      Chromium/Electron renderers expose this where AXSelectedText is
+--      empty. VS Code, Chrome, Arc, Cursor, Slack all fall here.
+--   3. Walk up the parent chain once in case the focus landed on a
+--      wrapper element rather than the text view that owns the
+--      selection (common in custom text widgets and some Electron apps).
+--
+-- Returns the selected string, or nil if every path came up dry.
 local function axSelection()
   local okCall, sys = pcall(hs.axuielement.systemWideElement)
   if not okCall or not sys then return nil end
   local focused = sys:attributeValue("AXFocusedUIElement")
   if not focused then return nil end
-  local text = focused:attributeValue("AXSelectedText")
-  if type(text) == "string" and #text > 0 then return text end
+
+  local function tryElement(el)
+    if not el then return nil end
+    local ok, text = pcall(function() return el:attributeValue("AXSelectedText") end)
+    if ok and type(text) == "string" and #text > 0 then return text end
+    local okr, range = pcall(function() return el:attributeValue("AXSelectedTextRange") end)
+    if okr and range then
+      local okq, str = pcall(function()
+        return el:parameterizedAttributeValue("AXStringForRange", range)
+      end)
+      if okq and type(str) == "string" and #str > 0 then return str end
+    end
+    return nil
+  end
+
+  local text = tryElement(focused)
+  if text then return text end
+
+  -- Second chance: focus landed on a wrapper; try the parent once.
+  local okP, parent = pcall(function() return focused:attributeValue("AXParent") end)
+  if okP and parent then
+    text = tryElement(parent)
+    if text then return text end
+  end
+
+  return nil
+end
+
+-- Compute a screen-space anchor rect for "where the user's attention is."
+-- Preference order:
+--   1. AX bounds for the focused element's selected text range — precise rect
+--      around the actual highlighted glyphs. Works in TextEdit, Safari, Notes,
+--      VS Code, most native apps. Falls through silently when the focused
+--      element doesn't implement AXBoundsForRange (some Electron, Chromium
+--      renderers).
+--   2. Mouse cursor position — users who drag to highlight end with the mouse
+--      hovering at the end of the selection, so this is a good proxy.
+--   3. nil — rsvp.lua falls back to menubar-anchored positioning.
+-- Returns a rect { x, y, w, h } in global screen coordinates, or nil.
+local function selectionAnchorRect()
+  local okCall, sys = pcall(hs.axuielement.systemWideElement)
+  if okCall and sys then
+    local focused = sys:attributeValue("AXFocusedUIElement")
+    if focused then
+      local range = focused:attributeValue("AXSelectedTextRange")
+      if range then
+        local ok_bounds, bounds = pcall(function()
+          return focused:parameterizedAttributeValue("AXBoundsForRange", range)
+        end)
+        if ok_bounds and type(bounds) == "table"
+           and bounds.x and bounds.y and bounds.w and bounds.h
+           and bounds.w > 0 and bounds.h > 0 then
+          return { x = bounds.x, y = bounds.y, w = bounds.w, h = bounds.h }
+        end
+      end
+    end
+  end
+  local ok_mouse, p = pcall(hs.mouse.absolutePosition)
+  if ok_mouse and p and p.x and p.y then
+    -- Treat as a tiny rect so rsvp.lua's above/below fallback logic still works.
+    return { x = p.x - 8, y = p.y - 12, w = 16, h = 24 }
+  end
   return nil
 end
 
@@ -417,14 +640,30 @@ end
 
 function M.toggle()
   if jobIsRunning() then
+    -- Mark this stop as user-initiated so the dying task's exit callback
+    -- doesn't fire a "Claudio error (exit 9)" alert if SIGKILL is needed.
+    userInitiatedStop = true
     runPlayScript({ PLAY_SCRIPT })
+    -- Stop kills play-stream abruptly — POS events halt and rsvp would sit
+    -- on its last word forever waiting for the linger timer that never
+    -- arms (the linger trigger only fires when POS crosses last_word.end_ms).
+    rsvp.hide()
     return
   end
+
+  -- Snapshot the anchor rect *before* captureSelection goes async. The AX
+  -- and mouse state is most reliable in the instant the user presses F13;
+  -- after the Cmd+C fallback path runs, focus and selection can shift.
+  local anchor = selectionAnchorRect()
 
   captureSelection(function(selection, hint)
     if selection then
       local tmp = selectionToTempfile(selection)
       if tmp then
+        -- Show the balloon empty; the first SIDECAR event will populate it.
+        -- Delaying this until after the first SIDECAR would leave F13 with
+        -- no visible response for ~500ms-2s of synth time.
+        rsvp.show(nil, { anchor = anchor })
         runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
       end
     elseif hint and hint.pdfPath then
@@ -448,6 +687,7 @@ function M.toggle()
             if f then
               f:write(stdout)
               f:close()
+              rsvp.show(nil, { anchor = anchor })
               runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
             else
               os.remove(tmp)
@@ -782,6 +1022,22 @@ function M.start()
   menubar:setTitle("▸")
   -- Dropdown menu. Using a function makes the menu content dynamic each open.
   menubar:setMenu(buildMenu)
+
+  -- RSVP → play-stream command hookup. Set once; the callbacks read the
+  -- current controlFifoPath, which runPlayScript resets per task. No-op if
+  -- no task is running (writeControl bails when controlFifoPath is nil).
+  rsvp.on_pause_request  = function() writeControl("PAUSE") end
+  rsvp.on_resume_request = function() writeControl("RESUME") end
+  rsvp.on_seek_request   = function(delta_ms)
+    writeControl("SEEK " .. tostring(delta_ms))
+  end
+  -- × button in the balloon: same semantics as F13-during-playback — stop
+  -- the TTS job (if any) and clear the balloon. Without the stop, audio
+  -- keeps playing after the balloon disappears.
+  rsvp.on_close_request  = function()
+    if jobIsRunning() then runPlayScript({ PLAY_SCRIPT }) end
+    rsvp.hide()
+  end
 
   watcher = hs.pathwatcher.new(STATE_DIR, function() render() end)
   watcher:start()

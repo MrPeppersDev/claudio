@@ -59,6 +59,18 @@
 #                      — the previous single-sample threshold ate release
 #                      bursts from t/p/k whose amplitude sits below 0.005.
 #                      (default: 40; 0 disables — keep Kokoro's native tail)
+#   KOKORO_AUDIO_LEAD_MS  fixed POS compensation in ms. Override for the
+#                      auto-detected sounddevice OutputStream.latency.
+#                      Subtracted from emitted source_ms so POS reflects
+#                      what's AT THE SPEAKER, not what's been written to
+#                      the ring buffer. Guarantees the RSVP visual onset
+#                      lands AT or AFTER the audio onset — Kim et al.
+#                      (2024, AJSLP) found audio lagging behind visual
+#                      measurably hurts comprehension; audio leading or
+#                      matching is the only safe direction. Default:
+#                      auto-detect via OutputStream.latency (~20-30 ms on
+#                      CoreAudio). Clamped to [0, 200]. Set to a number
+#                      to pin it, or leave unset.
 #   KOKORO_SACRIFICIAL_WORD  throwaway prefix word. Kokoro's first-token
 #                      warm-up eats the initial consonant of every sentence,
 #                      so we synth "banana, {real_text}" and the server cuts
@@ -124,14 +136,16 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
 #   3 — Sacrificial-head trim rework: relative RMS threshold + 20ms dwell
 #       + min/max cut-position guardrails. Old WAVs may have "banana,"
 #       leakage baked in from the prior detector — bump to force re-synth.
-#   4 — Strip pad-0 boundary silence in synth_with_durations. The patched-
-#       model path bypassed kokoro_onnx's built-in librosa-trim step,
-#       leaving ~100-200ms of leading silence. That silence pushed the
-#       banana+comma gap past trim_sacrificial_head's max-cut guardrail →
-#       "banana," leaked audibly on every synth. Now cut the boundary
-#       pad-0 audio using the duration predictor's own frame counts (exact,
-#       frame-aligned). v3 WAVs have silence+banana baked in — bump to
-#       re-synth and re-sidecar.
+#   4 — Two combined fixes for "banana" audibility:
+#       (a) Strip pad-0 boundary silence in synth_with_durations. The
+#           patched-model path bypassed kokoro_onnx's built-in librosa-trim
+#           step, leaving ~100-200ms of leading silence that pushed the
+#           banana+comma gap past trim_sacrificial_head's max-cut guardrail.
+#       (b) Sacrificial-head bounds anchored to first audible frame, so the
+#           detector measures "how far through banana" rather than "how far
+#           into the WAV" — defense-in-depth against any residual leading
+#           silence.
+#       v3 WAVs have leak baked in — bump to re-synth and re-sidecar.
 SYNTH_VERSION=4
 sentence_hash() {
   local text="$1"
@@ -210,8 +224,24 @@ STREAM_FIFO=""
 STREAM_PID=""
 # Track whether fd 9 is currently open so cleanup never tries to close it twice.
 STREAM_FD_OPEN=0
+# Control FIFO: optional out-of-band command channel. Hammerspoon (RSVP UI)
+# writes PAUSE/RESUME/SEEK lines to this FIFO and a background reader forwards
+# them to fd 9 (play-stream.py). Path is advertised on stderr via "CTRL <path>"
+# so hs.task's stream callback can pick it up.
+CONTROL_FIFO=""
+CONTROL_READER_PID=""
 
 cleanup() {
+  # Kill the control-fifo forwarder first. It inherited a dup of fd 9, so
+  # until it exits, play-stream.py's stdin still has a writer and won't see
+  # EOF when we close fd 9 below.
+  if [ -n "$CONTROL_READER_PID" ]; then
+    kill "$CONTROL_READER_PID" 2>/dev/null || true
+    wait "$CONTROL_READER_PID" 2>/dev/null || true
+    CONTROL_READER_PID=""
+  fi
+  [ -n "$CONTROL_FIFO" ] && rm -f "$CONTROL_FIFO"
+  CONTROL_FIFO=""
   # Close fd 9 so play-stream.py hits EOF and begins draining.
   if [ "$STREAM_FD_OPEN" -eq 1 ]; then
     exec 9>&- 2>/dev/null || true
@@ -258,6 +288,31 @@ if [ "${KOKORO_NO_PLAY:-0}" != "1" ]; then
   STREAM_FD_OPEN=1
   # Send initial playback rate.
   printf 'RATE %s\n' "$PLAYBACK_RATE" >&9
+
+  # Control FIFO: Hammerspoon's RSVP integration writes PAUSE/RESUME/SEEK
+  # commands here and the subshell forwards them to fd 9. The subshell opens
+  # the FIFO O_RDWR on fd 10 (bash `<>` redirect) so that (a) it doesn't
+  # block waiting for an external writer and (b) `read <&10` never sees EOF
+  # between HS's brief open/write/close cycles. The previous split-fd
+  # approach (exec 11>FIFO; exec 10<FIFO) deadlocked at line 1: O_WRONLY on
+  # a FIFO blocks until an O_RDONLY exists, which was the very next line.
+  CONTROL_FIFO=$(mktemp -u "$STATE_DIR/control.XXXXXX")
+  mkfifo "$CONTROL_FIFO"
+  (
+    exec 10<>"$CONTROL_FIFO"
+    while IFS= read -r line <&10; do
+      # Only forward the three commands we've agreed on — anything else
+      # would let a compromised HS script drive arbitrary play-stream
+      # commands like STOP or RATE, which isn't that channel's job.
+      case "$line" in
+        PAUSE|RESUME|"SEEK "*) printf '%s\n' "$line" >&9 ;;
+      esac
+    done
+  ) &
+  CONTROL_READER_PID=$!
+  # Advertise the FIFO to whatever's watching stderr (Hammerspoon) so it
+  # knows where to send commands. Emitted once per invocation.
+  printf 'CTRL %s\n' "$CONTROL_FIFO" >&2
 fi
 
 # Interleaved synth + playback. Each iteration resolves its sentence's WAV
@@ -401,6 +456,15 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
     fi
 
     play_id=$((play_id + 1))
+    # Announce the timing sidecar (if written) on stderr so Hammerspoon
+    # can feed it to the RSVP balloon before POS events for this buffer
+    # arrive. The server only writes the .words.json when the patched
+    # model has duration outputs; absence is fine — balloon just stays
+    # empty and later words from a working buffer will populate it.
+    sidecar_path="${cache_wav%.wav}.words.json"
+    if [ -f "$sidecar_path" ]; then
+      printf 'SIDECAR %s %s\n' "$play_id" "$sidecar_path" >&2
+    fi
     printf 'PLAY %s %s\n' "$play_id" "$cache_wav" >&9
     seg_has_audio=1
     first_sentence=0
@@ -408,15 +472,37 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
   [ "$seg_has_audio" -eq 1 ] && first_seg=0
 done
 
-# Close fd 9 so play-stream.py sees EOF, drains, and exits cleanly.
+# Tell play-stream we're done queueing audio. It will drain its internal
+# queue and exit cleanly. We deliberately do NOT close fd 9 yet, and we
+# leave CONTROL_READER alive — that keeps Hammerspoon's PAUSE/RESUME/SEEK
+# channel functional through the entire end-of-playback drain (~30s for a
+# paragraph). Closing fd 9 first or killing the forwarder first leaves the
+# user with no controls during drain.
 if [ "$STREAM_FD_OPEN" -eq 1 ]; then
-  exec 9>&-
-  STREAM_FD_OPEN=0
+  printf 'EXIT\n' >&9
 fi
-# Wait for the last audio to finish playing before returning to the caller.
+
+# Wait for play-stream.py to finish its queue and exit. CONTROL plumbing
+# is still wired so user controls keep working until this returns.
 if [ -n "$STREAM_PID" ]; then
   wait "$STREAM_PID" 2>/dev/null || true
   STREAM_PID=""
+fi
+
+# Now safe to tear down the control plumbing — play-stream is gone, so
+# any stragglers from Hammerspoon would have nowhere useful to go anyway.
+if [ -n "$CONTROL_READER_PID" ]; then
+  kill "$CONTROL_READER_PID" 2>/dev/null || true
+  wait "$CONTROL_READER_PID" 2>/dev/null || true
+  CONTROL_READER_PID=""
+fi
+[ -n "$CONTROL_FIFO" ] && rm -f "$CONTROL_FIFO"
+CONTROL_FIFO=""
+
+# Close fd 9 (bookkeeping only — play-stream already exited above).
+if [ "$STREAM_FD_OPEN" -eq 1 ]; then
+  exec 9>&-
+  STREAM_FD_OPEN=0
 fi
 
 # Prune only when we actually added bytes. On a pure cache-hit run (the

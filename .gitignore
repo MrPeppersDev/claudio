@@ -42,6 +42,9 @@ __pycache__/
 # Benchmark artifacts (wav clips + spectrograms — not committed, for local A/B listening)
 bench/
 
+# graphify knowledge-graph artifacts (regenerable from `graphify update .`)
+graphify-out/
+
 # Claude Code per-session scratch: notes, worktrees, session state. The
 # committed CLAUDE.md at repo root is the evergreen project-guide half;
 # this directory holds the in-flight stuff (SESSION.md, agent worktrees)

@@ -73,8 +73,15 @@ local ANIMATE_OUT_MS  = 300    -- fade-out duration (CSS handles this)
 -- Gap between the bottom of the menubar icon and the top of the balloon (px).
 local ICON_GAP = 4
 
+-- Gap between the anchor (selected text rect) and the balloon edge when
+-- positioning in "above the selection" / "below the selection" mode.
+local ANCHOR_GAP = 12
+
+-- Screen-edge safety margin when clamping balloon position.
+local SCREEN_PAD = 12
+
 -- How long (seconds) to linger after the last word before fade-out.
-local LINGER_SECS = 2.0
+local LINGER_SECS = 1.25
 
 -- Keyboard scrub increment (milliseconds per ← / → keypress).
 local SEEK_DELTA_MS = 2000
@@ -82,9 +89,9 @@ local SEEK_DELTA_MS = 2000
 -- ── State ─────────────────────────────────────────────────────────────────────
 
 local _webview      = nil    -- hs.webview instance (nil when hidden)
-local _hotkeys      = {}     -- list of hs.hotkey bindings active while balloon is visible
 local _lingerTimer  = nil    -- hs.timer: fires after LINGER_SECS to begin fade-out
 local _animTimer    = nil    -- hs.timer: used during animate-in
+local _pollTimer    = nil    -- hs.timer: polls window.__claudio_q for button clicks
 local _htmlPath     = nil    -- absolute path to rsvp.html
 
 -- Per-buffer sidecar cache: buffer_id (number) → parsed sidecar table
@@ -105,6 +112,7 @@ local _lastPosMs = nil
 M.on_pause_request  = nil    -- function()
 M.on_resume_request = nil    -- function()
 M.on_seek_request   = nil    -- function(delta_ms)
+M.on_close_request  = nil    -- function()  -- user clicked × button
 
 -- ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -189,6 +197,50 @@ local function balloonStartRect(iconFrame, targetRect)
   }
 end
 
+-- Pick the screen that best contains a given rect's center point. Falls back
+-- to mainScreen() if hs.screen.find isn't available or nothing matches.
+local function screenForRect(r)
+  local cx = r.x + r.w / 2
+  local cy = r.y + r.h / 2
+  local ok, found = pcall(hs.screen.find, hs.geometry.point(cx, cy))
+  if ok and found then return found end
+  for _, s in ipairs(hs.screen.allScreens()) do
+    local sf = s:fullFrame()
+    if cx >= sf.x and cx <= sf.x + sf.w
+       and cy >= sf.y and cy <= sf.y + sf.h then
+      return s
+    end
+  end
+  return hs.screen.mainScreen()
+end
+
+-- Compute the target balloon rect anchored relative to a screen-space
+-- selection bounding rect. Prefers "above the anchor" so the balloon
+-- doesn't cover the text the user is still reading; falls through to
+-- "below" if above would clip off the top of the screen.
+local function balloonTargetRectForAnchor(anchorRect)
+  local screen = screenForRect(anchorRect)
+  local sf = screen:frame()   -- usable area (excludes menu bar + Dock)
+
+  local bx = anchorRect.x + anchorRect.w / 2 - BALLOON_WIDTH / 2
+  local by_above = anchorRect.y - BALLOON_HEIGHT - ANCHOR_GAP
+  local by_below = anchorRect.y + anchorRect.h + ANCHOR_GAP
+
+  local by
+  if by_above >= sf.y + SCREEN_PAD then
+    by = by_above
+  else
+    by = by_below
+  end
+
+  bx = math.max(sf.x + SCREEN_PAD,
+                math.min(bx, sf.x + sf.w - BALLOON_WIDTH - SCREEN_PAD))
+  by = math.max(sf.y + SCREEN_PAD,
+                math.min(by, sf.y + sf.h - BALLOON_HEIGHT - SCREEN_PAD))
+
+  return { x = bx, y = by, w = BALLOON_WIDTH, h = BALLOON_HEIGHT }
+end
+
 -- Call a JS function on the webview (fire-and-forget; errors logged to console).
 local function jsCall(fn, ...)
   if not _webview then return end
@@ -221,6 +273,69 @@ local function jsCall(fn, ...)
   end)
 end
 
+-- ── Hover-button bridge ─────────────────────────────────────────────────────
+--
+-- rsvp.html buttons push command strings onto window.__claudio_q. We poll
+-- that queue every ~80 ms, drain it, and dispatch. This was the fallback
+-- after the rsvp:// URL-scheme approach failed — WKWebView either swallows
+-- unknown schemes or fires the navigationCallback too late to intercept.
+
+-- Polling cadence for window.__claudio_q. 200 ms gives "imperceptible"
+-- button latency (well under the 300 ms reaction-time threshold) while
+-- halving main-thread contention vs. 80 ms — important because POS events
+-- from play-stream.py parse on the same main thread, and any contention
+-- shows up as audio/RSVP drift.
+local POLL_INTERVAL = 0.20
+
+local function dispatchCmd(cmd)
+  if cmd == "toggle_pause" then
+    if _isPaused then M.resume() else M.pause() end
+  elseif cmd == "pause_only" then
+    if not _isPaused then M.pause() end
+  elseif cmd == "seek_back" then
+    if M.on_seek_request then M.on_seek_request(-SEEK_DELTA_MS) end
+  elseif cmd == "seek_fwd" then
+    if M.on_seek_request then M.on_seek_request(SEEK_DELTA_MS) end
+  elseif cmd == "close" then
+    if M.on_close_request then
+      M.on_close_request()
+    else
+      M.hide()
+    end
+  end
+end
+
+local function startPolling()
+  if _pollTimer then return end
+  -- Keep the JS a single expression — WKWebView evaluates in script-tag
+  -- context, so a top-level `return` is a syntax error. The trailing
+  -- expression is what gets returned to Lua.
+  local js = "var q=window.__claudio_q||[];window.__claudio_q=[];JSON.stringify(q)"
+  _pollTimer = hs.timer.doEvery(POLL_INTERVAL, function()
+    if not _webview then return end
+    _webview:evaluateJavaScript(js, function(result, err)
+      -- Some HS/WebKit versions hand back a sentinel err table with code=0
+      -- on success. Treat as a real error only when we also have no result.
+      if err and not result then return end
+      if not result then return end
+      local s = tostring(result)
+      if s == "" or s == "[]" then return end
+      local ok, cmds = pcall(hs.json.decode, s)
+      if not ok or type(cmds) ~= "table" then return end
+      for _, cmd in ipairs(cmds) do
+        if type(cmd) == "string" then dispatchCmd(cmd) end
+      end
+    end)
+  end)
+end
+
+local function stopPolling()
+  if _pollTimer then
+    _pollTimer:stop()
+    _pollTimer = nil
+  end
+end
+
 -- Cancel any pending linger timer.
 local function cancelLinger()
   if _lingerTimer then
@@ -229,17 +344,14 @@ local function cancelLinger()
   end
 end
 
--- Destroy the webview and clean up all hotkeys/timers.
+-- Destroy the webview and clean up the eventtap/timers.
 local function destroyWebview()
   cancelLinger()
+  stopPolling()
   if _animTimer then
     _animTimer:stop()
     _animTimer = nil
   end
-  for _, hk in ipairs(_hotkeys) do
-    hk:delete()
-  end
-  _hotkeys = {}
   if _webview then
     _webview:delete()
     _webview = nil
@@ -262,35 +374,11 @@ local function beginFadeOut()
   end)
 end
 
--- Register hotkeys that are only active while the balloon is visible.
-local function registerHotkeys()
-  -- Esc → pause
-  table.insert(_hotkeys, hs.hotkey.new({}, "escape", function()
-    M.pause()
-  end))
-
-  -- Space → resume
-  table.insert(_hotkeys, hs.hotkey.new({}, "space", function()
-    M.resume()
-  end))
-
-  -- ← → scrub
-  table.insert(_hotkeys, hs.hotkey.new({}, "left", function()
-    if M.on_seek_request then
-      M.on_seek_request(-SEEK_DELTA_MS)
-    end
-  end))
-
-  table.insert(_hotkeys, hs.hotkey.new({}, "right", function()
-    if M.on_seek_request then
-      M.on_seek_request(SEEK_DELTA_MS)
-    end
-  end))
-
-  for _, hk in ipairs(_hotkeys) do
-    hk:enable()
-  end
-end
+-- Space/Esc/←/→ are handled via JS keydown listeners in rsvp.html that push
+-- commands into the same __claudio_q queue the hover buttons use. The Lua
+-- side picks them up through startPolling()/dispatchCmd. Scope is identical
+-- to the buttons — only fires while the webview content has focus, so keys
+-- pass through to other apps unchanged when the balloon isn't focused.
 
 -- ── Linger + last-word detection ─────────────────────────────────────────────
 
@@ -305,11 +393,16 @@ end
 
 -- ── Public API ────────────────────────────────────────────────────────────────
 
---- show(sidecar_path)
+--- show(sidecar_path, opts)
 --- Load sidecar JSON, create the webview, animate it open.
 --- sidecar_path may be nil (start empty; PR 4 will call feedSidecar before
 --- the first POS events arrive).
-function M.show(sidecar_path)
+--- opts is an optional table:
+---   opts.anchor = { x, y, w, h }   -- screen-space rect around the user's
+---     focused text (selection bounds or mouse cursor). When present, the
+---     balloon positions itself just above (or below, if above clips) that
+---     rect instead of under the menubar icon.
+function M.show(sidecar_path, opts)
   -- If already visible, just reload with new sidecar.
   if _webview then
     M.hide()
@@ -335,10 +428,20 @@ function M.show(sidecar_path)
     end
   end
 
-  -- Determine icon position.
-  local iconFrame  = menubarFrame()
-  local targetRect = balloonTargetRect(iconFrame)
-  local startRect  = balloonStartRect(iconFrame, targetRect)
+  -- Decide where to place the balloon. Anchor mode (selection/mouse rect)
+  -- pops in at final size with a fade; menubar mode grows from the icon.
+  local anchor     = opts and opts.anchor
+  local targetRect
+  local startRect
+  local anchorMode = anchor ~= nil
+  if anchorMode then
+    targetRect = balloonTargetRectForAnchor(anchor)
+    startRect  = targetRect   -- pop-in; CSS handles the fade
+  else
+    local iconFrame = menubarFrame()
+    targetRect = balloonTargetRect(iconFrame)
+    startRect  = balloonStartRect(iconFrame, targetRect)
+  end
 
   -- Create webview starting at collapsed height.
   local wm = hs.webview.windowMasks
@@ -353,31 +456,18 @@ function M.show(sidecar_path)
   _webview:windowStyle(wm.borderless)
   _webview:transparent(true)
   _webview:bringToFront(true)
-  -- Block link clicks / form navigation: any navigation attempt other than
-  -- our initial file:// load returns false (blocked).
-  _webview:navigationCallback(function(action, wv, navID, url)
-    -- Allow the initial HTML load, block everything else.
-    if action == "didFinishNavigation" or action == "didStartProvisionalNavigation" then
-      return true
-    end
-    if action == "navigating" then
-      -- Our own file:// load is always permitted.
-      if url and url:sub(1, 7) == "file://" then return true end
-      return false
-    end
-    return true
-  end)
+  -- Required so clicks make the webview content firstResponder; without it
+  -- the JS keydown listener for Space/Esc/←/→ never fires.
+  if _webview.allowTextEntry then _webview:allowTextEntry(true) end
 
-  -- Load the HTML file.
-  local url = "file://" .. htmlPath()
-  _webview:url(url)
-
-  _webview:show()
-
-  -- Once the page is loaded, inject sidecar and fade in.
-  -- hs.webview doesn't expose a reliable onload callback in all versions,
-  -- so we use a short timer to let the page settle before injecting JS.
-  hs.timer.doAfter(0.15, function()
+  -- Fires once when the HTML has finished loading (triggered by the
+  -- navigationCallback didFinishNavigation event, or by the safety-net
+  -- timer if that event doesn't reach us). Idempotent via _pageReadyFired
+  -- so double-fire is a no-op.
+  local pageReadyFired = false
+  local function onPageReady()
+    if pageReadyFired then return end
+    pageReadyFired = true
     if not _webview then return end
 
     -- Feed the top-level sidecar into the page.
@@ -394,9 +484,20 @@ function M.show(sidecar_path)
       end
     end
 
-    -- Animate open: grow from startRect to targetRect over ANIMATE_IN_MS.
-    -- hs.webview:setFrameWithAnimation is not available in all builds;
-    -- use hs.animate via hs.timer steps for compatibility.
+    if anchorMode then
+      -- Anchor mode: balloon is already at final rect. Just fade in the
+      -- content (CSS transition handles it) and start polling. No grow
+      -- animation — a pop-in at cursor/selection position reads as more
+      -- deliberate than a bubble unfurling from somewhere else.
+      _webview:frame(targetRect)
+      jsCall("window.rsvpFadeIn")
+      startPolling()
+      return
+    end
+
+    -- Menubar mode: grow from iconFrame collapsed rect to targetRect over
+    -- ANIMATE_IN_MS. hs.webview:setFrameWithAnimation is not available in
+    -- all builds; use hs.timer steps for compatibility.
     local steps     = 10
     local stepSecs  = (ANIMATE_IN_MS / 1000) / steps
     local step      = 0
@@ -422,12 +523,45 @@ function M.show(sidecar_path)
         _webview:frame(targetRect)
         _animTimer = nil
         jsCall("window.rsvpFadeIn")
-        -- Register hotkeys now that balloon is fully visible.
-        registerHotkeys()
+        startPolling()
       end
     end
 
     _animTimer = hs.timer.doAfter(stepSecs, doStep)
+  end
+
+  -- Block link clicks / form navigation and watch for the page-load
+  -- completion that tells us it's safe to inject JS. Our page is a single
+  -- inline-script file:// load, so by the time didFinishNavigation fires
+  -- the window.rsvp* functions are defined.
+  _webview:navigationCallback(function(action, wv, navID, url)
+    if action == "didFinishNavigation" then
+      onPageReady()
+      return true
+    end
+    if action == "didStartProvisionalNavigation" then
+      return true
+    end
+    if action == "navigating" then
+      -- Our own file:// load is always permitted.
+      if url and url:sub(1, 7) == "file://" then return true end
+      return false
+    end
+    return true
+  end)
+
+  -- Load the HTML file.
+  local url = "file://" .. htmlPath()
+  _webview:url(url)
+
+  _webview:show()
+
+  -- Safety net: some Hammerspoon builds don't deliver didFinishNavigation
+  -- for file:// URLs. If that happens, fire the ready path ourselves after
+  -- a bounded wait. Bigger than the old 150 ms so the navigation callback
+  -- is the winning path in the common case; still imperceptible on F13.
+  hs.timer.doAfter(0.5, function()
+    if not pageReadyFired then onPageReady() end
   end)
 end
 
@@ -435,6 +569,17 @@ end
 --- Immediately destroy the balloon without animation.
 function M.hide()
   destroyWebview()
+end
+
+--- endOfStream()
+--- Called by PR 4 when the play task exits cleanly. The in-stream linger
+--- trigger fires only when onPos sees ms >= last_word.end_ms, but
+--- play-stream can stop emitting POS slightly before that (tail silence,
+--- 400ms pre-roll offset, etc.), so the timer never arms and the balloon
+--- sits on-screen forever. This forces the linger-fade path regardless.
+function M.endOfStream()
+  if not _webview then return end
+  scheduleLingerFadeOut()
 end
 
 --- pause()
@@ -487,7 +632,11 @@ end
 --- Advances the word display.
 function M.onPos(ms, buffer_id)
   if not _webview then return end
-  if _isPaused then return end
+  -- No early-return on _isPaused. play-stream only emits POS during pause
+  -- when a seek has just been applied (the regular per-chunk POS emit is
+  -- skipped by the paused branch in _play_buffer), so any POS arriving
+  -- here while paused is a seek-induced visual update — exactly what the
+  -- user wants forwarded to the JS balloon.
 
   _lastPosMs = ms
 
