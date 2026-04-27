@@ -153,6 +153,32 @@ class TestSeekBackward:
         assert _ps._playhead_idx == 0
         assert _ps._playhead_offset == 0
 
+    def test_seek_when_playhead_past_end_of_history(self):
+        """Player loop's natural-advance increments _playhead_idx and resets
+        offset to 0 even when there's no next buffer yet (the queue-pull
+        happens on the *next* iteration). A SEEK landing in that window
+        used to index history out-of-bounds. Should clamp to end of last
+        buffer and proceed normally."""
+        _ps._history.append(_make_buf(0, 1000))
+        _ps._history.append(_make_buf(1, 1000))
+        _ps._playhead_idx = 2  # past end
+        _ps._playhead_offset = 0
+        with _ps._lock:
+            _ps._resolve_seek_ms_unlocked(-500)  # back into buf 1
+        assert _ps._playhead_idx == 1
+        assert abs(_current_source_ms() - 500) < 2.0
+
+    def test_forward_seek_when_playhead_past_end_no_crash(self):
+        """Same off-by-one window, forward seek with empty queue: must
+        clamp at end of last history buffer rather than crash."""
+        _ps._history.append(_make_buf(0, 500))
+        _ps._playhead_idx = 1  # past end
+        _ps._playhead_offset = 0
+        with _ps._lock:
+            _ps._resolve_seek_ms_unlocked(2000)  # would walk forward
+        assert _ps._playhead_idx == 0
+        assert _ps._playhead_offset == len(_ps._history[0][1])
+
 
 # ---------------------------------------------------------------------------
 # Forward seek across buffer boundary

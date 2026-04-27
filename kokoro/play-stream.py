@@ -339,6 +339,14 @@ def _resolve_seek_ms_unlocked(delta_ms: int) -> None:
                 # but if somehow we got a SEEK before any item materialised,
                 # there's nothing to seek into.
 
+    # Player loop's natural-advance leaves _playhead_idx == len(_history)
+    # momentarily — between the increment at end-of-buffer and the next
+    # iteration's queue-pull. A SEEK arriving in that window would index
+    # past the end. Treat the playhead as parked at end of last buffer.
+    if _playhead_idx >= len(_history):
+        _playhead_idx = len(_history) - 1
+        _playhead_offset = len(_history[_playhead_idx][1])
+
     if delta_ms > 0:
         remaining = delta_ms
         while remaining > 0:
