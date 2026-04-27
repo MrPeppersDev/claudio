@@ -68,8 +68,11 @@ SAMPLE_RATE = _ps.SAMPLE_RATE  # 24000
 def _reset_state():
     """Reset shared module-level state between tests."""
     _ps._paused = False
-    _ps._seek_delta_samples = None
+    _ps._seek_request_ms = None
     _ps._stop_requested = False
+    _ps._history = []
+    _ps._playhead_idx = 0
+    _ps._playhead_offset = 0
     # Drain the queue.
     while not _ps._audio_queue.empty():
         try:
@@ -151,56 +154,28 @@ class TestSilencePauseBackcompat:
         assert _ps._audio_queue.empty()
 
 
-class TestSeekClamping:
-    """SEEK clamps to [0, buffer_duration] inside _play_buffer."""
+class TestSeekRequestStorage:
+    """SEEK now stores a signed source-domain millisecond delta;
+    cross-buffer resolution lives in _resolve_seek_ms_unlocked, exercised
+    in tests/test_play_stream_seek.py. These tests cover only the
+    accumulator behaviour at the SEEK→state boundary."""
 
     def setup_method(self):
         _reset_state()
 
-    def test_seek_forward(self):
-        """Positive SEEK advances playhead."""
-        delta_ms = 500
-        expected_delta = int(delta_ms * SAMPLE_RATE / 1000)
+    def test_seek_forward_stored(self):
+        """Positive SEEK is stored verbatim as source-domain ms."""
         with _ps._lock:
-            _ps._seek_delta_samples = expected_delta
+            _ps._seek_request_ms = 500
         with _ps._lock:
-            got = _ps._seek_delta_samples
-        assert got == expected_delta
+            assert _ps._seek_request_ms == 500
 
-    def test_seek_backward(self):
-        """Negative SEEK rewinds playhead."""
-        delta_ms = -200
-        expected_delta = int(delta_ms * SAMPLE_RATE / 1000)
+    def test_seek_backward_stored(self):
+        """Negative SEEK is stored verbatim as source-domain ms."""
         with _ps._lock:
-            _ps._seek_delta_samples = expected_delta
+            _ps._seek_request_ms = -200
         with _ps._lock:
-            got = _ps._seek_delta_samples
-        assert got == expected_delta
-
-    def test_seek_clamp_below_zero(self):
-        """Seeking past start of buffer clamps to 0."""
-        # Simulate _play_buffer clamp logic.
-        pos = 100  # already 100 samples in
-        total = 10000
-        delta = -50000  # way before start
-        new_pos = max(0, min(total, pos + delta))
-        assert new_pos == 0
-
-    def test_seek_clamp_above_total(self):
-        """Seeking past end of buffer clamps to total."""
-        pos = 9000
-        total = 10000
-        delta = 5000  # past the end
-        new_pos = max(0, min(total, pos + delta))
-        assert new_pos == total
-
-    def test_seek_within_bounds(self):
-        """Seeking within bounds sets exact position."""
-        pos = 5000
-        total = 10000
-        delta = 2000
-        new_pos = max(0, min(total, pos + delta))
-        assert new_pos == 7000
+            assert _ps._seek_request_ms == -200
 
 
 class TestUnknownCommands:
@@ -213,14 +188,14 @@ class TestUnknownCommands:
         """State is unchanged after processing an unknown command."""
         # Verify initial state.
         assert _ps._paused is False
-        assert _ps._seek_delta_samples is None
+        assert _ps._seek_request_ms is None
         assert _ps._stop_requested is False
         assert _ps._audio_queue.empty()
         # Simulate receiving an unknown command — nothing should change.
         # (The main() loop has an implicit else: pass for unknown cmds.)
         # We verify by checking state is still clean.
         assert _ps._paused is False
-        assert _ps._seek_delta_samples is None
+        assert _ps._seek_request_ms is None
 
 
 # ---------------------------------------------------------------------------

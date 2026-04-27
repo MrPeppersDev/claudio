@@ -96,7 +96,7 @@ EDGE_FADE_MS = 3      # linear fade-in/out applied to every PLAY/EARCON buffer
 POS_CADENCE_S = 0.020  # ~20 ms between POS emissions while playing
 
 # Audio-leads-visual compensation (Kim et al. 2024, AJSLP).
-# When _play_buffer writes a chunk, POS is naturally emitted against the
+# When the player loop writes a chunk, POS is naturally emitted against the
 # write offset — but those samples are sitting in the CoreAudio ring
 # buffer and haven't reached the speaker yet. Meanwhile the pipe→Lua→JS
 # render pipeline adds its own latency. If ring > pipe, visual flashes
@@ -113,7 +113,12 @@ _STREAM_OUTPUT_LATENCY_S: float = 0.0
 
 _lock = threading.Lock()
 _paused = False          # soft-pause flag; player thread checks this
-_seek_delta_samples: Optional[int] = None  # pending relative seek; set by SEEK cmd
+# Pending relative seek in *source-domain* milliseconds. Resolution (which
+# may walk across multiple history buffers and pull from _audio_queue) is
+# done by the player thread under _lock — see _resolve_seek_ms_unlocked.
+# Source-domain rather than stretched-samples so cross-buffer math doesn't
+# need to know each buffer's tempo_factor at SEEK enqueue time.
+_seek_request_ms: Optional[int] = None
 _stop_requested = False  # STOP command sets this; player thread clears it
 _shutdown_requested = False  # set by SIGTERM / EOF cleanup; player thread exits
 _pending_timers: list = []   # threading.Timer instances to cancel on shutdown
@@ -122,11 +127,12 @@ _pending_timers_lock = threading.Lock()
 # "no more PLAYs coming"). The main thread keeps reading stdin so user
 # controls (PAUSE/RESUME/SEEK) still work through the drain. The player
 # thread, once it observes (queue empty AND kokoro_done AND pending
-# Timers finished), emits DRAIN_DONE on stderr (trackability breadcrumb)
-# and closes stdin — that signals the main thread to fall through to the
-# existing shutdown path. The shell's `wait $STREAM_PID` then returns
-# and it tears down control plumbing. No os._exit, no protocol on the
-# shell side beyond what already exists.
+# Timers finished AND playhead at end of last history buffer), emits
+# DRAIN_DONE on stderr (trackability breadcrumb) and closes stdin — that
+# signals the main thread to fall through to the existing shutdown path.
+# The shell's `wait $STREAM_PID` then returns and it tears down control
+# plumbing. No os._exit, no protocol on the shell side beyond what
+# already exists.
 _kokoro_done = False
 _drain_done_emitted = False
 
@@ -134,9 +140,39 @@ _drain_done_emitted = False
 # Each item is one of:
 #   ("samples", buffer_id: int, samples: np.ndarray, tempo_factor: float)
 #   ("silence", ms: int)
-# The player thread drains this.
+# The player thread pulls from this and appends materialized buffers to
+# _history (silence items become zero-amplitude buffers with buffer_id=-2
+# so the player loop only has to handle one kind).
 
 _audio_queue: queue.Queue = queue.Queue()
+
+# ---- playback history (for cross-sentence scrubbing) --------------------------
+#
+# Every buffer the user has heard (or is about to hear, once pulled from
+# _audio_queue) is kept here so SEEK can walk backward and forward across
+# sentence boundaries — not just within the currently-playing buffer.
+#
+# Items are tuples: (buffer_id: int, samples: np.ndarray, tempo_factor: float)
+#   buffer_id >=  0  → real synthesized speech, POS emits to RSVP
+#   buffer_id == -1  → earcon (no POS)
+#   buffer_id == -2  → materialized silence (no POS)
+#
+# _playhead_idx, _playhead_offset together identify the current playback
+# position: idx into _history, then sample offset (in stretched-sample
+# space) within that buffer. The player loop advances offset chunk by
+# chunk; on natural end-of-buffer it bumps idx and resets offset to 0.
+#
+# Eviction (200 MB byte cap): when an append would push total bytes over
+# _HISTORY_MAX_BYTES, drop buffers from the front — but only if the
+# playhead is past them (_playhead_idx > 0). Never evict the buffer
+# the user is currently scrubbing through; if they've scrubbed deep
+# into history, the cap is a soft cap that recovers when they catch up.
+# 200 MB ≈ 35 minutes of mono float32 24 kHz audio — well past any
+# plausible single-selection size.
+_history: list = []
+_playhead_idx: int = 0
+_playhead_offset: int = 0
+_HISTORY_MAX_BYTES = 200 * 1024 * 1024
 
 # ---- globals ------------------------------------------------------------------
 
@@ -253,62 +289,240 @@ def _emit_pos(ms_float: float, buffer_id: int) -> None:
 _CHUNK_SAMPLES = int(SAMPLE_RATE * POS_CADENCE_S)  # ~480 samples @ 24kHz → 20ms
 
 
-def _drain_done_ready() -> bool:
+def _history_byte_size_unlocked() -> int:
+    total = 0
+    for _, samples, _ in _history:
+        total += samples.nbytes
+    return total
+
+
+def _history_append_unlocked(item: tuple) -> None:
+    """Append (buffer_id, samples, tempo_factor) to history; evict from the
+    front to honour _HISTORY_MAX_BYTES. Eviction adjusts _playhead_idx so
+    the playhead still references the same buffer post-shift. We never
+    evict the buffer the playhead is currently sitting on or any newer —
+    that would yank audio out from under an active scrub. Caller holds
+    _lock."""
+    global _playhead_idx
+    _history.append(item)
+    # Only attempt eviction while front is strictly older than playhead.
+    while (_history_byte_size_unlocked() > _HISTORY_MAX_BYTES
+           and _playhead_idx > 0):
+        _history.pop(0)
+        _playhead_idx -= 1
+
+
+def _materialize_queue_item(item: tuple) -> Optional[tuple]:
+    """Convert a queue item to a (buffer_id, samples, tempo_factor) tuple
+    suitable for _history. Silence items become zero-amplitude buffers
+    with buffer_id=-2; samples items pass through unchanged."""
+    kind = item[0]
+    if kind == "silence":
+        _, ms = item
+        return (-2, _silence_samples(ms), 1.0)
+    if kind == "samples":
+        _, buf_id, samples, tempo = item
+        return (buf_id, samples, tempo)
+    return None
+
+
+def _resolve_seek_ms_unlocked(delta_ms: int) -> None:
+    """Walk _history forward/backward by `delta_ms` source-domain ms and
+    update _playhead_idx, _playhead_offset. Pulls from _audio_queue
+    non-blocking when a forward seek runs past the end of history;
+    clamps at start of oldest available buffer / end of last queued
+    buffer. Caller holds _lock."""
+    global _playhead_idx, _playhead_offset
+
+    if not _history:
+        return  # pre-roll silence is enqueued before main starts the player,
+                # but if somehow we got a SEEK before any item materialised,
+                # there's nothing to seek into.
+
+    if delta_ms > 0:
+        remaining = delta_ms
+        while remaining > 0:
+            buf_id, samples, tempo = _history[_playhead_idx]
+            buf_total_ms = len(samples) / SAMPLE_RATE * 1000.0 * tempo
+            cur_ms = _playhead_offset / SAMPLE_RATE * 1000.0 * tempo
+            ms_left_in_buf = buf_total_ms - cur_ms
+            if remaining <= ms_left_in_buf:
+                new_ms = cur_ms + remaining
+                _playhead_offset = min(
+                    len(samples),
+                    int(new_ms * SAMPLE_RATE / (1000.0 * tempo)),
+                )
+                return
+            # Past end of this buffer — try to advance to the next.
+            remaining -= ms_left_in_buf
+            if _playhead_idx + 1 < len(_history):
+                _playhead_idx += 1
+                _playhead_offset = 0
+                continue
+            # End of history. Pull from queue if anything's there;
+            # otherwise clamp at end of last buffer.
+            try:
+                item = _audio_queue.get_nowait()
+                _audio_queue.task_done()
+            except queue.Empty:
+                _playhead_offset = len(samples)
+                return
+            mat = _materialize_queue_item(item)
+            if mat is None:
+                _playhead_offset = len(samples)
+                return
+            _history_append_unlocked(mat)
+            _playhead_idx += 1
+            _playhead_offset = 0
+        return
+
+    if delta_ms < 0:
+        remaining = delta_ms  # negative
+        buf_id, samples, tempo = _history[_playhead_idx]
+        cur_ms = _playhead_offset / SAMPLE_RATE * 1000.0 * tempo
+        if cur_ms + remaining >= 0:
+            new_ms = cur_ms + remaining
+            _playhead_offset = max(
+                0,
+                int(new_ms * SAMPLE_RATE / (1000.0 * tempo)),
+            )
+            return
+        # Walk backward through earlier buffers.
+        remaining += cur_ms  # consume the way back to start of current buf
+        _playhead_offset = 0
+        while remaining < 0 and _playhead_idx > 0:
+            _playhead_idx -= 1
+            buf_id, samples, tempo = _history[_playhead_idx]
+            buf_total_ms = len(samples) / SAMPLE_RATE * 1000.0 * tempo
+            if -remaining <= buf_total_ms:
+                new_ms = buf_total_ms + remaining  # remaining is negative
+                _playhead_offset = max(
+                    0,
+                    int(new_ms * SAMPLE_RATE / (1000.0 * tempo)),
+                )
+                return
+            remaining += buf_total_ms
+        # Walked past the oldest available — clamp.
+        _playhead_idx = 0
+        _playhead_offset = 0
+        return
+
+
+def _drain_done_ready_unlocked() -> bool:
     """True iff the queue is empty AND every previously scheduled end-of-
-    buffer Timer has finished firing. The Timers fire the final POS for a
-    buffer (audio-leads-visual compensation, ~latency*tempo ms after the
-    buffer ends); we must wait for them so the RSVP balloon's last word
-    actually advances before the shutdown path cancels pending Timers."""
+    buffer Timer has finished firing AND the playhead has reached the end
+    of the last history buffer. The end-of-history check matters during
+    cross-buffer scrubbing: if the user has scrubbed back, we mustn't
+    fire DRAIN_DONE just because EXIT was sent — they're still listening."""
     if not _audio_queue.empty():
         return False
     with _pending_timers_lock:
         for t in _pending_timers:
             if t.is_alive():
                 return False
+    if not _history:
+        return True
+    last_idx = len(_history) - 1
+    if _playhead_idx < last_idx:
+        return False
+    if _playhead_idx == last_idx:
+        if _playhead_offset < len(_history[last_idx][1]):
+            return False
     return True
 
 
+def _schedule_end_of_buffer_pos(buffer_id: int, samples: np.ndarray,
+                                tempo_factor: float) -> None:
+    """When a buffer plays through to its end (natural advance, not a seek-
+    induced jump), schedule the final uncompensated POS to fire at the
+    moment those last samples actually reach the speaker. See the long
+    note on audio-leads-visual compensation for why this exists.
+
+    No-op for non-speech buffers (silence/earcon, buffer_id < 0)."""
+    if buffer_id < 0:
+        return
+    final_source_ms = len(samples) / SAMPLE_RATE * 1000.0 * tempo_factor
+    final_delay_s = _STREAM_OUTPUT_LATENCY_S * tempo_factor
+    if final_delay_s > 0.0:
+        t = threading.Timer(
+            final_delay_s,
+            lambda sm=final_source_ms, bid=buffer_id: _emit_pos(sm, bid),
+        )
+        with _pending_timers_lock:
+            _pending_timers.append(t)
+        t.daemon = True
+        t.start()
+    else:
+        _emit_pos(final_source_ms, buffer_id)
+
+
 def _player_loop() -> None:
-    """Drain _audio_queue and write samples to the stream.
+    """Drain _audio_queue → _history and write samples to the stream.
 
     Runs in a dedicated daemon thread so the main thread can keep reading
-    stdin commands.  Soft-pause is implemented by spinning without consuming
-    queue items (the stream stays alive and silent via zero-writes).
+    stdin commands. Soft-pause is implemented by writing tiny silence
+    chunks without advancing the playhead. The outer loop iterates on
+    every tick — pause, drain-done check, seek resolution, and chunk
+    write all happen at this level so none can starve the others. (The
+    pre-Bug-2 code had an inner per-buffer loop that could spin on
+    pause-write-silence forever, leaking the process when the user
+    paused mid-last-buffer after EXIT.)
     """
-    global _stream, _stop_requested, _drain_done_emitted
+    global _stream, _stop_requested, _drain_done_emitted, _seek_request_ms
+    global _playhead_idx, _playhead_offset
+
+    last_emit_buf_idx = -1   # detect buffer transitions for POS reset
+    last_emit_pos = -1       # last-emitted POS in int source-ms
 
     while True:
-        # Check for shutdown — exit the loop entirely so main() can join.
+        # Shutdown / STOP.
         with _lock:
             if _shutdown_requested:
                 return
-
-        # Check for STOP first — clears queue and continues.
-        with _lock:
             if _stop_requested:
                 _drain_queue()
                 _stop_requested = False
+                # Park playhead at end of whatever's in history so subsequent
+                # PLAYs append cleanly and the loop waits for them.
+                if _history:
+                    _playhead_idx = len(_history) - 1
+                    _playhead_offset = len(_history[_playhead_idx][1])
                 continue
-
-        # Check pause — spin-wait with tiny sleep to avoid busy-loop.
-        with _lock:
             paused = _paused
-        if paused:
-            # Write a small silence chunk to keep the stream alive.
-            _stream_write(_silence_samples(int(POS_CADENCE_S * 1000)))
-            continue
+            seek_ms = _seek_request_ms
+            _seek_request_ms = None
 
-        # End-of-playback handshake (Option Y). Once the shell has signalled
-        # EXIT (kokoro_done) AND the queue is empty AND any pending
-        # final-POS Timers have fired: emit DRAIN_DONE on stderr (so the
-        # log/Hammerspoon can see the lifecycle phase) and close stdin so
-        # the main thread exits its read loop and runs the existing
-        # shutdown path. Done in the player thread because it's the
-        # authoritative drain-state observer.
+        # Apply any pending seek BEFORE the pause check so seeks issued while
+        # paused take effect immediately. POS is emitted uncompensated so the
+        # visual lands exactly where the user seeked to (no audio in flight
+        # to lead with).
+        if seek_ms is not None and seek_ms != 0:
+            with _lock:
+                _resolve_seek_ms_unlocked(seek_ms)
+                if _playhead_idx < len(_history):
+                    buf_id, samples, tempo = _history[_playhead_idx]
+                    seek_source_ms = (
+                        _playhead_offset / SAMPLE_RATE * 1000.0 * tempo
+                    )
+                else:
+                    buf_id = -1
+                    seek_source_ms = 0.0
+            if buf_id >= 0:
+                _emit_pos(seek_source_ms, buf_id)
+                last_emit_pos = int(seek_source_ms)
+            last_emit_buf_idx = _playhead_idx
+
+        # End-of-playback handshake. Fires only when EXIT was sent AND
+        # the queue is empty AND pending Timers are done AND the playhead
+        # is at the end of the last history buffer. The last condition
+        # protects mid-history scrub-backs and pause-mid-last-buffer:
+        # in both states the user is still consuming, and shutting the
+        # stream out from under them would cut audio.
         with _lock:
             kokoro_done = _kokoro_done
             already_emitted = _drain_done_emitted
-        if kokoro_done and not already_emitted and _drain_done_ready():
+            ready = _drain_done_ready_unlocked() if kokoro_done and not already_emitted else False
+        if ready:
             print("DRAIN_DONE", file=sys.stderr, flush=True)
             with _lock:
                 _drain_done_emitted = True
@@ -317,23 +531,76 @@ def _player_loop() -> None:
             except Exception:
                 pass
 
-        # Try to get the next item.
-        try:
-            item = _audio_queue.get(timeout=POS_CADENCE_S)
-        except queue.Empty:
+        # Pause: keep the stream alive with a tiny silence write, no playhead
+        # advance. Drain-done check above still gets a chance every tick.
+        if paused:
+            _stream_write(_silence_samples(int(POS_CADENCE_S * 1000)))
             continue
 
-        kind = item[0]
-
-        if kind == "silence":
-            _, ms = item
-            _stream_write(_silence_samples(ms))
+        # Ensure the playhead points at a valid history slot. If it's at
+        # len(_history), pull from the queue (briefly blocking so we don't
+        # busy-loop while nothing's available).
+        with _lock:
+            need_pull = _playhead_idx >= len(_history)
+        if need_pull:
+            try:
+                item = _audio_queue.get(timeout=POS_CADENCE_S)
+            except queue.Empty:
+                continue
             _audio_queue.task_done()
+            mat = _materialize_queue_item(item)
+            if mat is None:
+                continue
+            with _lock:
+                _history_append_unlocked(mat)
 
-        elif kind == "samples":
-            _, buffer_id, samples, tempo_factor = item
-            _play_buffer(buffer_id, samples, tempo_factor)
-            _audio_queue.task_done()
+        # Snapshot the current history slot.
+        with _lock:
+            if _playhead_idx >= len(_history):
+                # Race: a STOP between the pull and here could reset the
+                # playhead past the end. Loop and retry.
+                continue
+            buf_id, samples, tempo = _history[_playhead_idx]
+            offset = _playhead_offset
+
+        # New buffer? Reset emit tracking so the first POS for it isn't
+        # suppressed by stale last_emit_pos from the previous buffer.
+        if _playhead_idx != last_emit_buf_idx:
+            last_emit_pos = -1
+            last_emit_buf_idx = _playhead_idx
+
+        # End of this buffer (natural advance)? Schedule end-of-buffer
+        # final-POS Timer and step to the next history slot.
+        if offset >= len(samples):
+            _schedule_end_of_buffer_pos(buf_id, samples, tempo)
+            with _lock:
+                _playhead_idx += 1
+                _playhead_offset = 0
+            continue
+
+        # Write one chunk and advance the playhead.
+        end = min(offset + _CHUNK_SAMPLES, len(samples))
+        chunk = samples[offset:end]
+        _stream_write(chunk)
+        with _lock:
+            # Only advance if no concurrent SEEK landed elsewhere mid-write.
+            if (_playhead_idx == last_emit_buf_idx
+                    and _playhead_offset == offset):
+                _playhead_offset = end
+
+        # Emit POS in source-domain time, compensated for audio-leads-visual.
+        # See the original derivation comment retained on the SEEK command.
+        # source_ms = pos * 1000 * tempo / SAMPLE_RATE  (multiply by tempo).
+        # Skip non-speech buffers (silence/earcon).
+        if buf_id < 0:
+            continue
+        source_ms = end / SAMPLE_RATE * 1000.0 * tempo
+        adjusted_ms = source_ms - _STREAM_OUTPUT_LATENCY_S * 1000.0 * tempo
+        if adjusted_ms < 0:
+            continue
+        if int(adjusted_ms) != last_emit_pos:
+            _emit_pos(adjusted_ms, buf_id)
+            last_emit_pos = int(adjusted_ms)
 
 
 def _drain_queue() -> None:
@@ -344,125 +611,6 @@ def _drain_queue() -> None:
             _audio_queue.task_done()
         except queue.Empty:
             break
-
-
-def _play_buffer(buffer_id: int, samples: np.ndarray, tempo_factor: float) -> None:
-    """Play a buffer of (already-stretched) samples in chunks, emitting POS.
-
-    The samples are already time-stretched; the tempo_factor is the sox rate
-    that was applied so we can recover source-domain position.
-
-    Formula derivation:
-      Source WAV: N samples at SAMPLE_RATE → duration = N/SAMPLE_RATE seconds.
-      sox tempo R (R>1 = faster): output has N/R stretched samples.
-      When player has consumed `pos` stretched samples:
-        fraction_complete = pos / (N/R) = pos*R/N
-        source_time_s     = fraction_complete * (N/SAMPLE_RATE)
-                          = pos * R / SAMPLE_RATE
-        source_ms         = pos / SAMPLE_RATE * 1000 * R
-    So: source_ms = pos * 1000 * tempo_factor / SAMPLE_RATE  (MULTIPLY by R).
-
-    SEEK delta: the fd-9 SEEK command is in source-domain ms. Converting to
-    the stretched-sample domain:
-        source_samples = ms * SAMPLE_RATE / 1000
-        stretched_delta = source_samples / tempo_factor  (DIVIDE by R)
-    because each source sample corresponds to 1/R stretched samples.
-    """
-    global _stop_requested, _seek_delta_samples
-
-    pos = 0  # current position in samples array
-    total = len(samples)
-    last_pos_emit = -1  # track when we last emitted a POS
-
-    while pos < total:
-        # Check STOP.
-        with _lock:
-            if _stop_requested:
-                return
-
-        # Apply any pending seek BEFORE the pause check so seeks issued while
-        # paused take effect immediately (otherwise they'd queue in
-        # _seek_delta_samples and only apply on resume — and successive seeks
-        # would overwrite, so only the last one would survive).
-        with _lock:
-            delta = _seek_delta_samples
-            _seek_delta_samples = None
-        if delta is not None:
-            # delta is in source-domain samples; convert to stretched domain
-            # (source_samples → stretched: divide by tempo_factor)
-            stretched_delta = int(delta / tempo_factor)
-            pos = max(0, min(total, pos + stretched_delta))
-            # Emit POS for the new position immediately so the RSVP balloon
-            # advances on every seek — including when paused, where the
-            # paused branch below `continue`s past the regular per-chunk POS
-            # emit. No audio-leads-visual compensation: the visual should
-            # land exactly where the user seeked to, since there's no audio
-            # currently in flight to "lead" with.
-            seek_source_ms = pos / SAMPLE_RATE * 1000.0 * tempo_factor
-            _emit_pos(seek_source_ms, buffer_id)
-            last_pos_emit = int(seek_source_ms)
-
-        # Check pause — spin-wait, write silence to keep stream alive.
-        with _lock:
-            paused = _paused
-        if paused:
-            _stream_write(_silence_samples(int(POS_CADENCE_S * 1000)))
-            continue
-
-        # Write one chunk.
-        end = min(pos + _CHUNK_SAMPLES, total)
-        chunk = samples[pos:end]
-        _stream_write(chunk)
-        pos = end
-
-        # Emit POS in source-domain time, compensated for audio-leads-visual.
-        #
-        # Raw: source_ms = pos * 1000 * tempo_factor / SAMPLE_RATE.
-        #      This is the position of the just-WRITTEN sample, which is
-        #      sitting in CoreAudio's ring buffer and hasn't played yet.
-        #
-        # Compensated: subtract the ring-buffer latency converted to
-        #      source-domain ms. Result = source position currently AT THE
-        #      SPEAKER. Downstream visual-pipeline latency then lands
-        #      visual onset slightly AFTER audio onset — the direction
-        #      Kim et al. 2024 found protects comprehension.
-        #
-        # During the first ~latency*tempo ms of a buffer the adjusted value
-        # is negative — that audio isn't at the speaker yet. Skip those so
-        # rsvp doesn't flash a word before its sound plays.
-        source_ms = pos / SAMPLE_RATE * 1000.0 * tempo_factor
-        adjusted_ms = source_ms - _STREAM_OUTPUT_LATENCY_S * 1000.0 * tempo_factor
-        if adjusted_ms < 0:
-            continue
-        if int(adjusted_ms) != last_pos_emit:
-            _emit_pos(adjusted_ms, buffer_id)
-            last_pos_emit = int(adjusted_ms)
-
-    # End-of-buffer catch-up. The compensated POS stream stops
-    # `latency*tempo` source-ms short of the buffer's true end — otherwise the
-    # last word's visual would fire before its audio. That leaves the RSVP
-    # balloon frozen on whichever word contains that final POS while audio
-    # plays through the remaining ~latency*tempo ms of already-buffered
-    # samples. Schedule one final uncompensated POS at source_ms_end, delayed
-    # by the same compensation, so it lands at the speaker simultaneously
-    # with audio's actual end — advancing the balloon's final word without
-    # violating audio-leads-visual.
-    final_source_ms = total / SAMPLE_RATE * 1000.0 * tempo_factor
-    final_delay_s = _STREAM_OUTPUT_LATENCY_S * tempo_factor
-    if final_delay_s > 0.0:
-        t = threading.Timer(
-            final_delay_s,
-            lambda sm=final_source_ms, bid=buffer_id: _emit_pos(sm, bid),
-        )
-        # Track so cooperative shutdown can cancel before the interpreter
-        # tears down — otherwise a Timer firing post-finalization can crash
-        # via stderr/print after sys.stderr is closed.
-        with _pending_timers_lock:
-            _pending_timers.append(t)
-        t.daemon = True
-        t.start()
-    else:
-        _emit_pos(final_source_ms, buffer_id)
 
 
 # ---- signal handling ----------------------------------------------------------
@@ -530,7 +678,7 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 # ---- main ---------------------------------------------------------------------
 
 def main() -> None:
-    global _stream, _rate, _paused, _stop_requested, _seek_delta_samples
+    global _stream, _rate, _paused, _stop_requested, _seek_request_ms
     global _player_thread, _kokoro_done
 
     global _STREAM_OUTPUT_LATENCY_S
@@ -649,18 +797,24 @@ def main() -> None:
 
         elif cmd == "SEEK":
             # SEEK <ms> — relative seek in source-domain milliseconds.
-            # Positive = forward; negative = backward.
-            # Clamping to [0, buffer_duration] is done in the player thread
-            # where we have the actual buffer length.
+            # Positive = forward; negative = backward. Resolution (which
+            # may walk across multiple history buffers and pull from the
+            # audio queue) is deferred to the player thread, which holds
+            # the lock while traversing _history. Successive SEEKs that
+            # arrive before the player thread has resolved the previous
+            # one accumulate (seek_request_ms += ms) so users can tap
+            # the arrow key several times rapidly without dropping
+            # any of the requested deltas.
             try:
                 ms = int(parts[1]) if len(parts) > 1 else 0
             except ValueError:
                 ms = 0
             if ms != 0:
-                # Convert source-domain ms to source-domain samples.
-                delta_source_samples = int(ms * SAMPLE_RATE / 1000)
                 with _lock:
-                    _seek_delta_samples = delta_source_samples
+                    if _seek_request_ms is None:
+                        _seek_request_ms = ms
+                    else:
+                        _seek_request_ms += ms
 
         elif cmd == "STOP":
             with _lock:
