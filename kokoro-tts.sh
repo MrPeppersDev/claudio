@@ -136,12 +136,16 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
 #   3 — Sacrificial-head trim rework: relative RMS threshold + 20ms dwell
 #       + min/max cut-position guardrails. Old WAVs may have "banana,"
 #       leakage baked in from the prior detector — bump to force re-synth.
-#   4 — Sacrificial-head bounds anchored to first audible frame. Kokoro ONNX
-#       emits ~400 ms of leading silence before the first phoneme, which
-#       shifted the banana window past the max_cut guardrail (measured from
-#       WAV t=0), so the comma gap was rejected and "banana" leaked through.
-#       Bounds now measure from first_audible; old WAVs have the leak baked
-#       in — bump to force re-synth.
+#   4 — Two combined fixes for "banana" audibility:
+#       (a) Strip pad-0 boundary silence in synth_with_durations. The
+#           patched-model path bypassed kokoro_onnx's built-in librosa-trim
+#           step, leaving ~100-200ms of leading silence that pushed the
+#           banana+comma gap past trim_sacrificial_head's max-cut guardrail.
+#       (b) Sacrificial-head bounds anchored to first audible frame, so the
+#           detector measures "how far through banana" rather than "how far
+#           into the WAV" — defense-in-depth against any residual leading
+#           silence.
+#       v3 WAVs have leak baked in — bump to re-synth and re-sidecar.
 SYNTH_VERSION=4
 sentence_hash() {
   local text="$1"
