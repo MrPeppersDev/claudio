@@ -67,7 +67,6 @@ import signal
 import subprocess
 import sys
 import threading
-import time
 from typing import Optional
 
 import numpy as np
@@ -119,6 +118,17 @@ _stop_requested = False  # STOP command sets this; player thread clears it
 _shutdown_requested = False  # set by SIGTERM / EOF cleanup; player thread exits
 _pending_timers: list = []   # threading.Timer instances to cancel on shutdown
 _pending_timers_lock = threading.Lock()
+# End-of-playback handshake. Set by EXIT command (the shell signalling
+# "no more PLAYs coming"). The main thread keeps reading stdin so user
+# controls (PAUSE/RESUME/SEEK) still work through the drain. The player
+# thread, once it observes (queue empty AND kokoro_done AND pending
+# Timers finished), emits DRAIN_DONE on stderr (trackability breadcrumb)
+# and closes stdin — that signals the main thread to fall through to the
+# existing shutdown path. The shell's `wait $STREAM_PID` then returns
+# and it tears down control plumbing. No os._exit, no protocol on the
+# shell side beyond what already exists.
+_kokoro_done = False
+_drain_done_emitted = False
 
 # ---- audio queue --------------------------------------------------------------
 # Each item is one of:
@@ -243,6 +253,21 @@ def _emit_pos(ms_float: float, buffer_id: int) -> None:
 _CHUNK_SAMPLES = int(SAMPLE_RATE * POS_CADENCE_S)  # ~480 samples @ 24kHz → 20ms
 
 
+def _drain_done_ready() -> bool:
+    """True iff the queue is empty AND every previously scheduled end-of-
+    buffer Timer has finished firing. The Timers fire the final POS for a
+    buffer (audio-leads-visual compensation, ~latency*tempo ms after the
+    buffer ends); we must wait for them so the RSVP balloon's last word
+    actually advances before the shutdown path cancels pending Timers."""
+    if not _audio_queue.empty():
+        return False
+    with _pending_timers_lock:
+        for t in _pending_timers:
+            if t.is_alive():
+                return False
+    return True
+
+
 def _player_loop() -> None:
     """Drain _audio_queue and write samples to the stream.
 
@@ -250,7 +275,7 @@ def _player_loop() -> None:
     stdin commands.  Soft-pause is implemented by spinning without consuming
     queue items (the stream stays alive and silent via zero-writes).
     """
-    global _stream, _stop_requested
+    global _stream, _stop_requested, _drain_done_emitted
 
     while True:
         # Check for shutdown — exit the loop entirely so main() can join.
@@ -272,6 +297,25 @@ def _player_loop() -> None:
             # Write a small silence chunk to keep the stream alive.
             _stream_write(_silence_samples(int(POS_CADENCE_S * 1000)))
             continue
+
+        # End-of-playback handshake (Option Y). Once the shell has signalled
+        # EXIT (kokoro_done) AND the queue is empty AND any pending
+        # final-POS Timers have fired: emit DRAIN_DONE on stderr (so the
+        # log/Hammerspoon can see the lifecycle phase) and close stdin so
+        # the main thread exits its read loop and runs the existing
+        # shutdown path. Done in the player thread because it's the
+        # authoritative drain-state observer.
+        with _lock:
+            kokoro_done = _kokoro_done
+            already_emitted = _drain_done_emitted
+        if kokoro_done and not already_emitted and _drain_done_ready():
+            print("DRAIN_DONE", file=sys.stderr, flush=True)
+            with _lock:
+                _drain_done_emitted = True
+            try:
+                sys.stdin.close()
+            except Exception:
+                pass
 
         # Try to get the next item.
         try:
@@ -348,6 +392,15 @@ def _play_buffer(buffer_id: int, samples: np.ndarray, tempo_factor: float) -> No
             # (source_samples → stretched: divide by tempo_factor)
             stretched_delta = int(delta / tempo_factor)
             pos = max(0, min(total, pos + stretched_delta))
+            # Emit POS for the new position immediately so the RSVP balloon
+            # advances on every seek — including when paused, where the
+            # paused branch below `continue`s past the regular per-chunk POS
+            # emit. No audio-leads-visual compensation: the visual should
+            # land exactly where the user seeked to, since there's no audio
+            # currently in flight to "lead" with.
+            seek_source_ms = pos / SAMPLE_RATE * 1000.0 * tempo_factor
+            _emit_pos(seek_source_ms, buffer_id)
+            last_pos_emit = int(seek_source_ms)
 
         # Check pause — spin-wait, write silence to keep stream alive.
         with _lock:
@@ -478,7 +531,7 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 
 def main() -> None:
     global _stream, _rate, _paused, _stop_requested, _seek_delta_samples
-    global _player_thread
+    global _player_thread, _kokoro_done
 
     global _STREAM_OUTPUT_LATENCY_S
 
@@ -614,13 +667,17 @@ def main() -> None:
                 _stop_requested = True
 
         elif cmd == "EXIT":
-            # Cooperative exit from kokoro-tts.sh teardown. Break out of the
-            # stdin loop so we drain the queue normally and shut down — vs.
-            # SIGTERM, which is fast/abort. The shell sends EXIT *instead of*
-            # closing fd 9 so the control-fifo subshell (which holds a dup of
-            # fd 9) can stay alive through the drain, keeping PAUSE/RESUME/
-            # SEEK working during end-of-playback.
-            break
+            # Cooperative end-of-playback signal from kokoro-tts.sh. The
+            # shell has finished queueing audio but is leaving fd 9 open so
+            # the control-fifo subshell keeps working — that means
+            # PAUSE/RESUME/SEEK from Hammerspoon stay live through the
+            # drain. We set _kokoro_done and KEEP READING stdin; the player
+            # thread observes drain completion (queue empty + Timers done),
+            # emits DRAIN_DONE on stderr, and closes our stdin to wind us
+            # down. Process exit then unblocks the shell's `wait` and it
+            # tears down the control plumbing.
+            with _lock:
+                _kokoro_done = True
 
         # else: unknown command — silently ignore for forward-compat
 

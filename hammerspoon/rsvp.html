@@ -505,7 +505,11 @@ window.rsvpLoadBuffer = function(bufferId, jsonString) {
 };
 
 window.rsvpShowAt = function(ms, bufferId) {
-  if (_paused) return;
+  // No early-return on _paused. play-stream only emits POS during pause
+  // when a seek has just been applied (the regular per-chunk POS emit is
+  // skipped by the paused branch in _play_buffer), so any POS arriving
+  // here while paused is a seek-induced visual update — exactly what the
+  // user wants to see.
 
   var words;
   if (bufferId != null && _bufferSidecars[bufferId]) {
