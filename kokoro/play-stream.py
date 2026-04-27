@@ -116,6 +116,9 @@ _lock = threading.Lock()
 _paused = False          # soft-pause flag; player thread checks this
 _seek_delta_samples: Optional[int] = None  # pending relative seek; set by SEEK cmd
 _stop_requested = False  # STOP command sets this; player thread clears it
+_shutdown_requested = False  # set by SIGTERM / EOF cleanup; player thread exits
+_pending_timers: list = []   # threading.Timer instances to cancel on shutdown
+_pending_timers_lock = threading.Lock()
 
 # ---- audio queue --------------------------------------------------------------
 # Each item is one of:
@@ -204,11 +207,27 @@ def _edge_fade(samples: np.ndarray, ms: int = EDGE_FADE_MS) -> np.ndarray:
 
 
 def _stream_write(samples: np.ndarray) -> None:
-    """Block-write samples into the stream (called from player thread only)."""
+    """Block-write samples into the stream (called from player thread only).
+
+    Swallows exceptions because the stream may be aborted/closed underneath
+    us during shutdown (cooperative-shutdown sequence aborts the stream to
+    unblock a blocking write so the player thread can join). Without this,
+    the abort raises a PortAudio error that would propagate out of the
+    daemon thread mid-shutdown — sometimes after CFFI's underlying dylib
+    is already torn down — and crash with EXC_BAD_ACCESS.
+    """
     global _stream
     if _stream is None or len(samples) == 0:
         return
-    _stream.write(samples)
+    try:
+        _stream.write(samples)
+    except Exception:
+        # Either the stream was aborted (shutdown path) or PortAudio is
+        # unhappy. Either way, not the player thread's job to recover —
+        # main() owns lifecycle. Set shutdown so the loop exits.
+        global _shutdown_requested
+        with _lock:
+            _shutdown_requested = True
 
 
 # ---- POS emission -------------------------------------------------------------
@@ -234,6 +253,11 @@ def _player_loop() -> None:
     global _stream, _stop_requested
 
     while True:
+        # Check for shutdown — exit the loop entirely so main() can join.
+        with _lock:
+            if _shutdown_requested:
+                return
+
         # Check for STOP first — clears queue and continues.
         with _lock:
             if _stop_requested:
@@ -373,23 +397,77 @@ def _play_buffer(buffer_id: int, samples: np.ndarray, tempo_factor: float) -> No
     final_source_ms = total / SAMPLE_RATE * 1000.0 * tempo_factor
     final_delay_s = _STREAM_OUTPUT_LATENCY_S * tempo_factor
     if final_delay_s > 0.0:
-        threading.Timer(
+        t = threading.Timer(
             final_delay_s,
             lambda sm=final_source_ms, bid=buffer_id: _emit_pos(sm, bid),
-        ).start()
+        )
+        # Track so cooperative shutdown can cancel before the interpreter
+        # tears down — otherwise a Timer firing post-finalization can crash
+        # via stderr/print after sys.stderr is closed.
+        with _pending_timers_lock:
+            _pending_timers.append(t)
+        t.daemon = True
+        t.start()
     else:
         _emit_pos(final_source_ms, buffer_id)
 
 
 # ---- signal handling ----------------------------------------------------------
 
-def _handle_sigterm(signum, frame):  # noqa: ARG001
-    global _stream
+_player_thread: Optional[threading.Thread] = None
+
+
+def _shutdown() -> None:
+    """Cooperative shutdown: stop the player thread, abort+close stream,
+    cancel pending Timers. Safe to call from a signal handler or main().
+
+    The order matters:
+      1. Cancel pending Timers (so they don't fire after stderr/sys is gone).
+      2. Set _shutdown_requested so the player loop returns next iteration.
+      3. Abort the stream so any in-flight blocking _stream.write() returns
+         immediately (otherwise the player thread can sit in CFFI for the
+         duration of the buffer, racing with interpreter finalization).
+      4. Join the player thread with a short timeout. If it's stuck in C,
+         we let it die as a daemon — but the abort should unblock it well
+         within the timeout in practice.
+      5. Close the stream from the main thread, where lifecycle ownership
+         lives.
+    """
+    global _stream, _shutdown_requested
+    # 1) Cancel any pending POS Timers.
+    with _pending_timers_lock:
+        for t in _pending_timers:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        _pending_timers.clear()
+    # 2) Signal the player thread.
+    with _lock:
+        _shutdown_requested = True
+    # 3) Abort to unblock a blocking write, if any.
     if _stream is not None:
         try:
             _stream.abort()
         except Exception:
             pass
+    # 4) Join the player.
+    if _player_thread is not None:
+        try:
+            _player_thread.join(timeout=0.5)
+        except Exception:
+            pass
+    # 5) Close.
+    if _stream is not None:
+        try:
+            _stream.close()
+        except Exception:
+            pass
+        _stream = None
+
+
+def _handle_sigterm(signum, frame):  # noqa: ARG001
+    _shutdown()
     sys.exit(0)
 
 
@@ -400,6 +478,7 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 
 def main() -> None:
     global _stream, _rate, _paused, _stop_requested, _seek_delta_samples
+    global _player_thread
 
     global _STREAM_OUTPUT_LATENCY_S
 
@@ -430,8 +509,9 @@ def main() -> None:
             _STREAM_OUTPUT_LATENCY_S = 0.0
 
     # Start the player thread as daemon so it exits when main() returns.
-    player = threading.Thread(target=_player_loop, daemon=True)
-    player.start()
+    # Also expose at module scope so _shutdown() can join it.
+    _player_thread = threading.Thread(target=_player_loop, daemon=True)
+    _player_thread.start()
 
     # 400 ms silent pre-roll: CoreAudio device ramp-up happens here, not
     # during the first real word.  Enqueue as a silence item so it's consumed
@@ -535,13 +615,12 @@ def main() -> None:
 
         # else: unknown command — silently ignore for forward-compat
 
-    # stdin EOF: wait for queue to drain, then exit cleanly.
+    # stdin EOF: wait for queue to drain, then run cooperative shutdown.
+    # Same path as SIGTERM so the player thread gets a clean exit and any
+    # pending end-of-buffer Timers are cancelled before the interpreter
+    # tears down — preventing the post-finalization CFFI segfault.
     _audio_queue.join()
-    try:
-        _stream.stop()
-        _stream.close()
-    except Exception:
-        pass
+    _shutdown()
 
 
 if __name__ == "__main__":
