@@ -34,12 +34,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # Stub heavy server.py dependencies before importing anything from kokoro/.
 # ---------------------------------------------------------------------------
 
-_scipy_signal = types.ModuleType("scipy.signal")
+# Additive stub: re-use any scipy.signal module already in sys.modules so
+# play-stream tests' resample_poly and our lfilter co-exist regardless of
+# collection order (otherwise setdefault no-ops the second installer).
+_scipy_signal = sys.modules.setdefault("scipy.signal", types.ModuleType("scipy.signal"))
 _scipy_signal.lfilter = lambda b, a, x: x
-_scipy = types.ModuleType("scipy")
+_scipy = sys.modules.setdefault("scipy", types.ModuleType("scipy"))
 _scipy.signal = _scipy_signal
-sys.modules.setdefault("scipy", _scipy)
-sys.modules.setdefault("scipy.signal", _scipy_signal)
 
 _kokoro_onnx = types.ModuleType("kokoro_onnx")
 
