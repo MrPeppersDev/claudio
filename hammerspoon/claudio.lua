@@ -43,11 +43,29 @@ local SPEED_FILE = STATE_DIR .. "/speed"
 local VOICE_FILE = STATE_DIR .. "/voice"
 local PLAY_LOG = STATE_DIR .. "/play.log"
 local SERVER_LOG = STATE_DIR .. "/kokoro-server.log"
+local DIAG_LOG = STATE_DIR .. "/hs.log"
 local QUEUE_DIR = STATE_DIR .. "/queue"
 -- CACHE_DIR mirrors kokoro-tts.sh's KOKORO_CACHE_DIR resolution. Used to
 -- bound paths read from the play task's stderr stream (SIDECAR <path>),
 -- which would otherwise be a stderr-injection arbitrary-file-read primitive.
 local CACHE_DIR = os.getenv("KOKORO_CACHE_DIR") or (STATE_DIR .. "/cache")
+
+-- Diagnostic logger: append-only `hs.log` capturing claudio + rsvp lifecycle
+-- state transitions. Lets us reconstruct a bug repro after the fact (toggle
+-- decisions, exit codes, userInitiatedStop flag, balloon hide/linger calls,
+-- SIDECAR/CTRL accept/reject) without depending on the Hammerspoon console
+-- buffer being captured live. play-stream.py and rsvp.lua append to the
+-- same file so the timeline reads in order.
+local function diagLog(msg)
+  local t = hs.timer.secondsSinceEpoch()
+  local secs = math.floor(t)
+  local ms = math.floor((t - secs) * 1000)
+  local f = io.open(DIAG_LOG, "a")
+  if not f then return end
+  f:write(string.format("[%s.%03d] [claudio] %s\n",
+    os.date("%H:%M:%S", secs), ms, msg))
+  f:close()
+end
 local PLAY_SCRIPT = CLAUDIO_DIR .. "/play-last.sh"
 local SERVER_SCRIPT = CLAUDIO_DIR .. "/kokoro-server.sh"
 local KOKORO_URL = os.getenv("KOKORO_URL") or "http://127.0.0.1:8880"
@@ -383,11 +401,15 @@ local function processStderrLine(line)
     local id_s, path = line:match("^SIDECAR (%d+) (.+)$")
     if id_s and path then
       if not pathInsideDir(path, CACHE_DIR) or not path:match("%.words%.json$") then
+        diagLog(string.format("SIDECAR rejected (outside CACHE_DIR=%s): %s",
+                              CACHE_DIR, path))
         hs.printf("[claudio] rejecting SIDECAR path outside CACHE_DIR: %s", path)
         return
       end
       local json = loadSidecar(path)
       if json then
+        diagLog(string.format("SIDECAR accepted: id=%s bytes=%d path=%s",
+                              id_s, #json, path))
         rsvp.feedSidecar(tonumber(id_s), json)
       else
         -- Sidecar was announced but not readable. Common causes: server
@@ -395,6 +417,7 @@ local function processStderrLine(line)
         -- error, or a write race. Surface in the HS console so "balloon
         -- stays empty" has a diagnostic trail instead of looking like a
         -- silent UI bug.
+        diagLog(string.format("SIDECAR unreadable: id=%s path=%s", id_s, path))
         hs.printf("[claudio] SIDECAR missing or unreadable: id=%d path=%s",
                   tonumber(id_s), path)
       end
@@ -406,15 +429,19 @@ local function processStderrLine(line)
     if path then
       local basename = path:match("([^/]+)$") or ""
       if not pathInsideDir(path, STATE_DIR) or basename:sub(1, 8) ~= "control." then
+        diagLog(string.format("CTRL rejected (outside STATE_DIR=%s, basename=%s): %s",
+                              STATE_DIR, basename, path))
         hs.printf("[claudio] rejecting CTRL path outside STATE_DIR: %s", path)
         return
       end
+      diagLog("CTRL accepted: " .. path)
       controlFifoPath = path
     end
   end
 end
 
 local function runPlayScript(args)
+  diagLog(string.format("runPlayScript: args=[%s]", table.concat(args, " ")))
   -- Per-run state reset. Leftover controlFifoPath from a prior run would
   -- point at an already-unlinked FIFO; writing to it is a silent no-op but
   -- clearer to just drop the reference. Stderr partial-line buffer is also
@@ -459,8 +486,14 @@ local function runPlayScript(args)
       -- we still want the balloon cleared so a crashed task doesn't leave
       -- it dangling, so hide it directly.
       if code == 0 or code == 143 or userStop then
+        diagLog(string.format(
+          "task exit: code=%s wasUserStop=%s userStop=%s → endOfStream",
+          tostring(code), tostring(wasUserStop), tostring(userStop)))
         rsvp.endOfStream()
       else
+        diagLog(string.format(
+          "task exit: code=%s wasUserStop=%s userStop=%s → hide+alert",
+          tostring(code), tostring(wasUserStop), tostring(userStop)))
         rsvp.hide()
         hs.alert.show("Claudio error (exit " .. code .. ")")
       end
@@ -701,17 +734,23 @@ local function selectionToTempfile(selection)
 end
 
 function M.toggle()
-  if jobIsRunning() then
+  local running = jobIsRunning()
+  diagLog(string.format("toggle entry: jobIsRunning=%s userInitiatedStop=%s",
+    tostring(running), tostring(userInitiatedStop)))
+  if running then
     -- Mark this stop as user-initiated so the dying task's exit callback
     -- doesn't fire a "Claudio error (exit 9)" alert if SIGKILL is needed.
     userInitiatedStop = true
+    diagLog("toggle: stop branch — userInitiatedStop ← true, runPlayScript spawn")
     runPlayScript({ PLAY_SCRIPT })
     -- Stop kills play-stream abruptly — POS events halt and rsvp would sit
     -- on its last word forever waiting for the linger timer that never
     -- arms (the linger trigger only fires when POS crosses last_word.end_ms).
+    diagLog("toggle: stop branch — calling rsvp.hide()")
     rsvp.hide()
     return
   end
+  diagLog("toggle: play branch — capturing selection")
 
   -- Snapshot the anchor rect *before* captureSelection goes async. The AX
   -- and mouse state is most reliable in the instant the user presses F13;

@@ -116,6 +116,24 @@ M.on_close_request  = nil    -- function()  -- user clicked × button
 
 -- ── Helpers ───────────────────────────────────────────────────────────────────
 
+-- Diagnostic logger: append-only `hs.log` capturing rsvp lifecycle state
+-- (show/hide/fadeout/linger arming/POS threshold crosses). Same file as
+-- claudio.lua's diagLog so the timeline reads in order. Uses the same
+-- STATE_DIR resolution claudio.lua does so the env var contract matches.
+local _diagLogPath = (os.getenv("CLAUDIO_STATE_DIR")
+                       or os.getenv("CLAUDIO_DIR")
+                       or (os.getenv("HOME") .. "/.claude/claudio")) .. "/hs.log"
+local function diagLog(msg)
+  local t = hs.timer.secondsSinceEpoch()
+  local secs = math.floor(t)
+  local ms = math.floor((t - secs) * 1000)
+  local f = io.open(_diagLogPath, "a")
+  if not f then return end
+  f:write(string.format("[%s.%03d] [rsvp] %s\n",
+    os.date("%H:%M:%S", secs), ms, msg))
+  f:close()
+end
+
 -- Resolve the path to rsvp.html relative to this script.
 local function htmlPath()
   if _htmlPath then return _htmlPath end
@@ -346,6 +364,9 @@ end
 
 -- Destroy the webview and clean up the eventtap/timers.
 local function destroyWebview()
+  diagLog(string.format("destroyWebview: webview=%s linger=%s anim=%s",
+    tostring(_webview ~= nil), tostring(_lingerTimer ~= nil),
+    tostring(_animTimer ~= nil)))
   cancelLinger()
   stopPolling()
   if _animTimer then
@@ -365,11 +386,13 @@ end
 
 -- Begin the fade-out animation then destroy.
 local function beginFadeOut()
+  diagLog("beginFadeOut: webview=" .. tostring(_webview ~= nil))
   cancelLinger()
   if not _webview then return end
   jsCall("window.rsvpFadeOut")
   -- Wait for CSS transition (~300ms) then destroy.
   hs.timer.doAfter((ANIMATE_OUT_MS + 50) / 1000, function()
+    diagLog("beginFadeOut: timer fired → destroyWebview")
     destroyWebview()
   end)
 end
@@ -384,9 +407,14 @@ end
 
 -- Called from onPos when we detect that playback has passed the last word.
 local function scheduleLingerFadeOut()
-  if _lingerTimer then return end   -- already scheduled
+  if _lingerTimer then
+    diagLog("scheduleLingerFadeOut: already scheduled — no-op")
+    return
+  end
+  diagLog(string.format("scheduleLingerFadeOut: arming for %.2fs", LINGER_SECS))
   _lingerTimer = hs.timer.doAfter(LINGER_SECS, function()
     _lingerTimer = nil
+    diagLog("linger timer fired → beginFadeOut")
     beginFadeOut()
   end)
 end
@@ -403,6 +431,9 @@ end
 ---     balloon positions itself just above (or below, if above clips) that
 ---     rect instead of under the menubar icon.
 function M.show(sidecar_path, opts)
+  diagLog(string.format(
+    "M.show: sidecar_path=%s prior_webview=%s",
+    tostring(sidecar_path), tostring(_webview ~= nil)))
   -- If already visible, just reload with new sidecar.
   if _webview then
     M.hide()
@@ -568,6 +599,7 @@ end
 --- hide()
 --- Immediately destroy the balloon without animation.
 function M.hide()
+  diagLog("M.hide called")
   destroyWebview()
 end
 
@@ -578,6 +610,10 @@ end
 --- 400ms pre-roll offset, etc.), so the timer never arms and the balloon
 --- sits on-screen forever. This forces the linger-fade path regardless.
 function M.endOfStream()
+  diagLog(string.format(
+    "M.endOfStream: webview=%s last_pos_ms=%s active_buf=%s",
+    tostring(_webview ~= nil), tostring(_lastPosMs),
+    tostring(_activeBufferId)))
   if not _webview then return end
   scheduleLingerFadeOut()
 end
@@ -618,6 +654,14 @@ function M.feedSidecar(buffer_id, sidecar_json)
   end)
   if ok_parse and parsed then
     _bufferSidecars[buffer_id] = parsed
+    local n = (parsed.words and #parsed.words) or 0
+    local last = (n > 0 and parsed.words[n].end_ms) or -1
+    diagLog(string.format(
+      "feedSidecar: buf=%s words=%d last_end_ms=%s",
+      tostring(buffer_id), n, tostring(last)))
+  else
+    diagLog(string.format("feedSidecar: parse FAILED for buf=%s",
+      tostring(buffer_id)))
   end
 
   -- Also push to the webview JS side.
@@ -653,6 +697,9 @@ function M.onPos(ms, buffer_id)
   if sidecar and sidecar.words and #sidecar.words > 0 then
     local lastWord = sidecar.words[#sidecar.words]
     if ms >= lastWord.end_ms then
+      diagLog(string.format(
+        "onPos linger trigger: ms=%d >= last_end_ms=%d (buf=%s)",
+        ms, lastWord.end_ms, tostring(buffer_id)))
       scheduleLingerFadeOut()
       return
     end
