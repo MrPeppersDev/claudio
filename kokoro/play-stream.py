@@ -538,12 +538,44 @@ def _player_loop() -> None:
     pre-Bug-2 code had an inner per-buffer loop that could spin on
     pause-write-silence forever, leaking the process when the user
     paused mid-last-buffer after EXIT.)
+
+    Any uncaught exception inside the loop body is logged to hs.log
+    with a full traceback and triggers _shutdown_requested so the main
+    thread exits cleanly instead of leaving us with a dead player
+    thread but a still-running interpreter (the user-visible "audio
+    cut out, balloon stuck, no exit" failure mode).
     """
     global _stream, _stop_requested, _drain_done_emitted, _seek_request_ms
-    global _playhead_idx, _playhead_offset
+    global _playhead_idx, _playhead_offset, _shutdown_requested
 
     last_emit_buf_idx = -1   # detect buffer transitions for POS reset
     last_emit_pos = -1       # last-emitted POS in int source-ms
+
+    try:
+        _player_loop_body(last_emit_buf_idx, last_emit_pos)
+    except BaseException as exc:
+        # BaseException catches everything except the truly-uncatchable
+        # (KeyboardInterrupt, SystemExit) — and we want those too. Log
+        # full traceback so we can see exactly what wedged the player.
+        import traceback
+        tb = traceback.format_exc()
+        _diag_log(f"PLAYER THREAD CRASHED: {type(exc).__name__}: {exc}")
+        for line in tb.rstrip().split("\n"):
+            _diag_log(f"  {line}")
+        # Trigger shutdown so the main thread exits and play-last.sh's
+        # `wait $STREAM_PID` returns. Without this the process hangs in
+        # main()'s stdin read forever, leading to the orphan-process
+        # symptom where audio stops but nothing exits.
+        with _lock:
+            _shutdown_requested = True
+
+
+def _player_loop_body(last_emit_buf_idx: int, last_emit_pos: int) -> None:
+    """The actual player loop, separated so _player_loop's try/except can
+    wrap the entire iteration without indentation reflows on every
+    future change."""
+    global _stream, _stop_requested, _drain_done_emitted, _seek_request_ms
+    global _playhead_idx, _playhead_offset
 
     while True:
         # Shutdown / STOP.
