@@ -486,10 +486,24 @@ local function runPlayScript(args)
       -- we still want the balloon cleared so a crashed task doesn't leave
       -- it dangling, so hide it directly.
       if code == 0 or code == 143 or userStop then
-        diagLog(string.format(
-          "task exit: code=%s wasUserStop=%s userStop=%s → endOfStream",
-          tostring(code), tostring(wasUserStop), tostring(userStop)))
-        rsvp.endOfStream()
+        -- Stale-callback guard: when the user does F13-stop then
+        -- F13-play in quick succession, the OLD stopper task exits 0
+        -- a few seconds later — well after the NEW playback's balloon
+        -- is on screen. Without this guard, that stale exit calls
+        -- rsvp.endOfStream() on the live balloon and arms a 1.25s
+        -- linger fade, making the new balloon vanish mid-document.
+        -- jobIsRunning() reading the new lock file is the simplest
+        -- "is there a successor in progress" signal we have.
+        if jobIsRunning() then
+          diagLog(string.format(
+            "task exit: code=%s — newer job is running; skipping endOfStream",
+            tostring(code)))
+        else
+          diagLog(string.format(
+            "task exit: code=%s wasUserStop=%s userStop=%s → endOfStream",
+            tostring(code), tostring(wasUserStop), tostring(userStop)))
+          rsvp.endOfStream()
+        end
       else
         diagLog(string.format(
           "task exit: code=%s wasUserStop=%s userStop=%s → hide+alert",
