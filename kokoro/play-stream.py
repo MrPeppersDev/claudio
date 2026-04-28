@@ -704,11 +704,17 @@ def _shutdown() -> None:
       3. Abort the stream so any in-flight blocking _stream.write() returns
          immediately (otherwise the player thread can sit in CFFI for the
          duration of the buffer, racing with interpreter finalization).
-      4. Join the player thread with a short timeout. If it's stuck in C,
-         we let it die as a daemon — but the abort should unblock it well
-         within the timeout in practice.
+      4. Join the player thread with a 2s timeout. The abort SHOULD unblock
+         it within milliseconds, but on macOS PortAudio under certain
+         device-state corner cases the CFFI call wedges for seconds.
       5. Close the stream from the main thread, where lifecycle ownership
          lives.
+      6. If the player thread is STILL alive after step 4, call os._exit(0)
+         to bypass Py_FinalizeEx entirely. Letting Python tear down with a
+         live CFFI thread is the documented cause of the SEGV signature in
+         every recent .ips crash report (gc_collect_main racing
+         ffi_call_SYSV during module finalization). os._exit skips GC and
+         lets the OS reap.
     """
     global _stream, _shutdown_requested
     pt_alive_pre = _player_thread is not None and _player_thread.is_alive()
@@ -725,10 +731,10 @@ def _shutdown() -> None:
             _stream.abort()
         except Exception:
             pass
-    # 4) Join the player.
+    # 4) Join the player. 2s — gives the abort plenty of time to take.
     if _player_thread is not None:
         try:
-            _player_thread.join(timeout=0.5)
+            _player_thread.join(timeout=2.0)
         except Exception:
             pass
     pt_alive_post = _player_thread is not None and _player_thread.is_alive()
@@ -740,8 +746,17 @@ def _shutdown() -> None:
         except Exception:
             pass
         _stream = None
-    _diag_log(f"_shutdown done: player_still_alive={pt_alive_post} "
-              f"(if True, Py_FinalizeEx will race CFFI thread → segfault)")
+    # 6) Hard-exit if the CFFI thread is still alive — bypass GC entirely.
+    if pt_alive_post:
+        _diag_log("_shutdown: player thread STILL alive after 2s join — "
+                  "os._exit(0) to skip Py_FinalizeEx (avoids CFFI segfault)")
+        # Best-effort flush before bailing.
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)
+    _diag_log("_shutdown done: clean")
 
 
 def _handle_sigterm(signum, frame):  # noqa: ARG001
