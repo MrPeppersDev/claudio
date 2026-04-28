@@ -188,3 +188,14 @@ check(
 print(f"\nResults: {_passed} passed, {_failed} failed")
 if _failed:
     sys.exit(1)
+
+
+# Pytest-visible wrapper so `pytest tests/` collects these assertions as a
+# single test instead of reporting "0 collected" for the file. The
+# module-level check() calls above already executed at import time and
+# populated _failed; this just exposes the pass/fail state to pytest.
+def test_split_sentences_runner_passes():
+    assert _failed == 0, (
+        f"{_failed} sub-test(s) failed; see stdout for details "
+        f"(run `python3 tests/test_preprocess_sentences.py` for per-case output)"
+    )

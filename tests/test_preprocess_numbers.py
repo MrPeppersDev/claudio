@@ -168,3 +168,14 @@ print(f"Results: {tests_passed} passed, {tests_failed} failed")
 # code) doesn't trip on a successful run. Matches test_preprocess_sentences.py.
 if tests_failed:
     sys.exit(1)
+
+
+# Pytest-visible wrapper so `pytest tests/` collects these assertions as a
+# single test instead of reporting "0 collected" for the file. The
+# module-level run() calls above already executed at import time and
+# populated tests_failed; this just exposes the pass/fail state to pytest.
+def test_normalize_numbers_runner_passes():
+    assert tests_failed == 0, (
+        f"{tests_failed} sub-test(s) failed; see stdout for details "
+        f"(run `python3 tests/test_preprocess_numbers.py` for per-case output)"
+    )
