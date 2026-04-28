@@ -114,6 +114,18 @@ local _isPaused = false
 -- Last POS seen (for linger detection)
 local _lastPosMs = nil
 
+-- Wall-clock time of last POS event (for the hang watchdog). nil while no
+-- balloon is up. The watchdog fires when playback emits no POS for
+-- HANG_SECS while a balloon is showing — which means play-stream has
+-- wedged mid-stream (CFFI deadlock, sox subprocess hung, audio device
+-- corner case) and the user has a frozen balloon they can't dismiss
+-- without × clicking. The watchdog rescues them by force-hiding.
+local _lastPosTime = nil
+local _hangWatchdog = nil
+local HANG_SECS = 8     -- conservative: long sox stretches on cold cache
+                        -- can produce 4-5s gaps between buffers without
+                        -- being a real hang. 8s gives enough margin.
+
 -- ── Callbacks (filled by PR 4) ────────────────────────────────────────────────
 
 M.on_pause_request  = nil    -- function()
@@ -369,6 +381,39 @@ local function cancelLinger()
   end
 end
 
+-- ── Hang watchdog ────────────────────────────────────────────────────────────
+-- Catches the failure mode where play-stream.py wedges mid-stream (CFFI
+-- deadlock or PortAudio corner case) and the balloon is left frozen on the
+-- last word with no exit callback ever firing. The watchdog polls every 2s
+-- while a balloon is up; if the time since the last POS event exceeds
+-- HANG_SECS, force-hide the balloon and surface an alert so the user knows
+-- playback hung. Without this rescue the only escape is the × button.
+-- Forward-declared as a local before destroyWebview because destroyWebview
+-- calls stopHangWatchdog and Lua lexical scoping requires the name be in
+-- scope at the call site.
+local function startHangWatchdog()
+  if _hangWatchdog then return end
+  _hangWatchdog = hs.timer.doEvery(2.0, function()
+    if not _webview then return end
+    if not _lastPosTime then return end
+    local idle = hs.timer.secondsSinceEpoch() - _lastPosTime
+    if idle > HANG_SECS then
+      diagLog(string.format(
+        "hang watchdog: %.1fs since last POS — force-hiding stuck balloon",
+        idle))
+      hs.alert.show("Claudio: playback hung — clearing balloon")
+      M.hide()
+    end
+  end)
+end
+
+local function stopHangWatchdog()
+  if _hangWatchdog then
+    _hangWatchdog:stop()
+    _hangWatchdog = nil
+  end
+end
+
 -- Destroy the webview and clean up the eventtap/timers.
 local function destroyWebview()
   diagLog(string.format(
@@ -376,6 +421,7 @@ local function destroyWebview()
     tostring(_webview ~= nil), tostring(_lingerTimer ~= nil),
     tostring(_animTimer ~= nil), tostring(_fadeTimer ~= nil)))
   cancelLinger()
+  stopHangWatchdog()
   stopPolling()
   if _animTimer then
     _animTimer:stop()
@@ -464,6 +510,9 @@ function M.show(sidecar_path, opts)
   _activeSidecar   = nil
   _activeBufferId  = nil
   _isPaused        = false
+  -- Seed the hang-watchdog clock so the very first 8s of synthesis doesn't
+  -- look like a hang. onPos updates this on every POS event.
+  _lastPosTime     = hs.timer.secondsSinceEpoch()
   _lastPosMs       = nil
 
   -- Load sidecar if provided.
@@ -509,6 +558,11 @@ function M.show(sidecar_path, opts)
   -- Required so clicks make the webview content firstResponder; without it
   -- the JS keydown listener for Space/Esc/←/→ never fires.
   if _webview.allowTextEntry then _webview:allowTextEntry(true) end
+
+  -- Start the hang watchdog. Polls every 2s while the webview is up; if
+  -- HANG_SECS elapse without any POS event, force-hides the balloon
+  -- (rescues the user from the play-stream-wedged failure mode).
+  startHangWatchdog()
 
   -- Fires once when the HTML has finished loading (triggered by the
   -- navigationCallback didFinishNavigation event, or by the safety-net
@@ -712,19 +766,30 @@ function M.onPos(ms, buffer_id)
     sidecar = _activeSidecar
   end
 
-  -- Check if we've passed the end of all words (linger trigger).
+  -- The linger-fade trigger used to fire here when ms >= last_word.end_ms,
+  -- but that was wrong on two counts:
+  --   1) It fires at the end of EVERY buffer, not just the document's last
+  --      buffer — onPos has no way to know "is this the last buffer?".
+  --      Any pause or slow buffer transition longer than LINGER_SECS
+  --      would prematurely fade the balloon mid-document. Confirmed in
+  --      diag log: buf=25 finishes at ms=2525, audio plays trailing
+  --      silence to ms=3086, then the next buffer is delayed → 1.25s
+  --      timer fires → balloon vanishes mid-text.
+  --   2) The early-return in that branch short-circuited jsCall, so the
+  --      balloon stopped advancing whenever the timer was armed.
+  -- The single source of truth for end-of-document is M.endOfStream,
+  -- which the hs.task exit callback drives. Mid-document hangs (where
+  -- play-stream wedges and never sends an exit) are caught by the new
+  -- hang watchdog (see startHangWatchdog below).
   if sidecar and sidecar.words and #sidecar.words > 0 then
-    local lastWord = sidecar.words[#sidecar.words]
-    if ms >= lastWord.end_ms then
-      diagLog(string.format(
-        "onPos linger trigger: ms=%d >= last_end_ms=%d (buf=%s)",
-        ms, lastWord.end_ms, tostring(buffer_id)))
-      scheduleLingerFadeOut()
-      return
-    end
-    -- Cancel any pending linger if the pos moved back (e.g., a seek).
+    -- Cancel any pending linger if the pos moved back (e.g., a seek that
+    -- crossed back over a previous boundary). endOfStream may have armed
+    -- one and we've now resumed playback.
     cancelLinger()
   end
+
+  -- Stamp the last POS time so the hang watchdog knows playback is alive.
+  _lastPosTime = hs.timer.secondsSinceEpoch()
 
   -- Tell the webview to advance.
   if buffer_id ~= nil then
