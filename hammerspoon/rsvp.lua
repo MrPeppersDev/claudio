@@ -162,17 +162,43 @@ local function htmlPath()
   return _htmlPath
 end
 
--- Return the menubar item's screen rect from claudio.lua's `menubar` object.
--- We reach into the module to find the exported menubar. If claudio hasn't
--- started yet, fall back to a safe top-center position on the main screen.
+-- Return a "near the user" frame on the screen the user is actively using.
+-- Multi-monitor users frequently set the menubar to live on a non-primary
+-- screen (e.g. a portrait DELL while working on the laptop), in which case
+-- positioning the balloon under the menubar icon literally puts it on the
+-- monitor the user isn't looking at. Prefer the focused window's screen,
+-- then fall back to the menubar position.
 local function menubarFrame()
-  -- Try to get the frame from claudio module's menubar field.
+  -- 1) If a real app window is focused, use that screen's top-center as a
+  -- pseudo-icon frame. The balloon math below treats it as a small icon
+  -- and positions itself just below.
+  local ok_app, app = pcall(hs.application.frontmostApplication)
+  if ok_app and app then
+    local ok_win, win = pcall(function() return app:focusedWindow() end)
+    if ok_win and win then
+      local ok_scr, screen = pcall(function() return win:screen() end)
+      if ok_scr and screen then
+        local sf = screen:fullFrame()
+        return {
+          x = sf.x + sf.w / 2 - 12,
+          y = sf.y + 4,
+          w = 24,
+          h = 22,
+        }
+      end
+    end
+  end
+
+  -- 2) Try the actual menubar icon frame. This is what we used to do
+  -- unconditionally; it produces a balloon on whichever screen macOS has
+  -- decided owns the menubar.
   local ok, claudio = pcall(require, "claudio")
   if ok and claudio and claudio._menubar then
     local f = claudio._menubar:frame()
     if f then return f end
   end
-  -- Fallback: center of main screen's menu bar area.
+
+  -- 3) Final fallback: top-center of the main screen.
   local screen = hs.screen.mainScreen()
   local sf = screen:fullFrame()
   return {
@@ -392,7 +418,11 @@ end
 -- calls stopHangWatchdog and Lua lexical scoping requires the name be in
 -- scope at the call site.
 local function startHangWatchdog()
-  if _hangWatchdog then return end
+  if _hangWatchdog then
+    diagLog("hang watchdog: already running — startHangWatchdog no-op")
+    return
+  end
+  diagLog(string.format("hang watchdog: started (HANG_SECS=%d)", HANG_SECS))
   _hangWatchdog = hs.timer.doEvery(2.0, function()
     if not _webview then return end
     if not _lastPosTime then return end
@@ -411,6 +441,7 @@ local function stopHangWatchdog()
   if _hangWatchdog then
     _hangWatchdog:stop()
     _hangWatchdog = nil
+    diagLog("hang watchdog: stopped")
   end
 end
 
@@ -496,9 +527,15 @@ end
 ---     balloon positions itself just above (or below, if above clips) that
 ---     rect instead of under the menubar icon.
 function M.show(sidecar_path, opts)
+  local _anchorRepr = "nil"
+  if opts and opts.anchor then
+    local a = opts.anchor
+    _anchorRepr = string.format("{x=%s,y=%s,w=%s,h=%s}",
+      tostring(a.x), tostring(a.y), tostring(a.w), tostring(a.h))
+  end
   diagLog(string.format(
-    "M.show: sidecar_path=%s prior_webview=%s",
-    tostring(sidecar_path), tostring(_webview ~= nil)))
+    "M.show: sidecar_path=%s prior_webview=%s anchor=%s",
+    tostring(sidecar_path), tostring(_webview ~= nil), _anchorRepr))
   -- If already visible, just reload with new sidecar.
   if _webview then
     M.hide()
