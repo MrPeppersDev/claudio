@@ -733,21 +733,40 @@ local function selectionToTempfile(selection)
   return tmp
 end
 
+-- Stop the running TTS job (if any) and clear the balloon. Used by:
+--   * M.toggle's stop branch (F13 during playback)
+--   * rsvp.on_close_request (× button in balloon)
+--   * audioWatcher (output device change)
+-- Sets userInitiatedStop=true so the dying task's exit callback (which
+-- typically arrives with code 9 from SIGKILL or 143 from SIGTERM) is
+-- treated as a user stop and the spurious "Claudio error (exit 9)" alert
+-- is suppressed. Previously only M.toggle set the flag — the × button and
+-- audioWatcher paths invoked the stopper without it, so every device
+-- switch or balloon close fired an alert.
+local function stopPlayback(reason)
+  if not jobIsRunning() then
+    diagLog("stopPlayback: no job running (reason=" .. (reason or "?") .. ")")
+    return false
+  end
+  userInitiatedStop = true
+  diagLog(string.format(
+    "stopPlayback: reason=%s, userInitiatedStop ← true, runPlayScript spawn",
+    reason or "?"))
+  runPlayScript({ PLAY_SCRIPT })
+  -- Stop kills play-stream abruptly — POS events halt and rsvp would sit
+  -- on its last word forever waiting for the linger timer that never
+  -- arms (the linger trigger only fires when POS crosses last_word.end_ms).
+  diagLog("stopPlayback: calling rsvp.hide()")
+  rsvp.hide()
+  return true
+end
+
 function M.toggle()
   local running = jobIsRunning()
   diagLog(string.format("toggle entry: jobIsRunning=%s userInitiatedStop=%s",
     tostring(running), tostring(userInitiatedStop)))
   if running then
-    -- Mark this stop as user-initiated so the dying task's exit callback
-    -- doesn't fire a "Claudio error (exit 9)" alert if SIGKILL is needed.
-    userInitiatedStop = true
-    diagLog("toggle: stop branch — userInitiatedStop ← true, runPlayScript spawn")
-    runPlayScript({ PLAY_SCRIPT })
-    -- Stop kills play-stream abruptly — POS events halt and rsvp would sit
-    -- on its last word forever waiting for the linger timer that never
-    -- arms (the linger trigger only fires when POS crosses last_word.end_ms).
-    diagLog("toggle: stop branch — calling rsvp.hide()")
-    rsvp.hide()
+    stopPlayback("M.toggle")
     return
   end
   diagLog("toggle: play branch — capturing selection")
@@ -1119,11 +1138,15 @@ function M.start()
     writeControl("SEEK " .. tostring(delta_ms))
   end
   -- × button in the balloon: same semantics as F13-during-playback — stop
-  -- the TTS job (if any) and clear the balloon. Without the stop, audio
-  -- keeps playing after the balloon disappears.
+  -- the TTS job (if any) and clear the balloon. Goes through stopPlayback
+  -- so userInitiatedStop is set and the dying task's exit-9/143 doesn't
+  -- fire a spurious alert.
   rsvp.on_close_request  = function()
-    if jobIsRunning() then runPlayScript({ PLAY_SCRIPT }) end
-    rsvp.hide()
+    if not stopPlayback("rsvp.on_close_request") then
+      -- No job running — just dismiss the balloon (it can be on screen
+      -- during the post-playback linger window).
+      rsvp.hide()
+    end
   end
 
   watcher = hs.pathwatcher.new(STATE_DIR, function() render() end)
@@ -1138,7 +1161,12 @@ function M.start()
   -- interferes with casual device switching while idle.
   audioWatcher = hs.audiodevice.watcher.setCallback(function(event)
     if event == "dOut" and jobIsRunning() then
-      runPlayScript({ PLAY_SCRIPT })
+      -- Same suppression rule as the × button and F13: this is a
+      -- user-initiated-equivalent stop (the system is changing audio
+      -- routing, which we treat as the user not wanting Claudio audio
+      -- on the new output), so the dying task's exit-9 should not fire
+      -- the "Claudio error" alert.
+      stopPlayback("audioWatcher.dOut")
       hs.alert.show("Claudio paused — output device changed")
     end
   end)
