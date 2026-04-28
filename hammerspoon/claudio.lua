@@ -1042,26 +1042,12 @@ local function registerMediaKeys()
         -- AirPods double-tap and the keyboard play/pause key both map here.
         M.toggle()
         return true  -- swallow: don't pass to Music.app / Spotify
-
-      elseif data.key == "NEXT" then
-        -- Future: skip to next queued item. Guard: only act when a job is
-        -- running so the key still works for other apps when claudio is idle.
-        if jobIsRunning() then
-          -- Placeholder — queue-advance not yet implemented.
-          -- TODO: call M.queueNext() when that function exists.
-          return false
-        end
-        return false
-
-      elseif data.key == "PREVIOUS" then
-        -- Same guard: only intercept during active playback.
-        if jobIsRunning() then
-          -- Placeholder — rewind/restart not yet implemented.
-          return false
-        end
-        return false
       end
-
+      -- NEXT / PREVIOUS: not intercepted. The system routes them to whichever
+      -- app is currently registered as a Now Playing source (Music.app,
+      -- Spotify, etc.). If/when claudio grows queue-advance or rewind, add
+      -- branches here; until then, returning false lets the keys behave
+      -- normally for other apps.
       return false
     end
   )
