@@ -91,6 +91,13 @@ local SEEK_DELTA_MS = 2000
 local _webview      = nil    -- hs.webview instance (nil when hidden)
 local _lingerTimer  = nil    -- hs.timer: fires after LINGER_SECS to begin fade-out
 local _animTimer    = nil    -- hs.timer: used during animate-in
+local _fadeTimer    = nil    -- hs.timer: scheduled inside beginFadeOut to call
+                              --   destroyWebview after the CSS transition. Stored
+                              --   so destroyWebview can cancel it — without that,
+                              --   a rapid stop→play cycle that destroys the old
+                              --   balloon during the 350ms fade window leaves
+                              --   the timer orphaned, and it later fires
+                              --   destroyWebview against the *new* balloon.
 local _pollTimer    = nil    -- hs.timer: polls window.__claudio_q for button clicks
 local _htmlPath     = nil    -- absolute path to rsvp.html
 
@@ -364,14 +371,22 @@ end
 
 -- Destroy the webview and clean up the eventtap/timers.
 local function destroyWebview()
-  diagLog(string.format("destroyWebview: webview=%s linger=%s anim=%s",
+  diagLog(string.format(
+    "destroyWebview: webview=%s linger=%s anim=%s fade=%s",
     tostring(_webview ~= nil), tostring(_lingerTimer ~= nil),
-    tostring(_animTimer ~= nil)))
+    tostring(_animTimer ~= nil), tostring(_fadeTimer ~= nil)))
   cancelLinger()
   stopPolling()
   if _animTimer then
     _animTimer:stop()
     _animTimer = nil
+  end
+  -- Cancel the fade-out follow-up timer if we're being destroyed before
+  -- it fires. Without this, an orphaned timer can later run destroyWebview
+  -- on a brand-new balloon spawned by a rapid stop→play cycle.
+  if _fadeTimer then
+    _fadeTimer:stop()
+    _fadeTimer = nil
   end
   if _webview then
     _webview:delete()
@@ -390,8 +405,12 @@ local function beginFadeOut()
   cancelLinger()
   if not _webview then return end
   jsCall("window.rsvpFadeOut")
-  -- Wait for CSS transition (~300ms) then destroy.
-  hs.timer.doAfter((ANIMATE_OUT_MS + 50) / 1000, function()
+  -- Wait for CSS transition (~300ms) then destroy. Store the handle in
+  -- _fadeTimer so destroyWebview can cancel it — otherwise a rapid
+  -- stop→play cycle during the fade window orphans this timer, which
+  -- later fires destroyWebview against the brand-new balloon.
+  _fadeTimer = hs.timer.doAfter((ANIMATE_OUT_MS + 50) / 1000, function()
+    _fadeTimer = nil
     diagLog("beginFadeOut: timer fired → destroyWebview")
     destroyWebview()
   end)

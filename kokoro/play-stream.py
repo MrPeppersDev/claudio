@@ -495,13 +495,19 @@ def _schedule_end_of_buffer_pos(buffer_id: int, samples: np.ndarray,
             final_delay_s,
             lambda sm=final_source_ms, bid=buffer_id: _emit_pos(sm, bid),
         )
+        # Daemon flag must be set BEFORE start(); CPython silently ignores
+        # the attribute write on a running thread. A non-daemon Timer that
+        # fires its callback during interpreter shutdown keeps the runtime
+        # alive long enough for GC to race the still-executing CFFI path,
+        # which is one of the segfault contributors documented in the .ips
+        # crash reports.
+        t.daemon = True
         with _pending_timers_lock:
             # Prune fired timers — otherwise the list grows for the entire
             # session (one per natural-advance) and _drain_done_ready_unlocked
             # walks it every 20 ms tick.
             _pending_timers[:] = [pt for pt in _pending_timers if pt.is_alive()]
             _pending_timers.append(t)
-        t.daemon = True
         t.start()
     else:
         _emit_pos(final_source_ms, buffer_id)
