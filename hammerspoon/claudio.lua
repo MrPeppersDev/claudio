@@ -454,8 +454,25 @@ local function runPlayScript(args)
   -- `>` redirect, kokoro-tts.sh's cleanup can unlink the FIFO, and the
   -- shell's `>` then creates a regular file at the same path. Those
   -- accumulate as turds in $STATE_DIR over rapid stop/play cycles.
+  --
+  -- Implemented in pure Lua via hs.fs.dir / os.remove rather than
+  -- shelling out via hs.execute. The shell-out version called
+  -- hs.execute(..., true) which spawns a LOGIN shell on every
+  -- runPlayScript (every play AND every stop), running the user's
+  -- full bash startup. That's both slow and a strong suspect for the
+  -- "F13 stops responding after a stop sequence" symptom — login
+  -- shell startup was modifying focus/keyboard state in some way
+  -- that disrupted Hammerspoon's Carbon hotkey registration. Pure-
+  -- Lua sweep is fast and side-effect-free.
   if STATE_DIR and STATE_DIR ~= "" then
-    hs.execute("rm -f " .. shellQuote(STATE_DIR) .. "/control.* 2>/dev/null", true)
+    local ok_iter, iter = pcall(hs.fs.dir, STATE_DIR)
+    if ok_iter and iter then
+      for entry in iter do
+        if type(entry) == "string" and entry:sub(1, 8) == "control." then
+          os.remove(STATE_DIR .. "/" .. entry)
+        end
+      end
+    end
   end
 
   hs.task.new("/bin/bash",
