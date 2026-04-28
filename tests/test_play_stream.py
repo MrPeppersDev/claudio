@@ -317,7 +317,68 @@ class TestAudioLeadCompensation:
 
 
 # ---------------------------------------------------------------------------
-# 3. Smoke test (optional — skipped if no audio device)
+# 3. Edge-fade DSP — load-bearing per CLAUDE.md (kills DC-step clicks at
+#    sentence seams). A regression here is silent unless someone listens.
+# ---------------------------------------------------------------------------
+
+class TestEdgeFade:
+    def _const(self, ms: int, value: float = 0.5) -> "np.ndarray":
+        n = int(_ps.SAMPLE_RATE * ms / 1000)
+        return np.full(n, value, dtype=np.float32)
+
+    def test_first_sample_zeroed(self):
+        """fade-in starts at 0 — that's the whole point of avoiding the click."""
+        samples = self._const(100)  # well over 2 * 3ms
+        out = _ps._edge_fade(samples)
+        assert out[0] == 0.0
+
+    def test_last_sample_zeroed(self):
+        samples = self._const(100)
+        out = _ps._edge_fade(samples)
+        assert out[-1] == 0.0
+
+    def test_middle_unchanged(self):
+        """Beyond the fade window, samples carry their original value."""
+        samples = self._const(100, 0.5)
+        out = _ps._edge_fade(samples)
+        n = int(_ps.SAMPLE_RATE * _ps.EDGE_FADE_MS / 1000)
+        # middle slice is between fade-in end and fade-out start
+        middle = out[n:-n]
+        assert np.allclose(middle, 0.5)
+
+    def test_fade_in_monotonic(self):
+        samples = self._const(100, 1.0)
+        out = _ps._edge_fade(samples)
+        n = int(_ps.SAMPLE_RATE * _ps.EDGE_FADE_MS / 1000)
+        head = out[:n]
+        # diff is >= 0 everywhere → non-decreasing
+        assert np.all(np.diff(head) >= 0.0)
+
+    def test_fade_out_monotonic(self):
+        samples = self._const(100, 1.0)
+        out = _ps._edge_fade(samples)
+        n = int(_ps.SAMPLE_RATE * _ps.EDGE_FADE_MS / 1000)
+        tail = out[-n:]
+        assert np.all(np.diff(tail) <= 0.0)
+
+    def test_too_short_returns_unchanged(self):
+        """Input shorter than 2 * fade window → no-op (can't fade meaningfully)."""
+        n = int(_ps.SAMPLE_RATE * _ps.EDGE_FADE_MS / 1000)
+        samples = np.full(n, 0.5, dtype=np.float32)  # exactly fade window
+        original = samples.copy()
+        out = _ps._edge_fade(samples)
+        assert out is samples
+        assert np.array_equal(out, original)
+
+    def test_mutates_in_place(self):
+        """Callers chain on the returned array; must be the same object."""
+        samples = self._const(100)
+        out = _ps._edge_fade(samples)
+        assert out is samples
+
+
+# ---------------------------------------------------------------------------
+# 4. Smoke test (optional — skipped if no audio device)
 # ---------------------------------------------------------------------------
 
 def _has_audio_device() -> bool:

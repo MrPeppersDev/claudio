@@ -274,9 +274,9 @@ class TestTrimSacrificialHead:
         # returned prefix should be << the original 500ms prefix.
         #   sig.size - result.size ≈ samples cut from the head.
         cut_ms = (sig.size - result.size) * 1000.0 / SR
-        assert 430 <= cut_ms <= 600, (
-            f"Cut at {cut_ms:.0f}ms — expected between min_cut (430ms) "
-            f"and end of comma gap (~600ms)."
+        assert HEAD_TRIM_MIN_CUT_AT_1X_MS <= cut_ms <= 600, (
+            f"Cut at {cut_ms:.0f}ms — expected between min_cut "
+            f"({HEAD_TRIM_MIN_CUT_AT_1X_MS}ms) and end of comma gap (~600ms)."
         )
 
     def test_compressed_gap_still_detected(self):
