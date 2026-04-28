@@ -44,14 +44,28 @@ port_holders() {
 }
 
 cmd_status() {
-  local pid state
+  local pid state model log_tail
   if pid=$(recorded_pid); then
     if is_healthy; then state="running (healthy)"; else state="running (unhealthy)"; fi
   else
     pid=""
     if is_healthy; then state="running (unmanaged)"; else state="stopped"; fi
   fi
-  printf 'state=%s\npid=%s\nport=%s\n' "$state" "$pid" "$PORT"
+  # Best-effort context for bug reports: which model file is loaded and
+  # the last few log lines. Both come from $LOG_FILE which is always
+  # under STATE_DIR, so no path traversal concern. `claudio.lua` only
+  # parses the `state=` line, so additional fields are safe to add.
+  model=""
+  if [ -r "$LOG_FILE" ]; then
+    model=$(grep 'loading model from' "$LOG_FILE" 2>/dev/null | tail -1 \
+      | sed 's/.*loading model from //')
+  fi
+  log_tail=""
+  if [ -r "$LOG_FILE" ]; then
+    log_tail=$(tail -n 3 "$LOG_FILE" 2>/dev/null | sed 's/^/  /')
+  fi
+  printf 'state=%s\npid=%s\nport=%s\nlog_file=%s\nmodel=%s\nlog_tail=\n%s\n' \
+    "$state" "$pid" "$PORT" "$LOG_FILE" "$model" "$log_tail"
 }
 
 cmd_start() {

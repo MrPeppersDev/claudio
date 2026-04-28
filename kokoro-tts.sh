@@ -169,14 +169,16 @@ prune_cache() {
     | xargs -0 stat -f '%z' 2>/dev/null | awk '{s+=$1} END{print s+0}')
   [ "$total" -le "$max_bytes" ] && return
   local freed_before="$total"
+  local removed=0
   while IFS=' ' read -r mtime size path; do
     [ "$total" -le "$max_bytes" ] && break
     [ -z "$path" ] && continue
     rm -f "$path"
     total=$((total - size))
+    removed=$((removed + 1))
   done < <(find "$CACHE_DIR" -name '*.wav' -type f -print0 \
     | xargs -0 stat -f '%m %z %N' 2>/dev/null | sort -n)
-  log "cache prune: ${freed_before} -> ${total} bytes (cap ${max_bytes})"
+  log "cache prune: ${freed_before} -> ${total} bytes, removed=${removed} files (cap ${max_bytes})"
 }
 
 current_preview() {
@@ -264,6 +266,10 @@ printf '%s' "$TEXT" | awk -v RS=$'\x1e' -v dir="$WORK_DIR" '
 
 SEG_COUNT=$(find "$WORK_DIR" -maxdepth 1 -name 'seg-*.txt' | wc -l | tr -d ' ')
 log "kokoro synthesize: voice=$VOICE target=${SPEED}x synth=${SYNTH_SPEED}x playback=${PLAYBACK_RATE}x lang=$LANG_CODE chars=${#TEXT} segments=$SEG_COUNT"
+# Effective config snapshot at synth start. A bug report saying "audio is
+# too bright" or "banana leaked through" needs to know exactly which knobs
+# this run used; SYNTH_VERSION lets us correlate with cache contents.
+log "  config: version=$SYNTH_VERSION eq=${EQ_GAIN_DB}dB@${EQ_FREQ}Hz/Q${EQ_Q} pad=${PAD_START_MS}ms trim=${TAIL_TRIM_MS}ms sacrificial=${SACRIFICIAL_WORD:-none} coalesce=${COALESCE_MAX_CHARS}"
 write_state synth
 
 have_earcon=0
@@ -286,6 +292,15 @@ if [ "${KOKORO_NO_PLAY:-0}" != "1" ]; then
   rm -f "$STREAM_FIFO"
   STREAM_FIFO=""
   STREAM_FD_OPEN=1
+  # Liveness check: if play-stream.py died at startup (no audio device,
+  # missing portaudio, device busy), the next RATE/PLAY writes go into a
+  # pipe with no reader and the user gets silence with no log entry. A
+  # short sleep + kill -0 catches the common case before we commit work.
+  sleep 0.1
+  if ! kill -0 "$STREAM_PID" 2>/dev/null; then
+    log "ERROR: play-stream.py exited at startup (audio device? portaudio?)"
+    exit 5
+  fi
   # Send initial playback rate.
   printf 'RATE %s\n' "$PLAYBACK_RATE" >&9
 

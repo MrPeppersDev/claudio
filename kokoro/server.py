@@ -812,6 +812,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
         t0 = time.time()
+        # Pre-initialize so the except block can reference len(phonemes) even
+        # if phonemize() itself is what raised — phoneme count is the most
+        # useful signal for diagnosing model errors and we want it whether
+        # the failure is in phonemize, chunking, or the per-chunk synth.
+        phonemes = ""
         try:
             # Phonemize once, then chunk into ≤MAX_PHONEMES_PER_CALL pieces
             # so we never trip Kokoro-82M's 510-phoneme IndexError on long
@@ -832,6 +837,15 @@ class Handler(BaseHTTPRequestHandler):
                 np.concatenate(gather_parts) if gather_parts else None
             )
         except Exception as e:
+            # Server-side log line carries the input context the curl-
+            # forwarded 500 body lacks. Without this the failure message
+            # in tts.log is "synth failed: list index out of range" with
+            # no way to reproduce.
+            sys.stderr.write(
+                f"[kokoro] synth FAILED: chars={len(text)} voice={voice_spec!r} "
+                f"speed={speed} lang={lang} phonemes={len(phonemes)} "
+                f"error={type(e).__name__}: {e}\n"
+            )
             self._json(500, {"error": f"synth failed: {e}"})
             return
         t1 = time.time()
