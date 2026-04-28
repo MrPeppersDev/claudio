@@ -44,6 +44,10 @@ local VOICE_FILE = STATE_DIR .. "/voice"
 local PLAY_LOG = STATE_DIR .. "/play.log"
 local SERVER_LOG = STATE_DIR .. "/kokoro-server.log"
 local QUEUE_DIR = STATE_DIR .. "/queue"
+-- CACHE_DIR mirrors kokoro-tts.sh's KOKORO_CACHE_DIR resolution. Used to
+-- bound paths read from the play task's stderr stream (SIDECAR <path>),
+-- which would otherwise be a stderr-injection arbitrary-file-read primitive.
+local CACHE_DIR = os.getenv("KOKORO_CACHE_DIR") or (STATE_DIR .. "/cache")
 local PLAY_SCRIPT = CLAUDIO_DIR .. "/play-last.sh"
 local SERVER_SCRIPT = CLAUDIO_DIR .. "/kokoro-server.sh"
 local KOKORO_URL = os.getenv("KOKORO_URL") or "http://127.0.0.1:8880"
@@ -261,14 +265,29 @@ local function kokoroServerStop()
   hs.execute(SERVER_SCRIPT .. " stop >/dev/null 2>&1", true)
 end
 
+-- POSIX shell single-quote escape: wraps `s` in single quotes and replaces any
+-- embedded single quote with the standard `'\''` sequence. Used to interpolate
+-- paths into shell commands (notably the tail-F invocation passed to Terminal
+-- via AppleScript) so a path containing a single quote can't break out of the
+-- argument and inject metacharacters. Hostile paths in normal use are unlikely
+-- but CLAUDIO_STATE_DIR is read from the environment.
+local function shellQuote(s)
+  return "'" .. s:gsub("'", "'\\''") .. "'"
+end
+
 -- Opens Terminal.app running `tail -F` on both Claudio log files. Terminal is
 -- shipped with macOS so this works on a vanilla install without requiring the
 -- user to have iTerm / kitty / etc. `touch` first so `tail -F` doesn't spin
 -- on a fresh install where no log exists yet; `-F` (capital) keeps following
 -- across rotate/recreate, which `kokoro-server.sh stop; start` will cause.
 local function tailLogs()
-  hs.execute(string.format("touch '%s' '%s' 2>/dev/null", PLAY_LOG, SERVER_LOG), true)
-  local cmd = string.format("tail -F '%s' '%s'", PLAY_LOG, SERVER_LOG)
+  local touchCmd = string.format(
+    "touch %s %s 2>/dev/null", shellQuote(PLAY_LOG), shellQuote(SERVER_LOG)
+  )
+  hs.execute(touchCmd, true)
+  local cmd = string.format(
+    "tail -F %s %s", shellQuote(PLAY_LOG), shellQuote(SERVER_LOG)
+  )
   -- %q quotes and escapes for Lua, but AppleScript double-quoted literals use
   -- the same `\"` / `\\` / `\n` conventions, so it round-trips cleanly for
   -- the plain-ASCII command we're passing.
@@ -282,6 +301,24 @@ end
 -- ============================================================
 -- Script runner (async — don't block Hammerspoon on synthesis)
 -- ============================================================
+
+-- Confine a path read from the play task's stderr to a known directory.
+-- The SIDECAR/CTRL stderr protocol carries paths from the child process;
+-- without these checks, any line a child writes to stderr matching the
+-- protocol regex (e.g. a Python traceback containing such a string) can
+-- redirect file reads or control writes to attacker-chosen locations.
+-- Trailing-slash check on the prefix prevents `/foo/bar` matching
+-- `/foo/barbaz`. Reject literal `..` segments rather than try to resolve
+-- them — Lua has no realpath and the protocol never legitimately uses them.
+local function pathInsideDir(path, dir)
+  if type(path) ~= "string" or path == "" then return false end
+  if path:find("/%.%./") or path:sub(-3) == "/.." or path:sub(1, 3) == "../" then
+    return false
+  end
+  local prefix = dir
+  if prefix:sub(-1) ~= "/" then prefix = prefix .. "/" end
+  return path:sub(1, #prefix) == prefix
+end
 
 -- Read a sidecar JSON file produced by the Kokoro server. Returns the raw
 -- JSON text (rsvp.feedSidecar does its own decode) or nil if unreadable.
@@ -345,6 +382,10 @@ local function processStderrLine(line)
   if line:sub(1, 8) == "SIDECAR " then
     local id_s, path = line:match("^SIDECAR (%d+) (.+)$")
     if id_s and path then
+      if not pathInsideDir(path, CACHE_DIR) or not path:match("%.words%.json$") then
+        hs.printf("[claudio] rejecting SIDECAR path outside CACHE_DIR: %s", path)
+        return
+      end
       local json = loadSidecar(path)
       if json then
         rsvp.feedSidecar(tonumber(id_s), json)
@@ -355,6 +396,11 @@ local function processStderrLine(line)
   if line:sub(1, 5) == "CTRL " then
     local path = line:match("^CTRL (.+)$")
     if path then
+      local basename = path:match("([^/]+)$") or ""
+      if not pathInsideDir(path, STATE_DIR) or basename:sub(1, 8) ~= "control." then
+        hs.printf("[claudio] rejecting CTRL path outside STATE_DIR: %s", path)
+        return
+      end
       controlFifoPath = path
     end
   end
