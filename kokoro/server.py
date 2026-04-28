@@ -43,6 +43,20 @@ VOICES_PATH = os.path.join(HERE, "voices-v1.0.bin")
 HOST = os.environ.get("KOKORO_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KOKORO_PORT", "8880"))
 
+# Cache directory the server is allowed to write sidecars into. Mirrors
+# kokoro-tts.sh's KOKORO_CACHE_DIR resolution so the two processes agree
+# without needing to pass the path on every request. cache_path values from
+# /speak payloads are validated to live inside this dir before any
+# filesystem touch — without that check, the loopback API is a write-anywhere
+# primitive for any local process that can reach the port.
+_DEFAULT_CACHE_DIR = os.path.join(
+    os.environ.get("CLAUDIO_STATE_DIR") or os.path.expanduser("~/.claude/claudio"),
+    "cache",
+)
+CACHE_DIR = os.path.realpath(
+    os.environ.get("KOKORO_CACHE_DIR") or _DEFAULT_CACHE_DIR
+)
+
 # Bind-safety guard: the server has no auth. Binding to anything other than
 # loopback would expose an unauthenticated TTS endpoint to the LAN (CPU burn,
 # voice enumeration, at worst an OS-level vuln in onnxruntime). Refuse by
@@ -162,6 +176,12 @@ HEAD_TRIM_REL_THRESHOLD = 0.15
 HEAD_TRIM_MIN_CUT_AT_1X_MS = 430
 HEAD_TRIM_MAX_CUT_AT_1X_MS = 950
 
+# Cap on how many name:weight entries a /speak voice spec may contain.
+# Each entry costs an O(N) numpy scale-and-add over a 64-float style vector,
+# trivial individually but unbounded otherwise — a 50KB voice_spec fits inside
+# MAX_REQUEST_BYTES and would loop tens of thousands of times.
+MAX_BLEND_ENTRIES = 10
+
 
 class ValidationError(ValueError):
     """Raised when a /speak payload field is out of range or malformed."""
@@ -190,6 +210,36 @@ def _check_range(value: float, *, field: str, lo: float, hi: float) -> float:
     return value
 
 
+def _validate_cache_path(cache_path: str) -> str:
+    """
+    Reject cache_path values that don't resolve inside CACHE_DIR or that
+    don't end with `.wav`. Returns the realpath on success, raises
+    ValidationError on rejection. Without this check the sidecar writer is a
+    constrained write-anywhere primitive: any local process reaching the
+    loopback server can drop attacker-controlled JSON at arbitrary
+    `*.words.json` paths (disk fill, sidecar poisoning, plist drops if any
+    daemon globs that suffix).
+    """
+    if not cache_path:
+        raise ValidationError("cache_path: empty")
+    if not os.path.isabs(cache_path):
+        raise ValidationError(f"cache_path: must be absolute (got {cache_path!r})")
+    if not cache_path.endswith(".wav"):
+        raise ValidationError(f"cache_path: must end with .wav (got {cache_path!r})")
+    real = os.path.realpath(cache_path)
+    try:
+        if os.path.commonpath([CACHE_DIR, real]) != CACHE_DIR:
+            raise ValidationError(
+                f"cache_path: outside cache dir (got {cache_path!r}, "
+                f"cache_dir={CACHE_DIR!r})"
+            )
+    except ValueError:
+        raise ValidationError(
+            f"cache_path: not comparable to cache dir (got {cache_path!r})"
+        )
+    return real
+
+
 def resolve_voice(spec: str):
     """
     Parse a voice spec and return either a voice name (str) or a blended
@@ -206,8 +256,13 @@ def resolve_voice(spec: str):
     if "," not in spec and ":" not in spec:
         # Plain name — let KOKORO.create() validate by name.
         return spec
+    parts = spec.split(",")
+    if len(parts) > MAX_BLEND_ENTRIES:
+        raise ValueError(
+            f"too many blend entries ({len(parts)}; max {MAX_BLEND_ENTRIES})"
+        )
     entries = []
-    for part in spec.split(","):
+    for part in parts:
         if ":" in part:
             name, raw_w = part.split(":", 1)
             weight = float(raw_w.strip())
@@ -744,7 +799,17 @@ class Handler(BaseHTTPRequestHandler):
         # writes cache/<hash>.words.json alongside the WAV on the server's
         # filesystem. kokoro-tts.sh passes this when it has a definite cache
         # target path so the sidecar is written atomically with the WAV.
-        cache_path = (payload.get("cache_path") or "").strip()
+        # Validation rejects paths outside CACHE_DIR — without it any local
+        # process reaching the loopback API can drop attacker-controlled
+        # JSON at arbitrary `*.words.json` paths.
+        cache_path_raw = (payload.get("cache_path") or "").strip()
+        cache_path = ""
+        if cache_path_raw:
+            try:
+                cache_path = _validate_cache_path(cache_path_raw)
+            except ValidationError as e:
+                self._json(400, {"error": str(e)})
+                return
 
         t0 = time.time()
         try:
