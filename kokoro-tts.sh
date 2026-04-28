@@ -257,6 +257,12 @@ cleanup() {
   fi
   [ -n "$STREAM_FIFO" ] && rm -f "$STREAM_FIFO"
   rm -rf "$WORK_DIR"
+  # Sweep partial cache writes that could have been left by a SIGTERM
+  # during curl. Each sentence writes <hash>.wav.tmp first then atomically
+  # mv's; if killed mid-curl the .tmp lingers. Sweeping here is safe
+  # because play-last.sh's lock prevents a concurrent kokoro-tts.sh from
+  # writing into the same cache dir.
+  rm -f "$CACHE_DIR"/*.wav.tmp 2>/dev/null || true
 }
 trap cleanup EXIT
 
