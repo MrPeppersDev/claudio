@@ -314,6 +314,13 @@ def _split_keeping_delims(text: str, delim_class: str) -> list[str]:
     Split `text` such that each piece ends with its terminating delimiter
     (if one was present). e.g. "abc. def! ghi" + r"[.!?]" →
     ["abc.", " def!", " ghi"].
+
+    Constraint: ``delim_class`` must be a literal regex character class
+    of the form ``[abc]`` — no ranges (``[a-z]``), no metacharacters
+    other than the brackets themselves. The implementation strips the
+    outer brackets and embeds the contents in a negated class, so any
+    ``-`` or ``]`` inside would mis-parse silently. Current callers pass
+    ``r"[.!?]"`` and ``r"[,;:—–]"`` which both satisfy this.
     """
     pattern = re.compile(rf"([^{delim_class[1:-1]}]*{delim_class})")
     pieces = pattern.findall(text)
@@ -644,8 +651,16 @@ def synth_with_durations(
         # silence and the banana+comma gap pushes past its max-cut guardrail
         # — detector fails open and "banana," plays audibly.
         if len(gather) == len(tokens) + 2:
-            head_samples = int(gather[0]) * 600
-            tail_samples = int(gather[-1]) * 600
+            # Local import: kokoro.timing is loaded lazily because tests
+            # stub the phonemizer dependency before importing it. A
+            # module-level import here would fire timing.py's
+            # `from phonemizer import _phonemize` at server.py import time,
+            # before tests get a chance to install the stub. The
+            # function-cache means the cost is one dict lookup after first
+            # call, not a real import each iteration.
+            from kokoro.timing import SAMPLES_PER_FRAME
+            head_samples = int(gather[0]) * SAMPLES_PER_FRAME
+            tail_samples = int(gather[-1]) * SAMPLES_PER_FRAME
             n = audio.shape[0]
             head_samples = min(head_samples, n)
             tail_samples = min(tail_samples, n - head_samples)

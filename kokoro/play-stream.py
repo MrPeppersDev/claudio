@@ -432,7 +432,15 @@ def _drain_done_ready_unlocked() -> bool:
     buffer Timer has finished firing AND the playhead has reached the end
     of the last history buffer. The end-of-history check matters during
     cross-buffer scrubbing: if the user has scrubbed back, we mustn't
-    fire DRAIN_DONE just because EXIT was sent — they're still listening."""
+    fire DRAIN_DONE just because EXIT was sent — they're still listening.
+
+    Lock acquisition order: callers hold ``_lock``, this function then
+    acquires ``_pending_timers_lock``. The reverse order is never used
+    anywhere in this module — keep it that way to avoid a deadlock.
+    ``_cancel_pending_timers`` and the natural-advance prune in
+    ``_emit_pos`` both acquire only ``_pending_timers_lock``, so they're
+    compatible.
+    """
     if not _audio_queue.empty():
         return False
     with _pending_timers_lock:
