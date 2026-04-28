@@ -389,6 +389,14 @@ local function processStderrLine(line)
       local json = loadSidecar(path)
       if json then
         rsvp.feedSidecar(tonumber(id_s), json)
+      else
+        -- Sidecar was announced but not readable. Common causes: server
+        -- ran without a patched model (no timings produced), permission
+        -- error, or a write race. Surface in the HS console so "balloon
+        -- stays empty" has a diagnostic trail instead of looking like a
+        -- silent UI bug.
+        hs.printf("[claudio] SIDECAR missing or unreadable: id=%d path=%s",
+                  tonumber(id_s), path)
       end
     end
     return

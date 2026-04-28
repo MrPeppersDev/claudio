@@ -225,10 +225,21 @@ def _stretch(samples: np.ndarray, rate: float) -> np.ndarray:
             capture_output=True,
             check=True,
         )
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-        # Sox missing or failed — play at 1.0x rather than corrupt pitch.
-        print(f"play-stream: sox tempo unavailable, skipping stretch: {exc}",
+    except FileNotFoundError as exc:
+        # Sox not installed — play at 1.0x rather than corrupt pitch.
+        # Distinct from CalledProcessError so a post-mortem can tell
+        # "system never had sox" from "sox failed on this specific buffer".
+        print(f"play-stream: sox not installed, skipping stretch: {exc}",
               file=sys.stderr)
+        return samples
+    except subprocess.CalledProcessError as exc:
+        err_msg = (exc.stderr.decode("utf-8", errors="replace").strip()
+                   if exc.stderr else "")
+        print(
+            f"play-stream: sox returned {exc.returncode} on stretch "
+            f"(rate={rate:.3f}, samples={samples.size}): {err_msg}",
+            file=sys.stderr,
+        )
         return samples
     stretched, _ = sf.read(io.BytesIO(proc.stdout), dtype="float32", always_2d=False)
     return stretched.astype(np.float32)
