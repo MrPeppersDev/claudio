@@ -109,6 +109,25 @@ POS_CADENCE_S = 0.020  # ~20 ms between POS emissions while playing
 # 20-30 ms. We cache it at startup.
 _STREAM_OUTPUT_LATENCY_S: float = 0.0
 
+
+def _diag_log(msg: str) -> None:
+    """Append to ~/.claude/claudio/hs.log so the play-stream lifecycle shows
+    up on the same timeline as claudio.lua / rsvp.lua diagnostics. Best-
+    effort — silent on any IO error since this fires from signal handlers
+    and shutdown paths where we can't tolerate exceptions."""
+    try:
+        state_dir = (os.environ.get("CLAUDIO_STATE_DIR")
+                     or os.path.expanduser("~/.claude/claudio"))
+        ts = time.time()
+        secs = int(ts)
+        ms = int((ts - secs) * 1000)
+        stamp = time.strftime("%H:%M:%S", time.localtime(secs))
+        with open(os.path.join(state_dir, "hs.log"), "a") as f:
+            f.write(f"[{stamp}.{ms:03d}] [play-stream] {msg}\n")
+    except Exception:
+        pass
+
+
 # ---- shared state (protected by _lock) ----------------------------------------
 
 _lock = threading.Lock()
@@ -685,6 +704,9 @@ def _shutdown() -> None:
          lives.
     """
     global _stream, _shutdown_requested
+    pt_alive_pre = _player_thread is not None and _player_thread.is_alive()
+    _diag_log(f"_shutdown entry: player_alive={pt_alive_pre} "
+              f"stream={'open' if _stream is not None else 'none'}")
     # 1) Cancel any pending POS Timers.
     _cancel_pending_timers()
     # 2) Signal the player thread.
@@ -702,6 +724,8 @@ def _shutdown() -> None:
             _player_thread.join(timeout=0.5)
         except Exception:
             pass
+    pt_alive_post = _player_thread is not None and _player_thread.is_alive()
+    _diag_log(f"_shutdown post-join: player_alive={pt_alive_post}")
     # 5) Close.
     if _stream is not None:
         try:
@@ -709,9 +733,12 @@ def _shutdown() -> None:
         except Exception:
             pass
         _stream = None
+    _diag_log(f"_shutdown done: player_still_alive={pt_alive_post} "
+              f"(if True, Py_FinalizeEx will race CFFI thread → segfault)")
 
 
 def _handle_sigterm(signum, frame):  # noqa: ARG001
+    _diag_log(f"_handle_sigterm: signum={signum}")
     _shutdown()
     sys.exit(0)
 
@@ -886,9 +913,13 @@ def main() -> None:
     # the original join — five seconds covers any normal drain (sox runs
     # are bounded, queue is short by design); after that, _shutdown()
     # takes over and forces clean exit.
+    _diag_log(f"main: stdin EOF, beginning bounded drain "
+              f"(unfinished={_audio_queue.unfinished_tasks})")
     drainer = threading.Thread(target=_audio_queue.join, daemon=True)
     drainer.start()
     drainer.join(timeout=5.0)
+    _diag_log(f"main: drain wait done (drainer_alive={drainer.is_alive()}, "
+              f"unfinished={_audio_queue.unfinished_tasks})")
     _shutdown()
 
 
