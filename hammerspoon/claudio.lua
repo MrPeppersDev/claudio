@@ -422,6 +422,14 @@ local function runPlayScript(args)
   -- into the next task's first line.
   controlFifoPath = nil
   stderrBuffer = ""
+  -- Sweep stray control.* files left by the writeControl FIFO race —
+  -- between hs.fs.attributes (named-pipe check) and the spawned shell's
+  -- `>` redirect, kokoro-tts.sh's cleanup can unlink the FIFO, and the
+  -- shell's `>` then creates a regular file at the same path. Those
+  -- accumulate as turds in $STATE_DIR over rapid stop/play cycles.
+  if STATE_DIR and STATE_DIR ~= "" then
+    hs.execute("rm -f " .. shellQuote(STATE_DIR) .. "/control.* 2>/dev/null", true)
+  end
 
   hs.task.new("/bin/bash",
     function(code)

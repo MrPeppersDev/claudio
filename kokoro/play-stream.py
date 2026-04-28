@@ -875,7 +875,18 @@ def main() -> None:
     # Same path as SIGTERM so the player thread gets a clean exit and any
     # pending end-of-buffer Timers are cancelled before the interpreter
     # tears down — preventing the post-finalization CFFI segfault.
-    _audio_queue.join()
+    #
+    # _audio_queue.join() blocks on Queue.unfinished_tasks. If the player
+    # thread aborted early (e.g. _stream_write hit a sounddevice error and
+    # set _shutdown_requested before calling task_done() on the item it had
+    # already pulled), unfinished_tasks stays > 0 forever and the join
+    # deadlocks. Cap the drain wait by joining a daemon thread that runs
+    # the original join — five seconds covers any normal drain (sox runs
+    # are bounded, queue is short by design); after that, _shutdown()
+    # takes over and forces clean exit.
+    drainer = threading.Thread(target=_audio_queue.join, daemon=True)
+    drainer.start()
+    drainer.join(timeout=5.0)
     _shutdown()
 
 

@@ -172,13 +172,23 @@ if [ "$MODE" = "drain" ]; then
   log "drain: started pid=$$"
 
   current_child=""
+  next_path=""
   drain_cleanup() {
     # Kill whatever child is still running (if we got SIGTERMed mid-item)
     if [ -n "$current_child" ] && kill -0 "$current_child" 2>/dev/null; then
       kill -TERM "$current_child" 2>/dev/null || true
     fi
-    rm -rf "$QUEUE_DIR" "$QUEUE_LOCK_DIR"
+    # Remove only the in-flight item file. Items already played were
+    # deleted in the loop; items not yet started stay in the queue so a
+    # subsequent drain can resume. The toggle-stop path in the parent
+    # block still wipes the whole queue when the user explicitly stops.
+    [ -n "$next_path" ] && [ -f "$next_path" ] && rm -f "$next_path"
+    next_path=""
+    rm -rf "$QUEUE_LOCK_DIR"
     rm -f "$QUEUE_PID_FILE"
+    # Drop the queue dir if it's empty (natural completion path), but
+    # keep it around if there are unplayed items left behind.
+    rmdir "$QUEUE_DIR" 2>/dev/null || true
     write_state idle
     log "drain: cleanup done"
   }
@@ -202,6 +212,11 @@ if [ "$MODE" = "drain" ]; then
     ec=$?
     set -e
     current_child=""
+    # Played item is consumed regardless of exit code — even on a kill or
+    # error, the audio that was going to come from this file is gone, and
+    # re-playing it on a future drain wouldn't recover the experience.
+    rm -f "$next_path"
+    next_path=""
     # 143 = SIGTERM (toggle-stop killed us). Any nonzero exit → stop draining;
     # the user either asked to stop or the play path errored and further
     # items probably won't fare better.
@@ -267,7 +282,15 @@ if [ -f "$LOCK_FILE" ]; then
 fi
 
 # --- Acquire lock for this run ---
-echo $$ > "$LOCK_FILE"
+# `set -C` (noclobber) makes `>` refuse to write if the file already exists.
+# That makes lock acquisition atomic against a concurrent invocation racing
+# past the stale-lock cleanup above — only one process's PID can be written;
+# the loser exits. In practice Hammerspoon serializes hs.task spawns so
+# this race is rare, but the cost of doing it right is one shell builtin.
+if ! (set -C; echo $$ > "$LOCK_FILE") 2>/dev/null; then
+  log "lock acquire raced — another invocation won; exiting"
+  exit 0
+fi
 cleanup() {
   # Kill any still-running children and clear state.
   pkill -TERM -P $$ 2>/dev/null || true
