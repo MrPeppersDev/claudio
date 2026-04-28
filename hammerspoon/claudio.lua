@@ -614,11 +614,13 @@ local function selectionAnchorRect()
       end
     end
   end
-  local ok_mouse, p = pcall(hs.mouse.absolutePosition)
-  if ok_mouse and p and p.x and p.y then
-    -- Treat as a tiny rect so rsvp.lua's above/below fallback logic still works.
-    return { x = p.x - 8, y = p.y - 12, w = 16, h = 24 }
-  end
+  -- Mouse-cursor fallback removed: in multi-monitor setups the cursor
+  -- often ends up on a different screen than the focused window (e.g.,
+  -- user reaches over to a portrait DELL while reading on the laptop),
+  -- and using its position sends the balloon to that wrong monitor.
+  -- Returning nil lets rsvp.lua's menubarFrame fallback position the
+  -- balloon on the focused window's screen instead, which is much
+  -- closer to where the user is actually reading.
   return nil
 end
 
