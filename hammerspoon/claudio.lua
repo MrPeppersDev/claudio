@@ -630,10 +630,15 @@ local function captureSelection(cb)
 
   local ax = axSelection()
   if ax then
+    diagLog(string.format(
+      "captureSelection: AX hit, %d chars (front=%s)", #ax, frontName))
     print(string.format("[claudio] AX selection: %d chars (front=%s)", #ax, frontName))
     cb(ax)
     return
   end
+
+  diagLog(string.format(
+    "captureSelection: AX empty, falling to Cmd+C (front=%s)", frontName))
 
   local prevCount = hs.pasteboard.changeCount()
   local prevContents = hs.pasteboard.getContents()
@@ -657,6 +662,9 @@ local function captureSelection(cb)
     local newContents = hs.pasteboard.getContents()
 
     if newCount > prevCount and newContents and #newContents > 0 then
+      diagLog(string.format(
+        "captureSelection: Cmd+C advanced count %d→%d, %d chars (front=%s)",
+        prevCount, newCount, #newContents, frontName))
       -- Restore pasteboard. When the pasteboard was empty before we ran
       -- Cmd+C, prevContents is nil — setContents(nil) is a no-op, so the
       -- captured selection would linger until the user's next copy.
@@ -670,12 +678,18 @@ local function captureSelection(cb)
     local baseline = lastSeenChangeCount or prevCount
     if isTerminal and newContents and #newContents > 0
         and newCount > baseline then
+      diagLog(string.format(
+        "captureSelection: terminal copy-on-select hit, %d chars (front=%s)",
+        #newContents, frontName))
       lastSeenChangeCount = newCount
       cb(newContents)
       return
     end
 
     lastSeenChangeCount = newCount
+    diagLog(string.format(
+      "captureSelection: empty (count %d→%d, front=%s)",
+      prevCount, newCount, frontName))
     -- Empty capture. For known PDF viewers, try to resolve the open
     -- document path via AX so the caller can attempt direct extraction
     -- with pdf_extract.py. If AX yields a path we return a table hint
