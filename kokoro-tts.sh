@@ -27,7 +27,7 @@
 #                      are normalized, so "1,1" is a 50/50 mix.
 #   KOKORO_SPEED       target effective speed (default: 2.0)
 #   KOKORO_SYNTH_CAP   max synth speed before play-stream picks up the rest
-#                      (default: 1.5; see split-speed note below)
+#                      (default: 1.3; see split-speed note below)
 #   KOKORO_URL         server base URL (default: http://127.0.0.1:8880)
 #   KOKORO_LANG        phoneme lang (auto: bm_/bf_ → en-gb, else en-us)
 #   KOKORO_EARCON      WAV/AIFF played at structural boundaries
