@@ -770,24 +770,18 @@ def main() -> None:
                 pass  # ignore malformed RATE — keep previous value
 
         elif cmd == "PLAY":
-            # Accept both:
-            #   PLAY <id> <path>   (new form; id is integer)
-            #   PLAY <path>        (backward-compat; id=0)
-            if len(parts) >= 3:
-                # Three-part: cmd id path
-                try:
-                    buf_id = int(parts[1])
-                    path = parts[2].strip()
-                except ValueError:
-                    # parts[1] is not an integer — treat as old form
-                    buf_id = 0
-                    path = (parts[1] + (" " + parts[2] if len(parts) > 2 else "")).strip()
-            elif len(parts) == 2:
-                # Two-part: PLAY <path>
-                buf_id = 0
-                path = parts[1].strip()
-            else:
+            # PLAY <id> <path> — id is an integer, path is everything after.
+            # The legacy two-part form (PLAY <path>) was removed; every
+            # caller in the codebase emits the 3-part form (kokoro-tts.sh
+            # at the PLAY printf), and the no-id fallback added parser
+            # complexity for nothing.
+            if len(parts) < 3:
                 continue
+            try:
+                buf_id = int(parts[1])
+            except ValueError:
+                continue  # malformed — drop the line
+            path = parts[2].strip()
 
             if not os.path.isfile(path):
                 continue
