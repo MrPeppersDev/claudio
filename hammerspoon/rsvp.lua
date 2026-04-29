@@ -445,6 +445,96 @@ local function stopHangWatchdog()
   end
 end
 
+-- ── Drag-to-reposition ───────────────────────────────────────────────────────
+-- Lets the user pick up the balloon and move it. While the balloon is up, a
+-- global eventtap watches the mouse stream:
+--   * leftMouseDown over the balloon's frame: capture click origin + frame
+--     origin. NOT consumed — the webview still gets the click so its JS
+--     keydown handlers (Space/Esc/←/→) get focus as before.
+--   * leftMouseDragged with > DRAG_THRESHOLD_PX of movement from origin:
+--     reposition the webview to (frame.origin + delta). CONSUMED so the
+--     underlying app doesn't see a half-drag (which could otherwise start
+--     a text selection or a window-system drag in apps below).
+--   * leftMouseUp: clear state.
+-- Tap starts after the animate-in finishes (alongside startPolling) so a
+-- mid-animation drag can't race the size animation. Stops in destroyWebview.
+local DRAG_THRESHOLD_PX = 3
+
+local _dragTap = nil
+local _dragState = nil  -- {mx0, my0, fx0, fy0, fw, fh, dragging} or nil
+
+local function startDragTap()
+  if _dragTap then return end
+  _dragTap = hs.eventtap.new({
+    hs.eventtap.event.types.leftMouseDown,
+    hs.eventtap.event.types.leftMouseDragged,
+    hs.eventtap.event.types.leftMouseUp,
+  }, function(event)
+    if not _webview then return false end
+    local etype = event:getType()
+    local types = hs.eventtap.event.types
+
+    if etype == types.leftMouseDown then
+      local pt = event:location()
+      local frame = _webview:frame()
+      local inside = pt.x >= frame.x and pt.x < frame.x + frame.w
+                     and pt.y >= frame.y and pt.y < frame.y + frame.h
+      if inside then
+        _dragState = {
+          mx0 = pt.x, my0 = pt.y,
+          fx0 = frame.x, fy0 = frame.y,
+          dragging = false,
+        }
+      else
+        _dragState = nil
+      end
+      return false  -- never consume mousedown — webview needs it for focus
+    end
+
+    if etype == types.leftMouseDragged then
+      if not _dragState then return false end
+      local pt = event:location()
+      local dx = pt.x - _dragState.mx0
+      local dy = pt.y - _dragState.my0
+      if not _dragState.dragging then
+        if math.abs(dx) < DRAG_THRESHOLD_PX
+           and math.abs(dy) < DRAG_THRESHOLD_PX then
+          return false  -- below threshold; let it pass as a click
+        end
+        _dragState.dragging = true
+      end
+      -- Position-only update via topLeft instead of frame(rect): on
+      -- borderless NSWindows, setFrame:display:animate: defaults toward
+      -- animation when called rapidly with new origins, which made
+      -- 90Hz drag updates queue up as smoothing animations and the
+      -- visible balloon trailed the cursor by hundreds of points
+      -- ("tiny centimeters" of perceived movement). topLeft sets the
+      -- origin only and snaps without animation.
+      _webview:topLeft({
+        x = _dragState.fx0 + dx,
+        y = _dragState.fy0 + dy,
+      })
+      return true  -- consume drag so apps below don't see it
+    end
+
+    if etype == types.leftMouseUp then
+      _dragState = nil
+      return false
+    end
+
+    return false
+  end)
+  _dragTap:start()
+end
+
+local function stopDragTap()
+  if _dragTap then
+    _dragTap:stop()
+    _dragTap = nil
+  end
+  _dragState = nil
+end
+
 -- Destroy the webview and clean up the eventtap/timers.
 local function destroyWebview()
   diagLog(string.format(
@@ -454,6 +544,7 @@ local function destroyWebview()
   cancelLinger()
   stopHangWatchdog()
   stopPolling()
+  stopDragTap()
   if _animTimer then
     _animTimer:stop()
     _animTimer = nil
@@ -633,6 +724,7 @@ function M.show(sidecar_path, opts)
       _webview:frame(targetRect)
       jsCall("window.rsvpFadeIn")
       startPolling()
+      startDragTap()
       return
     end
 
@@ -665,6 +757,7 @@ function M.show(sidecar_path, opts)
         _animTimer = nil
         jsCall("window.rsvpFadeIn")
         startPolling()
+        startDragTap()
       end
     end
 
