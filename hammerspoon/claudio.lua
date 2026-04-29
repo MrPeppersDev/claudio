@@ -14,6 +14,23 @@ local M = {}
 
 local rsvp = require("rsvp")
 
+-- Structure-mirror webview (#163 PR 4 v1, two-bubble fallback for non-AX
+-- apps). Default OFF — opt-in via KOKORO_MIRROR=1 until the v1 plumbing
+-- is validated against real selections. When disabled, all mirror.*
+-- calls below are no-ops, so the production rsvp-only path is unchanged.
+local mirror
+if os.getenv("KOKORO_MIRROR") == "1" then
+  mirror = require("mirror")
+else
+  mirror = {
+    show        = function() end,
+    hide        = function() end,
+    feedSidecar = function() end,
+    onPos       = function() end,
+    endOfStream = function() end,
+  }
+end
+
 -- RSVP wiring state. Reset on every runPlayScript spawn.
 --   controlFifoPath: path to the command FIFO advertised by kokoro-tts.sh via
 --     its "CTRL <path>" stderr line. Lives only for the duration of one play
@@ -393,7 +410,10 @@ local function processStderrLine(line)
   if prefix == "POS " then
     local ms_s, id_s = line:match("^POS (%d+) (%d+)$")
     if ms_s and id_s then
-      rsvp.onPos(tonumber(ms_s), tonumber(id_s))
+      local ms = tonumber(ms_s)
+      local bid = tonumber(id_s)
+      rsvp.onPos(ms, bid)
+      mirror.onPos(ms, bid)
     end
     return
   end
@@ -411,6 +431,7 @@ local function processStderrLine(line)
         diagLog(string.format("SIDECAR accepted: id=%s bytes=%d path=%s",
                               id_s, #json, path))
         rsvp.feedSidecar(tonumber(id_s), json)
+        mirror.feedSidecar(tonumber(id_s), json)
       else
         -- Sidecar was announced but not readable. Common causes: server
         -- ran without a patched model (no timings produced), permission
@@ -450,6 +471,7 @@ local function processStderrLine(line)
   if line == "DRAIN_DONE" then
     diagLog("DRAIN_DONE → endOfStream (linger-fade)")
     rsvp.endOfStream()
+    mirror.endOfStream()
     return
   end
   -- Anything else on stderr is unstructured output (e.g. bash error messages,
@@ -545,12 +567,14 @@ local function runPlayScript(args)
             "task exit: code=%s wasUserStop=%s userStop=%s → endOfStream",
             tostring(code), tostring(wasUserStop), tostring(userStop)))
           rsvp.endOfStream()
+          mirror.endOfStream()
         end
       else
         diagLog(string.format(
           "task exit: code=%s wasUserStop=%s userStop=%s → hide+alert",
           tostring(code), tostring(wasUserStop), tostring(userStop)))
         rsvp.hide()
+        mirror.hide()
         hs.alert.show("Claudio error (exit " .. code .. ")")
       end
     end,
@@ -828,8 +852,9 @@ local function stopPlayback(reason)
   -- Stop kills play-stream abruptly — POS events halt and rsvp would sit
   -- on its last word forever waiting for the linger timer that never
   -- arms (the linger trigger only fires when POS crosses last_word.end_ms).
-  diagLog("stopPlayback: calling rsvp.hide()")
+  diagLog("stopPlayback: calling rsvp.hide() / mirror.hide()")
   rsvp.hide()
+  mirror.hide()
   return true
 end
 
@@ -856,6 +881,7 @@ function M.toggle()
         -- Delaying this until after the first SIDECAR would leave F13 with
         -- no visible response for ~500ms-2s of synth time.
         rsvp.show(nil, { anchor = anchor })
+        mirror.show({ anchor = anchor })
         runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
       end
     elseif hint and hint.pdfPath then
@@ -880,6 +906,7 @@ function M.toggle()
               f:write(stdout)
               f:close()
               rsvp.show(nil, { anchor = anchor })
+              mirror.show({ anchor = anchor })
               runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
             else
               os.remove(tmp)
@@ -1218,6 +1245,7 @@ function M.start()
       -- No job running — just dismiss the balloon (it can be on screen
       -- during the post-playback linger window).
       rsvp.hide()
+      mirror.hide()
     end
   end
 

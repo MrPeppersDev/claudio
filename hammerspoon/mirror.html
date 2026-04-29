@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<!--
+  mirror.html — structure-mirror webview for #163 PR 4.
+
+  Renders the words being spoken as a streaming transcript with
+  karaoke-style highlight on the current word. Each arriving sidecar
+  appends its words; POS events highlight the matching <span>.
+
+  The mirror is the FALLBACK surface for apps where AX-follow on the
+  source page isn't available (#131 / #163 Q3b two-bubble architecture).
+  It runs ALONGSIDE the RSVP balloon (rsvp.html), not instead of —
+  RSVP gives speed-flash, mirror gives spatial context.
+
+  v1 scope (this iteration):
+    - Streaming words (words append as sidecars arrive — no upfront full text)
+    - Per-word karaoke highlight driven by POS via JS API
+    - Auto-scroll to keep the current word in the upper third
+    - Plain text only — no markdown structure rendering yet
+      (paragraphs / code blocks / tables come in follow-up PRs)
+
+  Driven by Lua (mirror.lua) via evaluateJavaScript on the window.mirror.*
+  API:
+    window.mirror.appendWords(buf_id, words_json) — buf_id integer, words
+                                                    is JSON array of
+                                                    {text, start_ms, end_ms}
+    window.mirror.highlight(buf_id, word_idx)     — apply .current to that
+                                                    span; remove from any
+                                                    previously-current span;
+                                                    auto-scroll into view
+    window.mirror.fadeOut()                       — fade to 0 opacity
+                                                    (the Lua side disposes
+                                                    after the transition)
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    /* Surface — same warm cream palette as rsvp.html for visual coherence. */
+    --cream:      #F6EFDC;
+    --ink:        #1A1613;
+    --ink-soft:   rgba(60, 42, 18, 0.65);
+    --ink-faint:  rgba(60, 42, 18, 0.10);
+    --accent:     #B23A2B;
+    --highlight:  rgba(178, 58, 43, 0.18);
+
+    --radius:     14px;
+    --ease:       cubic-bezier(0.4, 0, 0.2, 1);
+    --dur-fast:   160ms;
+    --dur-slow:   300ms;
+
+    --font-stack: "SF Pro Text", -apple-system, BlinkMacSystemFont,
+                  "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: transparent; overflow: hidden; }
+
+  body {
+    font-family: var(--font-stack);
+    font-feature-settings: "ss01", "cv11", "tnum";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    opacity: 0;
+    transition: opacity var(--dur-slow) var(--ease);
+    outline: none;
+  }
+
+  /*
+    Bubble: same shadow vocabulary as rsvp.html so the two surfaces feel
+    like siblings. inset:8px reserves room around the edge so the
+    shadow doesn't clip against the transparent webview frame.
+  */
+  #balloon {
+    position: absolute;
+    inset: 8px;
+    background: var(--cream);
+    border-radius: var(--radius);
+    box-shadow:
+      0 1px 2px   rgba(28, 20, 8, 0.06),
+      0 10px 22px rgba(28, 20, 8, 0.14),
+      0 28px 56px rgba(28, 20, 8, 0.10),
+      inset 0 0 0 1px rgba(60, 42, 18, 0.09),
+      inset 0 -1px 0 0 rgba(120, 90, 40, 0.05);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /*
+    Scrollable transcript area. Padding gives breathing room around the
+    text; overflow-y is auto so long transcripts get a native scrollbar
+    (we drive auto-scroll programmatically, but manual scroll still works).
+  */
+  #transcript {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px 28px;
+    font-size: 19px;
+    line-height: 1.55;
+    color: var(--ink-soft);
+    letter-spacing: -0.005em;
+    word-wrap: break-word;
+    /* Hide scrollbar by default; it appears on hover. */
+    scrollbar-width: thin;
+    scrollbar-color: var(--ink-faint) transparent;
+  }
+  #transcript::-webkit-scrollbar          { width: 6px; }
+  #transcript::-webkit-scrollbar-track    { background: transparent; }
+  #transcript::-webkit-scrollbar-thumb    {
+    background: var(--ink-faint);
+    border-radius: 3px;
+  }
+
+  /*
+    Words: rendered as inline <span>s. Spacing comes from the natural
+    document flow — we insert a literal space between words rather than
+    using margin/padding so word-wrap behaves sanely.
+
+    Default ink is soft (already-spoken / not-yet-spoken don't compete
+    for attention). The CURRENT word gets full ink + the highlight
+    background.
+  */
+  .word {
+    color: var(--ink-soft);
+    transition: background-color var(--dur-fast) var(--ease),
+                color           var(--dur-fast) var(--ease);
+    border-radius: 4px;
+    padding: 0 2px;
+    margin: 0 -2px;  /* cancel the padding for spacing math */
+  }
+  .word.spoken {
+    color: var(--ink);
+  }
+  .word.current {
+    color: var(--ink);
+    background-color: var(--highlight);
+    font-weight: 500;
+  }
+
+  /*
+    Empty-state message before any sidecars arrive. Hidden once the
+    first word lands.
+  */
+  #empty-state {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--ink-soft);
+    font-size: 14px;
+    pointer-events: none;
+    opacity: 1;
+    transition: opacity var(--dur-fast) var(--ease);
+  }
+  body.has-content #empty-state { opacity: 0; }
+</style>
+</head>
+<body tabindex="0">
+  <div id="balloon">
+    <div id="transcript"></div>
+    <div id="empty-state">listening…</div>
+  </div>
+
+<script>
+"use strict";
+
+// ── State ──────────────────────────────────────────────────────────────
+//
+// _wordSpans is a 2-level lookup:  buffer_id → word_idx → <span>
+// Used by highlight() to find the right span without a DOM scan.
+const _wordSpans = {};
+let _currentSpan = null;
+
+const _transcript = document.getElementById("transcript");
+const _empty = document.getElementById("empty-state");
+
+// ── Append words for a buffer ─────────────────────────────────────────
+//
+// Called by Lua as each sidecar arrives. words is an array of
+// {text, start_ms, end_ms}. We render each word as a <span> tagged with
+// data-buf and data-idx so highlight() can target it.
+//
+// Pre-existing words for the same buffer (sidecar re-fed for some reason)
+// are NOT cleared; we only append. Lua side guarantees idempotent feeds
+// in normal flow.
+window.mirror = window.mirror || {};
+window.mirror.appendWords = function(bufId, wordsJson) {
+  let words;
+  try {
+    words = JSON.parse(wordsJson);
+  } catch (e) {
+    return;
+  }
+  if (!Array.isArray(words)) return;
+  if (!_wordSpans[bufId]) _wordSpans[bufId] = {};
+
+  // Insert a leading space between this buffer's first word and whatever
+  // came before, unless the transcript is empty. Without this, words
+  // from buffer N+1 collide with the last word of buffer N.
+  if (_transcript.firstChild) {
+    _transcript.appendChild(document.createTextNode(" "));
+  }
+
+  words.forEach((w, idx) => {
+    if (!w || typeof w.text !== "string") return;
+    const span = document.createElement("span");
+    span.className = "word";
+    span.dataset.buf = String(bufId);
+    span.dataset.idx = String(idx);
+    span.textContent = w.text;
+    _transcript.appendChild(span);
+    if (idx < words.length - 1) {
+      _transcript.appendChild(document.createTextNode(" "));
+    }
+    _wordSpans[bufId][idx] = span;
+  });
+
+  document.body.classList.add("has-content");
+};
+
+// ── Highlight a specific word ─────────────────────────────────────────
+//
+// Drops .current from the previously-current span (and adds .spoken so
+// it stays inked). Adds .current to the new span. Auto-scrolls so the
+// new current span lands in the upper third of the visible area.
+window.mirror.highlight = function(bufId, wordIdx) {
+  const targetBucket = _wordSpans[bufId];
+  if (!targetBucket) return;
+  const span = targetBucket[wordIdx];
+  if (!span) return;
+  if (span === _currentSpan) return;
+
+  if (_currentSpan) {
+    _currentSpan.classList.remove("current");
+    _currentSpan.classList.add("spoken");
+  }
+  span.classList.add("current");
+  _currentSpan = span;
+
+  // Auto-scroll: keep the current word in the upper third of the
+  // viewport, so the eye can read downstream context naturally.
+  // scrollIntoView({block: 'start'}) puts it right at the top, which
+  // hides downstream context — manually compute offset for upper-third.
+  const tRect = _transcript.getBoundingClientRect();
+  const sRect = span.getBoundingClientRect();
+  const targetOffset = tRect.height * 0.33;
+  const currentOffset = sRect.top - tRect.top;
+  const delta = currentOffset - targetOffset;
+  if (Math.abs(delta) > 4) {
+    _transcript.scrollBy({ top: delta, behavior: "smooth" });
+  }
+};
+
+// ── Fade out ───────────────────────────────────────────────────────────
+//
+// Lua schedules a destroyWebview after the transition window.
+window.mirror.fadeOut = function() {
+  document.body.style.opacity = "0";
+};
+
+// ── Fade in ────────────────────────────────────────────────────────────
+window.mirror.fadeIn = function() {
+  document.body.style.opacity = "1";
+};
+
+// Initial render: empty transcript, fadeIn happens after the page-ready
+// callback fires on the Lua side (matches rsvp.lua's flow).
+</script>
+</body>
+</html>
