@@ -63,6 +63,7 @@ Exits cleanly on stdin EOF or SIGTERM.
 import io
 import os
 import queue
+import select
 import signal
 import subprocess
 import sys
@@ -634,10 +635,13 @@ def _player_loop_body(last_emit_buf_idx: int, last_emit_pos: int) -> None:
             print("DRAIN_DONE", file=sys.stderr, flush=True)
             with _lock:
                 _drain_done_emitted = True
-            try:
-                sys.stdin.close()
-            except Exception:
-                pass
+            # No sys.stdin.close() here. Closing a file from one thread
+            # does not reliably interrupt another thread blocked in a
+            # read syscall on it (macOS in particular leaves the read
+            # parked until something else writes or the writer closes).
+            # The main loop polls _drain_done_emitted via select() with
+            # a 100ms timeout and exits within one tick of this point —
+            # no cross-thread fd close needed.
 
         # Pause: keep the stream alive with a tiny silence write, no playhead
         # advance. Drain-done check above still gets a chance every tick.
@@ -844,117 +848,169 @@ def main() -> None:
     # by the player thread in the same serialised order as everything else.
     _audio_queue.put(("silence", PRE_ROLL_MS))
 
-    for raw_line in sys.stdin:
-        line = raw_line.rstrip("\n")
-        if not line:
+    # Drive the command stream with select() + os.read() rather than the
+    # natural `for line in sys.stdin` iterator. The for-iterator form blocks
+    # in readline() until either a newline arrives on the underlying fd or
+    # the fd is closed by the writer — and the old shutdown handshake
+    # depended on the player thread closing sys.stdin to wake the read up.
+    # On macOS that cross-thread close does not reliably interrupt a parked
+    # read syscall, so play-stream sat alive forever after DRAIN_DONE and
+    # the bash chain (kokoro-tts.sh's `wait $STREAM_PID`) hung indefinitely
+    # holding the lock. Polling _drain_done_emitted between selects exits
+    # within one tick (≤100 ms) without any cross-thread fd manipulation.
+    stdin_fd = sys.stdin.fileno()
+    pending = b""
+
+    while True:
+        # Exit on explicit shutdown (SIGTERM-driven) or natural drain-done
+        # (player thread set the flag after emitting DRAIN_DONE).
+        with _lock:
+            if _shutdown_requested or _drain_done_emitted:
+                break
+
+        try:
+            ready, _, _ = select.select([stdin_fd], [], [], 0.1)
+        except (InterruptedError, OSError, ValueError):
+            # Signal handler ran (InterruptedError) or fd was torn down.
+            # Loop back so the flag-check at the top observes the new state.
             continue
 
-        parts = line.split(" ", 2)
-        cmd = parts[0].upper()
+        if not ready:
+            continue
 
-        if cmd == "RATE":
+        try:
+            chunk = os.read(stdin_fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break  # writer closed fd 9 → real EOF (e.g. kokoro-tts.sh died)
+
+        pending += chunk
+
+        while True:
+            nl = pending.find(b"\n")
+            if nl < 0:
+                break
+            raw_line = pending[:nl].rstrip(b"\r")
+            pending = pending[nl + 1:]
             try:
-                _rate = float(parts[1]) if len(parts) > 1 else _rate
-            except ValueError:
-                pass  # ignore malformed RATE — keep previous value
-
-        elif cmd == "PLAY":
-            # PLAY <id> <path> — id is an integer, path is everything after.
-            # The legacy two-part form (PLAY <path>) was removed; every
-            # caller in the codebase emits the 3-part form (kokoro-tts.sh
-            # at the PLAY printf), and the no-id fallback added parser
-            # complexity for nothing.
-            if len(parts) < 3:
+                line = raw_line.decode("utf-8")
+            except UnicodeDecodeError:
                 continue
-            try:
-                buf_id = int(parts[1])
-            except ValueError:
-                continue  # malformed — drop the line
-            path = parts[2].strip()
-
-            if not os.path.isfile(path):
+            if not line:
                 continue
-            try:
-                raw = _read_audio_as_float32(path)
-                stretched = _stretch(raw, _rate)
-                faded = _edge_fade(stretched)
-                _audio_queue.put(("samples", buf_id, faded, _rate))
-            except Exception as exc:
-                print(f"play-stream: PLAY error {path}: {exc}", file=sys.stderr)
 
-        elif cmd == "EARCON":
-            path = parts[1].strip() if len(parts) > 1 else ""
-            if not os.path.isfile(path):
-                continue
-            try:
-                raw = _read_audio_as_float32(path)
-                faded = _edge_fade(raw)  # no stretching for earcons
-                # Earcons use tempo_factor=1.0 since they're not stretched.
-                _audio_queue.put(("samples", -1, faded, 1.0))
-            except Exception as exc:
-                print(f"play-stream: EARCON error {path}: {exc}", file=sys.stderr)
+            parts = line.split(" ", 2)
+            cmd = parts[0].upper()
 
-        elif cmd == "PAUSE":
-            # PAUSE with a positive integer arg → backward-compat silence insert.
-            # Bare PAUSE (or non-integer arg) → soft-pause.
-            arg = parts[1].strip() if len(parts) > 1 else ""
-            try:
-                ms = int(arg)
-                if ms > 0:
-                    _audio_queue.put(("silence", ms))
-                # else: 0 or negative → treat as soft-pause
+            if cmd == "RATE":
+                try:
+                    _rate = float(parts[1]) if len(parts) > 1 else _rate
+                except ValueError:
+                    pass  # ignore malformed RATE — keep previous value
+
+            elif cmd == "PLAY":
+                # PLAY <id> <path> — id is an integer, path is everything after.
+                # The legacy two-part form (PLAY <path>) was removed; every
+                # caller in the codebase emits the 3-part form (kokoro-tts.sh
+                # at the PLAY printf), and the no-id fallback added parser
+                # complexity for nothing.
+                if len(parts) < 3:
                     continue
-            except ValueError:
-                pass
-            # Soft-pause.
-            with _lock:
-                _paused = True
+                try:
+                    buf_id = int(parts[1])
+                except ValueError:
+                    continue  # malformed — drop the line
+                path = parts[2].strip()
 
-        elif cmd == "RESUME":
-            with _lock:
-                _paused = False
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    raw = _read_audio_as_float32(path)
+                    stretched = _stretch(raw, _rate)
+                    faded = _edge_fade(stretched)
+                    _audio_queue.put(("samples", buf_id, faded, _rate))
+                except Exception as exc:
+                    print(f"play-stream: PLAY error {path}: {exc}", file=sys.stderr)
 
-        elif cmd == "SEEK":
-            # SEEK <ms> — relative seek in source-domain milliseconds.
-            # Positive = forward; negative = backward. Resolution (which
-            # may walk across multiple history buffers and pull from the
-            # audio queue) is deferred to the player thread, which holds
-            # the lock while traversing _history. Successive SEEKs that
-            # arrive before the player thread has resolved the previous
-            # one accumulate (seek_request_ms += ms) so users can tap
-            # the arrow key several times rapidly without dropping
-            # any of the requested deltas.
-            try:
-                ms = int(parts[1]) if len(parts) > 1 else 0
-            except ValueError:
-                ms = 0
-            if ms != 0:
+            elif cmd == "EARCON":
+                path = parts[1].strip() if len(parts) > 1 else ""
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    raw = _read_audio_as_float32(path)
+                    faded = _edge_fade(raw)  # no stretching for earcons
+                    # Earcons use tempo_factor=1.0 since they're not stretched.
+                    _audio_queue.put(("samples", -1, faded, 1.0))
+                except Exception as exc:
+                    print(f"play-stream: EARCON error {path}: {exc}", file=sys.stderr)
+
+            elif cmd == "PAUSE":
+                # PAUSE with a positive integer arg → backward-compat silence insert.
+                # Bare PAUSE (or non-integer arg) → soft-pause.
+                arg = parts[1].strip() if len(parts) > 1 else ""
+                try:
+                    ms = int(arg)
+                    if ms > 0:
+                        _audio_queue.put(("silence", ms))
+                    # else: 0 or negative → treat as soft-pause
+                        continue
+                except ValueError:
+                    pass
+                # Soft-pause.
                 with _lock:
-                    if _seek_request_ms is None:
-                        _seek_request_ms = ms
-                    else:
-                        _seek_request_ms += ms
+                    _paused = True
 
-        elif cmd == "STOP":
-            with _lock:
-                _stop_requested = True
+            elif cmd == "RESUME":
+                with _lock:
+                    _paused = False
 
-        elif cmd == "EXIT":
-            # Cooperative end-of-playback signal from kokoro-tts.sh. The
-            # shell has finished queueing audio but is leaving fd 9 open so
-            # the control-fifo subshell keeps working — that means
-            # PAUSE/RESUME/SEEK from Hammerspoon stay live through the
-            # drain. We set _kokoro_done and KEEP READING stdin; the player
-            # thread observes drain completion (queue empty + Timers done),
-            # emits DRAIN_DONE on stderr, and closes our stdin to wind us
-            # down. Process exit then unblocks the shell's `wait` and it
-            # tears down the control plumbing.
-            with _lock:
-                _kokoro_done = True
+            elif cmd == "SEEK":
+                # SEEK <ms> — relative seek in source-domain milliseconds.
+                # Positive = forward; negative = backward. Resolution (which
+                # may walk across multiple history buffers and pull from the
+                # audio queue) is deferred to the player thread, which holds
+                # the lock while traversing _history. Successive SEEKs that
+                # arrive before the player thread has resolved the previous
+                # one accumulate (seek_request_ms += ms) so users can tap
+                # the arrow key several times rapidly without dropping
+                # any of the requested deltas.
+                try:
+                    ms = int(parts[1]) if len(parts) > 1 else 0
+                except ValueError:
+                    ms = 0
+                if ms != 0:
+                    with _lock:
+                        if _seek_request_ms is None:
+                            _seek_request_ms = ms
+                        else:
+                            _seek_request_ms += ms
 
-        # else: unknown command — silently ignore for forward-compat
+            elif cmd == "STOP":
+                with _lock:
+                    _stop_requested = True
 
-    # stdin EOF: wait for queue to drain, then run cooperative shutdown.
+            elif cmd == "EXIT":
+                # Cooperative end-of-playback signal from kokoro-tts.sh. The
+                # shell has finished queueing audio but is leaving fd 9 open
+                # so the control-fifo subshell keeps working — that means
+                # PAUSE/RESUME/SEEK from Hammerspoon stay live through the
+                # drain. We set _kokoro_done and keep polling stdin; the
+                # player thread observes drain completion (queue empty +
+                # Timers done + playhead at end of last buffer), emits
+                # DRAIN_DONE on stderr, and sets _drain_done_emitted. The
+                # outer while() observes that flag on its next tick and
+                # falls through to the bounded drain + _shutdown below,
+                # which lets the shell's `wait $STREAM_PID` return.
+                with _lock:
+                    _kokoro_done = True
+
+            # else: unknown command — silently ignore for forward-compat
+
+    # Loop exited: either _drain_done_emitted (natural completion),
+    # _shutdown_requested (SIGTERM hit while we were in here), or stdin
+    # EOF (writer closed fd 9 abruptly). Drain the queue, then run
+    # cooperative shutdown.
     # Same path as SIGTERM so the player thread gets a clean exit and any
     # pending end-of-buffer Timers are cancelled before the interpreter
     # tears down — preventing the post-finalization CFFI segfault.
