@@ -86,6 +86,15 @@ local LINGER_SECS = 1.25
 -- Keyboard scrub increment (milliseconds per ← / → keypress).
 local SEEK_DELTA_MS = 2000
 
+-- Threshold for sentence-aware backtrack: pressing ← within this many ms of
+-- the current buffer's start lands the user on the PREVIOUS sentence rather
+-- than replaying the current one. The intuition: if you've barely heard one
+-- word of a sentence and you hit ←, you almost certainly meant "rewind past
+-- the previous sentence boundary," not "restart this sentence I just heard
+-- one word of." Past the threshold, you've heard enough of the current
+-- sentence that the intent reads as "let me hear that again from the start."
+local SENTENCE_START_THRESHOLD_MS = 1500
+
 -- ── State ─────────────────────────────────────────────────────────────────────
 
 local _webview      = nil    -- hs.webview instance (nil when hidden)
@@ -350,11 +359,50 @@ end
 -- shows up as audio/RSVP drift.
 local POLL_INTERVAL = 0.20
 
+-- Compute the SEEK delta (always negative) for sentence-aware backtrack.
+-- Falls back to -SEEK_DELTA_MS when state isn't established (no POS yet,
+-- no sidecar yet, racing the very first buffer) so ← never feels dead.
+--
+-- "Sentence" here is approximate: each synth buffer is one sentence OR one
+-- coalesced short paragraph (kokoro-tts.sh's KOKORO_COALESCE_MAX_CHARS=700).
+-- For long paragraphs each sentence is its own buffer; for short paragraphs
+-- a buffer covers multiple sentences. Buffer-level backtrack is the cleanest
+-- approximation we have without a sentence-boundary marker in the sidecar.
+local function computeSentenceBackDelta()
+  if not _lastPosMs or not _activeBufferId then
+    return -SEEK_DELTA_MS
+  end
+  if _lastPosMs > SENTENCE_START_THRESHOLD_MS then
+    -- Mid-sentence: replay from the start of the current buffer.
+    return -_lastPosMs
+  end
+  -- Near sentence start: jump to start of previous buffer if we have one.
+  -- play-stream's SEEK handler walks backwards across history buffers, so
+  -- delta = -(current_pos_in_buffer + previous_buffer_total_duration) lands
+  -- exactly at the previous buffer's start.
+  local prevId = _activeBufferId - 1
+  if prevId >= 1 then
+    local prev = _bufferSidecars[prevId]
+    if prev and prev.words and #prev.words > 0 then
+      local prevDuration = prev.words[#prev.words].end_ms or 0
+      return -(_lastPosMs + prevDuration)
+    end
+  end
+  -- No previous buffer (start of document, or its sidecar hasn't arrived):
+  -- jump to current sentence start. Better than going backwards past the
+  -- start of the document.
+  return -_lastPosMs
+end
+
 local function dispatchCmd(cmd)
   if cmd == "toggle_pause" then
     if _isPaused then M.resume() else M.pause() end
   elseif cmd == "pause_only" then
     if not _isPaused then M.pause() end
+  elseif cmd == "sentence_back" then
+    if M.on_seek_request then
+      M.on_seek_request(computeSentenceBackDelta())
+    end
   elseif cmd == "seek_back" then
     if M.on_seek_request then M.on_seek_request(-SEEK_DELTA_MS) end
   elseif cmd == "seek_fwd" then
