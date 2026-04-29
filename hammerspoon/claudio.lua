@@ -437,7 +437,26 @@ local function processStderrLine(line)
       diagLog("CTRL accepted: " .. path)
       controlFifoPath = path
     end
+    return
   end
+  -- DRAIN_DONE: play-stream emits this on stderr after the last sample of
+  -- the last buffer is delivered to the audio device. We trigger the linger-
+  -- fade now rather than waiting on the bash task to exit, because the bash
+  -- shutdown chain (play-stream → kokoro-tts.sh → play-last.sh) can lag the
+  -- final word by several seconds; without this hook the balloon sat on
+  -- screen until the 8s hang watchdog force-hid it. endOfStream is
+  -- idempotent (scheduleLingerFadeOut returns early if a timer is armed),
+  -- so a later task-exit endOfStream is a no-op.
+  if line == "DRAIN_DONE" then
+    diagLog("DRAIN_DONE → endOfStream (linger-fade)")
+    rsvp.endOfStream()
+    return
+  end
+  -- Anything else on stderr is unstructured output (e.g. bash error messages,
+  -- python tracebacks). Surface it so we don't lose visibility into spawn or
+  -- script failures — without this, a `set -u` death or mkdir error in the
+  -- spawned shell would be invisible.
+  diagLog("stderr: " .. line)
 end
 
 local function runPlayScript(args)
@@ -465,14 +484,20 @@ local function runPlayScript(args)
   -- that disrupted Hammerspoon's Carbon hotkey registration. Pure-
   -- Lua sweep is fast and side-effect-free.
   if STATE_DIR and STATE_DIR ~= "" then
-    local ok_iter, iter = pcall(hs.fs.dir, STATE_DIR)
-    if ok_iter and iter then
-      for entry in iter do
+    -- Wrap the whole loop in pcall, not just hs.fs.dir's call: hs.fs.dir
+    -- returns (iterFn, dirObj), and Lua's `for x in expr do` only feeds
+    -- expr's first return to the iterator unless the multi-return is
+    -- preserved at the for-loop site. Splitting `local _, iter = pcall(...)`
+    -- discards dirObj, so the first iteration calls iterFn(nil, nil) and
+    -- throws "directory metatable expected, got nil" — which is exactly
+    -- the silent runPlayScript abort that wedged every F13 after #155.
+    pcall(function()
+      for entry in hs.fs.dir(STATE_DIR) do
         if type(entry) == "string" and entry:sub(1, 8) == "control." then
           os.remove(STATE_DIR .. "/" .. entry)
         end
       end
-    end
+    end)
   end
 
   hs.task.new("/bin/bash",
