@@ -71,6 +71,12 @@ local _fadeTimer    = nil    -- hs.timer follow-up after fadeOut JS call
 -- (so re-rendering a word's highlight doesn't require re-parsing JSON).
 local _bufferSidecars = {}
 
+-- Cached structured text from feedText. Held at module scope so that if
+-- feedText fires BEFORE the webview's onPageReady (rare but possible
+-- when the file IO race goes the wrong way), the page-ready callback
+-- can replay it. Cleared in destroyWebview.
+local _structuredText = nil
+
 -- The buffers we've already pushed into the webview, so feedSidecar
 -- doesn't duplicate them on a second call.
 local _pushed = {}
@@ -260,6 +266,7 @@ local function destroyWebview()
   _pushed = {}
   _lastHighlightBuf = nil
   _lastHighlightIdx = nil
+  _structuredText = nil
 end
 
 local function beginFadeOut()
@@ -350,6 +357,18 @@ function M.show(opts)
     pageReadyFired = true
     if not _webview then return end
 
+    -- Replay cached structured text first (so words exist BEFORE we
+    -- backfill sidecars — sidecars in v2 mode just tag pre-rendered
+    -- spans; if no text was cached, the v1 streaming-append fallback
+    -- kicks in inside the JS).
+    if _structuredText then
+      local ok_enc, json_str = pcall(hs.json.encode, _structuredText)
+      if ok_enc and json_str then
+        _webview:evaluateJavaScript(
+          "window.mirror.renderText(" .. json_str .. ")")
+      end
+    end
+
     -- Backfill any sidecars that arrived before page-ready.
     for bid, sc in pairs(_bufferSidecars) do
       pushSidecarToWebview(bid, sc)
@@ -382,6 +401,26 @@ end
 function M.hide()
   diagLog("M.hide called")
   destroyWebview()
+end
+
+-- Pre-render structured text (post-preprocess, with \x1c paragraph and
+-- \x1d sentence delimiters intact). The mirror parses the delimiters
+-- into <p> blocks and per-word <span>s. Subsequent feedSidecar calls
+-- TAG those spans with data-buf / data-idx; the streaming-append v1
+-- behavior is the fallback when feedText was never called.
+function M.feedText(text)
+  if not text or text == "" then return end
+  _structuredText = text
+  diagLog(string.format("feedText: %d bytes (paragraphs cached for render)",
+                        #text))
+  if not _webview then return end
+  local ok_enc, json_str = pcall(hs.json.encode, text)
+  if not ok_enc or not json_str then
+    diagLog("feedText: json encode FAILED")
+    return
+  end
+  local js = "window.mirror.renderText(" .. json_str .. ")"
+  _webview:evaluateJavaScript(js)
 end
 
 function M.feedSidecar(buffer_id, sidecar_json)

@@ -173,19 +173,97 @@
 const _wordSpans = {};
 let _currentSpan = null;
 
+// _allWordSpans is the flat list of pre-rendered spans (filled by
+// renderText). _taggedThrough is the cursor: appendWords tags this many
+// spans starting at _taggedThrough, then advances. Empty when renderText
+// wasn't called (v1 streaming-append fallback).
+const _allWordSpans = [];
+let _taggedThrough = 0;
+
 const _transcript = document.getElementById("transcript");
 const _empty = document.getElementById("empty-state");
 
-// ── Append words for a buffer ─────────────────────────────────────────
-//
-// Called by Lua as each sidecar arrives. words is an array of
-// {text, start_ms, end_ms}. We render each word as a <span> tagged with
-// data-buf and data-idx so highlight() can target it.
-//
-// Pre-existing words for the same buffer (sidecar re-fed for some reason)
-// are NOT cleared; we only append. Lua side guarantees idempotent feeds
-// in normal flow.
+// Sentinel codepoints shared with preprocess.py / kokoro-tts.sh:
+//   \x1c — paragraph-start prefix on the first sentence of a new paragraph
+//   \x1d — sentence separator
+//   \x1e — segment / earcon-position marker
+const SENTINEL_PARA = String.fromCharCode(0x1c);
+const SENTINEL_SENT = String.fromCharCode(0x1d);
+const SENTINEL_SEG  = String.fromCharCode(0x1e);
+
 window.mirror = window.mirror || {};
+
+// ── Pre-render structured text ────────────────────────────────────────
+//
+// Called by Lua's mirror.feedText with the post-preprocess input string.
+// Splits on \x1d (sentences) and groups into paragraphs (\x1c-prefixed
+// sentences begin a new paragraph). Each word becomes a <span class="word">
+// added to _allWordSpans for tag-on-arrival use by appendWords.
+window.mirror.renderText = function(structuredText) {
+  if (typeof structuredText !== "string" || !structuredText) return;
+
+  // Reset state — feedText is intended to be called once per show, but
+  // re-calling is idempotent: clear and re-render.
+  _transcript.innerHTML = "";
+  _allWordSpans.length = 0;
+  _taggedThrough = 0;
+
+  // Strip \x1e segment markers — they're earcon position cues, not
+  // visible structure. Paragraph and sentence delimiters survive.
+  const cleaned = structuredText.split(SENTINEL_SEG).join("");
+  const sentences = cleaned.split(SENTINEL_SENT);
+
+  let currentP = null;
+  for (let i = 0; i < sentences.length; i++) {
+    let s = sentences[i];
+    if (!s) continue;
+    const startsParagraph = s.charAt(0) === SENTINEL_PARA;
+    if (startsParagraph) s = s.substring(1);
+    s = s.trim();
+    if (!s) continue;
+
+    if (startsParagraph || !currentP) {
+      currentP = document.createElement("p");
+      // Paragraph spacing comes via CSS margin on <p>. Don't add inline
+      // <br>s — they'd stack in unpredictable ways with the <p> margin.
+      _transcript.appendChild(currentP);
+    }
+
+    // Word split: collapse any remaining whitespace runs to single spaces.
+    const words = s.split(/\s+/).filter(function(w) { return w.length > 0; });
+    for (let j = 0; j < words.length; j++) {
+      const span = document.createElement("span");
+      span.className = "word";
+      span.textContent = words[j];
+      currentP.appendChild(span);
+      _allWordSpans.push(span);
+      if (j < words.length - 1) {
+        currentP.appendChild(document.createTextNode(" "));
+      }
+    }
+    // Inter-sentence space within the same paragraph.
+    if (currentP) {
+      currentP.appendChild(document.createTextNode(" "));
+    }
+  }
+
+  if (_allWordSpans.length > 0) {
+    document.body.classList.add("has-content");
+  }
+};
+
+// ── Tag pre-rendered spans (or stream-append) for a buffer ───────────
+//
+// Two modes:
+//   v2 (renderText was called, spans pre-rendered): tag the next
+//     words.length spans with data-buf=bufId, data-idx=0..N-1, and
+//     advance _taggedThrough.
+//   v1 (no pre-render — fallback): create new spans inline appended to
+//     the transcript, same as the original streaming behavior.
+//
+// Hybrid: if the sidecar has more words than remaining un-tagged spans
+// (alignment drift), tag what we can then append the rest (graceful
+// degradation rather than dropping the audio's worth of text).
 window.mirror.appendWords = function(bufId, wordsJson) {
   let words;
   try {
@@ -196,26 +274,43 @@ window.mirror.appendWords = function(bufId, wordsJson) {
   if (!Array.isArray(words)) return;
   if (!_wordSpans[bufId]) _wordSpans[bufId] = {};
 
-  // Insert a leading space between this buffer's first word and whatever
-  // came before, unless the transcript is empty. Without this, words
-  // from buffer N+1 collide with the last word of buffer N.
-  if (_transcript.firstChild) {
-    _transcript.appendChild(document.createTextNode(" "));
+  let tagIdx = 0;
+
+  // v2 path: tag pre-rendered spans first.
+  while (tagIdx < words.length && _taggedThrough < _allWordSpans.length) {
+    const w = words[tagIdx];
+    if (!w || typeof w.text !== "string") {
+      tagIdx++;
+      continue;
+    }
+    const span = _allWordSpans[_taggedThrough];
+    span.dataset.buf = String(bufId);
+    span.dataset.idx = String(tagIdx);
+    _wordSpans[bufId][tagIdx] = span;
+    _taggedThrough++;
+    tagIdx++;
   }
 
-  words.forEach((w, idx) => {
-    if (!w || typeof w.text !== "string") return;
-    const span = document.createElement("span");
-    span.className = "word";
-    span.dataset.buf = String(bufId);
-    span.dataset.idx = String(idx);
-    span.textContent = w.text;
-    _transcript.appendChild(span);
-    if (idx < words.length - 1) {
+  // v1 / fallback path: append remaining words as new spans.
+  if (tagIdx < words.length) {
+    if (_transcript.firstChild) {
       _transcript.appendChild(document.createTextNode(" "));
     }
-    _wordSpans[bufId][idx] = span;
-  });
+    for (; tagIdx < words.length; tagIdx++) {
+      const w = words[tagIdx];
+      if (!w || typeof w.text !== "string") continue;
+      const span = document.createElement("span");
+      span.className = "word";
+      span.dataset.buf = String(bufId);
+      span.dataset.idx = String(tagIdx);
+      span.textContent = w.text;
+      _transcript.appendChild(span);
+      if (tagIdx < words.length - 1) {
+        _transcript.appendChild(document.createTextNode(" "));
+      }
+      _wordSpans[bufId][tagIdx] = span;
+    }
+  }
 
   document.body.classList.add("has-content");
 };

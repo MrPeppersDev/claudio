@@ -460,6 +460,38 @@ local function processStderrLine(line)
     end
     return
   end
+  -- MIRROR_TEXT: kokoro-tts.sh announces the post-preprocess input file
+  -- so the structure-mirror webview can render paragraphs upfront with
+  -- karaoke alignment (#163 PR 4). Path is confined to STATE_DIR with
+  -- basename "last_text.dat" to prevent stderr-injection arbitrary-file
+  -- reads, mirroring the SIDECAR / CTRL guards.
+  if line:sub(1, 12) == "MIRROR_TEXT " then
+    local path = line:match("^MIRROR_TEXT (.+)$")
+    if path then
+      local basename = path:match("([^/]+)$") or ""
+      if not pathInsideDir(path, STATE_DIR) or basename ~= "last_text.dat" then
+        diagLog(string.format(
+          "MIRROR_TEXT rejected (outside STATE_DIR=%s, basename=%s): %s",
+          STATE_DIR, basename, path))
+        hs.printf("[claudio] rejecting MIRROR_TEXT path: %s", path)
+        return
+      end
+      local f = io.open(path, "r")
+      if f then
+        local content = f:read("*a")
+        f:close()
+        if content and #content > 0 then
+          diagLog(string.format("MIRROR_TEXT accepted: %d bytes", #content))
+          mirror.feedText(content)
+        else
+          diagLog("MIRROR_TEXT empty file: " .. path)
+        end
+      else
+        diagLog("MIRROR_TEXT unreadable: " .. path)
+      end
+    end
+    return
+  end
   -- DRAIN_DONE: play-stream emits this on stderr after the last sample of
   -- the last buffer is delivered to the audio device. We trigger the linger-
   -- fade now rather than waiting on the bash task to exit, because the bash
