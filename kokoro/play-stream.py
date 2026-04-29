@@ -821,22 +821,43 @@ def main() -> None:
     )
     _stream.start()
 
-    # Cache the output latency for POS compensation. Post-start() this is a
-    # float (seconds). Belt-and-braces: env var override (tunable without a
-    # code change) and a floor of 0 / ceiling of 0.2 s (200 ms) against bad
-    # backends reporting nonsense.
-    lat_env = os.environ.get("KOKORO_AUDIO_LEAD_MS")
-    if lat_env:
+    # POS compensation = auto-detected stream latency + configured audio-lead.
+    #
+    # Two pieces stack:
+    #
+    #   1. auto_latency_s — the actual time between sample-write and sample-
+    #      reaching-speaker, reported by sounddevice. Without compensating for
+    #      this, POS would describe what's been written to the ring buffer,
+    #      not what's playing. Floor 0 / ceiling 0.2 s against bad backends.
+    #
+    #   2. lead_s — additional offset that pushes POS earlier than speaker
+    #      time, so audio LEADS visual by lead_s. Research-backed: Kim 2024
+    #      AJSLP shows the temporal binding window is asymmetric — visual-
+    #      leads-audio is the damaging direction, audio-leads-visual is safe.
+    #      Default 50 ms keeps us comfortably inside the binding window
+    #      while protecting against occasional visual-leads-audio on short
+    #      words where word boundaries land inside latency noise.
+    #
+    # The previous semantic of KOKORO_AUDIO_LEAD_MS was "replace auto_latency
+    # entirely" — fine for tuning but loses the speaker-time anchor. The
+    # additive model is more intuitive (env var = "how much should audio lead
+    # visual") and degrades gracefully if the user sets a small value.
+    raw = getattr(_stream, "latency", 0.0) or 0.0
+    try:
+        auto_latency_s = max(0.0, min(0.2, float(raw)))
+    except (TypeError, ValueError):
+        auto_latency_s = 0.0
+
+    lead_env = os.environ.get("KOKORO_AUDIO_LEAD_MS")
+    if lead_env:
         try:
-            _STREAM_OUTPUT_LATENCY_S = max(0.0, min(0.2, float(lat_env) / 1000.0))
+            lead_s = max(0.0, min(0.2, float(lead_env) / 1000.0))
         except ValueError:
-            _STREAM_OUTPUT_LATENCY_S = 0.0
+            lead_s = 0.050
     else:
-        raw = getattr(_stream, "latency", 0.0) or 0.0
-        try:
-            _STREAM_OUTPUT_LATENCY_S = max(0.0, min(0.2, float(raw)))
-        except (TypeError, ValueError):
-            _STREAM_OUTPUT_LATENCY_S = 0.0
+        lead_s = 0.050  # 50 ms default; #124 + Q2 of #163 design pass.
+
+    _STREAM_OUTPUT_LATENCY_S = auto_latency_s + lead_s
 
     # Start the player thread as daemon so it exits when main() returns.
     # Also expose at module scope so _shutdown() can join it.

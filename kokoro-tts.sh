@@ -59,18 +59,18 @@
 #                      — the previous single-sample threshold ate release
 #                      bursts from t/p/k whose amplitude sits below 0.005.
 #                      (default: 40; 0 disables — keep Kokoro's native tail)
-#   KOKORO_AUDIO_LEAD_MS  fixed POS compensation in ms. Override for the
-#                      auto-detected sounddevice OutputStream.latency.
-#                      Subtracted from emitted source_ms so POS reflects
-#                      what's AT THE SPEAKER, not what's been written to
-#                      the ring buffer. Guarantees the RSVP visual onset
-#                      lands AT or AFTER the audio onset — Kim et al.
-#                      (2024, AJSLP) found audio lagging behind visual
-#                      measurably hurts comprehension; audio leading or
-#                      matching is the only safe direction. Default:
-#                      auto-detect via OutputStream.latency (~20-30 ms on
-#                      CoreAudio). Clamped to [0, 200]. Set to a number
-#                      to pin it, or leave unset.
+#   KOKORO_AUDIO_LEAD_MS  audio-lead-over-visual offset in ms. Audio plays
+#                      this many ms before the matching POS event fires, so
+#                      the RSVP word renders AFTER its audio. Research-
+#                      backed asymmetric temporal binding window: visual-
+#                      leads-audio is damaging to comprehension, audio-
+#                      leads-visual is safe (Kim 2024, AJSLP). Stacks on
+#                      top of auto-detected sounddevice OutputStream
+#                      latency (typical ~20-30 ms on CoreAudio); the lead
+#                      is the additional offset beyond speaker-time.
+#                      Default 50 ms (per #163 design pass Q2). Clamped
+#                      to [0, 200]. Set to 0 to revert to "POS lands AT
+#                      the speaker" behavior.
 #   KOKORO_SACRIFICIAL_WORD  throwaway prefix word. Kokoro's first-token
 #                      warm-up eats the initial consonant of every sentence,
 #                      so we synth "banana, {real_text}" and the server cuts
@@ -460,15 +460,27 @@ for seg_txt in "$WORK_DIR"/seg-*.txt; do
       printf 'EARCON %s\n' "$EARCON" >&9
     fi
 
-    # Paragraph-level pause via play-stream silence insert. With windowed-
-    # RMS tail trim active (~40 ms kept), this 150 ms gap plus the trimmed
-    # tail on the previous sentence ≈ paragraph-y without dragging. Gated
-    # on "playing" so we never pause before the very first utterance, and
-    # routed through play-stream PAUSE (not shell sleep) because the bash
-    # loop is ahead of what the stream has actually played — a shell sleep
-    # here would pause the producer, not the listener.
+    # Tier'd boundary pauses via play-stream silence inserts (#163 Q1 hybrid).
+    # These are deterministic — independent of Kokoro's natural prosody —
+    # and routed through play-stream PAUSE (not shell sleep) because the
+    # bash loop is ahead of what the stream has actually played; a shell
+    # sleep here would pause the producer, not the listener.
+    #
+    #   paragraph (250 ms): preprocess.py marked this sentence with the
+    #     \x1c paragraph-start prefix. Long enough to read as a paragraph
+    #     break without dragging.
+    #   sentence  (120 ms): consecutive sentences within a single segment
+    #     (non-coalesced case — segment was over COALESCE_MAX_CHARS so each
+    #     sentence is its own buffer). For coalesced segments, sentence
+    #     prosody is handled inside one Kokoro synth call, no PAUSE needed.
+    #
+    # Order matters: paragraph-before takes precedence over sentence (a
+    # paragraph break is, semantically, also a sentence break, but we want
+    # the longer 250 ms reading rather than stacking 120+250).
     if [ "$paragraph_before" -eq 1 ] && [ "$playing" -eq 1 ]; then
-      printf 'PAUSE 150\n' >&9
+      printf 'PAUSE 250\n' >&9
+    elif [ "$playing" -eq 1 ] && [ "$seg_has_audio" -eq 1 ]; then
+      printf 'PAUSE 120\n' >&9
     fi
 
     if [ "$playing" -eq 0 ]; then
