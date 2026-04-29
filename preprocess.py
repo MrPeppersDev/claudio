@@ -236,6 +236,13 @@ def _is_all_caps_micro_line(line: str) -> bool:
         return False
     if EARCON_SENTINEL in stripped:
         return False
+    # Sentence punctuation (comma/period/semicolon/etc.) signals content,
+    # not a navigation tag. Without this check, table data rows like
+    # "Q1, 100" — one capital letter plus digits — were getting flagged
+    # as all-caps micro-lines and dropped, leaving listeners hearing only
+    # the table's header. Mirrors the same check in _is_short_chrome_line.
+    if _SENTENCE_PUNCT.search(stripped):
+        return False
     saw_letter = False
     for ch in stripped:
         if ch.islower():
