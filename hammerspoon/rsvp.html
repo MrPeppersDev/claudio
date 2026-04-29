@@ -624,7 +624,11 @@ window.addEventListener("keydown", function(e) {
     __claudio_push("pause_only");
   } else if (k === "ArrowLeft") {
     e.preventDefault();
-    __claudio_push("seek_back");
+    // Shift+← = fine-grain 2000ms seek (preserves the previous behavior).
+    // Bare ← = sentence-aware backtrack: jump to start of current buffer,
+    // or to start of previous buffer if we're within ~1.5s of the current
+    // buffer's start (lua side decides the boundary).
+    __claudio_push(e.shiftKey ? "seek_back" : "sentence_back");
   } else if (k === "ArrowRight") {
     e.preventDefault();
     __claudio_push("seek_fwd");
