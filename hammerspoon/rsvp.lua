@@ -122,9 +122,20 @@ local _lastPosMs = nil
 -- without × clicking. The watchdog rescues them by force-hiding.
 local _lastPosTime = nil
 local _hangWatchdog = nil
-local HANG_SECS = 8     -- conservative: long sox stretches on cold cache
-                        -- can produce 4-5s gaps between buffers without
-                        -- being a real hang. 8s gives enough margin.
+local _firstPosSeen = false   -- toggled true on the first M.onPos of a session
+local HANG_SECS = 8     -- post-first-POS gap allowance: long sox stretches
+                        -- on cold cache can produce 4-5s gaps between
+                        -- buffers without being a real hang. 8s gives
+                        -- enough margin.
+local INITIAL_HANG_SECS = 30  -- pre-first-POS wait: cold-cache fresh-synth
+                              -- of long selections (8000+ chars / sparse
+                              -- sentence boundaries) can spend 15-25s in
+                              -- chunked synth before the first PLAY
+                              -- command leaves kokoro-tts.sh. Watchdog
+                              -- shouldn't fire mid-synth on first audio.
+                              -- Once the first POS arrives, the tighter
+                              -- HANG_SECS rule takes over for mid-stream
+                              -- wedges.
 
 -- ── Callbacks (filled by PR 4) ────────────────────────────────────────────────
 
@@ -422,15 +433,23 @@ local function startHangWatchdog()
     diagLog("hang watchdog: already running — startHangWatchdog no-op")
     return
   end
-  diagLog(string.format("hang watchdog: started (HANG_SECS=%d)", HANG_SECS))
+  diagLog(string.format(
+    "hang watchdog: started (INITIAL=%ds before first POS, HANG=%ds after)",
+    INITIAL_HANG_SECS, HANG_SECS))
   _hangWatchdog = hs.timer.doEvery(2.0, function()
     if not _webview then return end
     if not _lastPosTime then return end
     local idle = hs.timer.secondsSinceEpoch() - _lastPosTime
-    if idle > HANG_SECS then
+    -- Two-phase threshold: INITIAL_HANG_SECS while we're waiting for the
+    -- first POS event (cold-cache long-text synth can take 15-25s before
+    -- audio starts; firing the watchdog mid-synth would force-hide a
+    -- balloon over still-progressing work). Once a POS has arrived the
+    -- shorter HANG_SECS catches mid-stream play-stream wedges.
+    local threshold = _firstPosSeen and HANG_SECS or INITIAL_HANG_SECS
+    if idle > threshold then
       diagLog(string.format(
-        "hang watchdog: %.1fs since last POS — force-hiding stuck balloon",
-        idle))
+        "hang watchdog: %.1fs since last POS (threshold=%ds, first_pos=%s) — force-hiding stuck balloon",
+        idle, threshold, tostring(_firstPosSeen)))
       hs.alert.show("Claudio: playback hung — clearing balloon")
       M.hide()
     end
@@ -638,9 +657,11 @@ function M.show(sidecar_path, opts)
   _activeSidecar   = nil
   _activeBufferId  = nil
   _isPaused        = false
-  -- Seed the hang-watchdog clock so the very first 8s of synthesis doesn't
-  -- look like a hang. onPos updates this on every POS event.
+  -- Seed the hang-watchdog clock. onPos updates this on every POS event.
+  -- _firstPosSeen toggles to true on the first POS so the watchdog can
+  -- relax its threshold from INITIAL_HANG_SECS to the tighter HANG_SECS.
   _lastPosTime     = hs.timer.secondsSinceEpoch()
+  _firstPosSeen    = false
   _lastPosMs       = nil
 
   -- Load sidecar if provided.
@@ -919,7 +940,10 @@ function M.onPos(ms, buffer_id)
   end
 
   -- Stamp the last POS time so the hang watchdog knows playback is alive.
+  -- First POS flips the watchdog from INITIAL_HANG_SECS (cold-cache synth
+  -- wait) to the tighter HANG_SECS (mid-stream wedge detection).
   _lastPosTime = hs.timer.secondsSinceEpoch()
+  _firstPosSeen = true
 
   -- Tell the webview to advance.
   if buffer_id ~= nil then

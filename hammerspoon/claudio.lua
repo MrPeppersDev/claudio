@@ -15,17 +15,38 @@ local M = {}
 local rsvp = require("rsvp")
 
 -- Structure-mirror webview (#163 PR 4 v1, two-bubble fallback for non-AX
--- apps). Default OFF — opt-in via KOKORO_MIRROR=1 until the v1 plumbing
--- is validated against real selections. When disabled, all mirror.*
--- calls below are no-ops, so the production rsvp-only path is unchanged.
+-- apps). Default OFF — opt-in until the v1 plumbing is validated against
+-- real selections. When disabled, all mirror.* calls below are no-ops,
+-- so the production rsvp-only path is unchanged.
+--
+-- Two ways to enable, evaluated at this require time (module load /
+-- hs.reload picks up changes — no full Hammerspoon restart needed):
+--   1. State file: `touch ~/.claude/claudio/mirror.enabled` (preferred —
+--      reload-friendly, no env-var-at-launch dance)
+--   2. Env var: KOKORO_MIRROR=1 (legacy; only takes effect on full
+--      Hammerspoon launch since launchd captures env at process start)
 local mirror
-if os.getenv("KOKORO_MIRROR") == "1" then
+local _mirror_state_dir = os.getenv("CLAUDIO_STATE_DIR")
+                          or (os.getenv("HOME") .. "/.claude/claudio")
+local _mirror_flag_file = io.open(_mirror_state_dir .. "/mirror.enabled", "r")
+local _mirror_enabled = false
+if _mirror_flag_file then
+  _mirror_flag_file:close()
+  _mirror_enabled = true
+elseif os.getenv("KOKORO_MIRROR") == "1" then
+  _mirror_enabled = true
+end
+if _mirror_enabled then
+  -- Drop any cached mirror module from a previous load so reload picks
+  -- up edits without needing a full Hammerspoon restart.
+  package.loaded.mirror = nil
   mirror = require("mirror")
 else
   mirror = {
     show        = function() end,
     hide        = function() end,
     feedSidecar = function() end,
+    feedText    = function() end,
     onPos       = function() end,
     endOfStream = function() end,
   }

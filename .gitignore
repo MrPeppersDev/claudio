@@ -50,3 +50,5 @@ graphify-out/
 # this directory holds the in-flight stuff (SESSION.md, agent worktrees)
 # that only makes sense on this machine.
 .claude/
+last_text.dat
+mirror.enabled
