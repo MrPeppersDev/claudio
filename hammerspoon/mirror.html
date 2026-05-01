@@ -139,6 +139,52 @@
   }
 
   /*
+    Tables — rendered when preprocess.py emits \x11..\x14 markers.
+    Layout uses border-collapse so cells share a single hairline grid;
+    monospace numerics keep digit-heavy tables visually aligned without
+    forcing ALL cells to monospace. Padding chosen so cells don't crowd.
+  */
+  #transcript table {
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 17px;       /* slightly smaller than prose so wider tables fit */
+    line-height: 1.4;
+  }
+  #transcript td, #transcript th {
+    border: 1px solid var(--ink-faint);
+    padding: 6px 12px;
+    text-align: left;
+    vertical-align: top;
+    font-variant-numeric: tabular-nums;
+  }
+  #transcript tr:first-child td {
+    /* First row reads as header — slightly heavier. */
+    font-weight: 500;
+    background: rgba(60, 42, 18, 0.04);
+  }
+
+  /*
+    Code blocks — rendered when preprocess.py emits \x15..\x16 markers.
+    Audio side skipped these (earcon plays in their place); the visual
+    surface preserves them as <pre> so the user can see what was
+    skipped. No karaoke highlight passes through code content because
+    no sidecar word timings exist for it.
+  */
+  #transcript pre {
+    background: rgba(60, 42, 18, 0.06);
+    border-left: 3px solid var(--ink-faint);
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin: 12px 0;
+    font-family: "SF Mono", Menlo, Monaco, "Courier New", monospace;
+    font-size: 14px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-x: auto;
+    color: var(--ink);
+  }
+
+  /*
     Empty-state message before any sidecars arrive. Hidden once the
     first word lands.
   */
@@ -183,13 +229,22 @@ let _taggedThrough = 0;
 const _transcript = document.getElementById("transcript");
 const _empty = document.getElementById("empty-state");
 
-// Sentinel codepoints shared with preprocess.py / kokoro-tts.sh:
-//   \x1c — paragraph-start prefix on the first sentence of a new paragraph
-//   \x1d — sentence separator
-//   \x1e — segment / earcon-position marker
-const SENTINEL_PARA = String.fromCharCode(0x1c);
-const SENTINEL_SENT = String.fromCharCode(0x1d);
-const SENTINEL_SEG  = String.fromCharCode(0x1e);
+// Sentinel codepoints shared with preprocess.py / kokoro-tts.sh.
+// All are ASCII control bytes that don't appear in normal text.
+//   \x11 / \x12 / \x13 / \x14 — table open / cell-sep / row-sep / table close
+//   \x15 / \x16             — code-block open / close
+//   \x1c                    — paragraph-start prefix
+//   \x1d                    — sentence separator
+//   \x1e                    — segment / earcon-position marker
+const SENTINEL_TABLE_START = String.fromCharCode(0x11);
+const SENTINEL_CELL_SEP    = String.fromCharCode(0x12);
+const SENTINEL_ROW_SEP     = String.fromCharCode(0x13);
+const SENTINEL_TABLE_END   = String.fromCharCode(0x14);
+const SENTINEL_CODE_START  = String.fromCharCode(0x15);
+const SENTINEL_CODE_END    = String.fromCharCode(0x16);
+const SENTINEL_PARA        = String.fromCharCode(0x1c);
+const SENTINEL_SENT        = String.fromCharCode(0x1d);
+const SENTINEL_SEG         = String.fromCharCode(0x1e);
 
 // Base64 → original UTF-8 string. The Lua side encodes
 // _structuredText via hs.base64 and inlines the result into a
@@ -226,9 +281,24 @@ window.mirror = window.mirror || {};
 // ── Pre-render structured text ────────────────────────────────────────
 //
 // Called by Lua's mirror.feedText with the post-preprocess input string.
-// Splits on \x1d (sentences) and groups into paragraphs (\x1c-prefixed
-// sentences begin a new paragraph). Each word becomes a <span class="word">
-// added to _allWordSpans for tag-on-arrival use by appendWords.
+// The text is a stream of structural sentinels and prose:
+//
+//   prose         — split on \x1d (sentences), \x1c-prefix marks paragraph
+//   tables        — \x11 ... [\x12 cells \x13 rows] ... \x14
+//   code blocks   — \x15 ... content ... \x16
+//
+// Builds the corresponding DOM (<p>, <table>, <pre>) and adds each
+// word inside prose / table cells to _allWordSpans so appendWords can
+// tag them with sidecar buffer/word ids for karaoke. Code-block
+// content is NOT added to _allWordSpans because the audio side
+// skipped it (an earcon plays instead) — no sidecar timings exist
+// for code content.
+//
+// The audio side translates table markers to comma+period prose
+// before synthesis, so the sidecar word stream visits cells in
+// reading order: cell1, cell2, ..., cellN_row1, cell1_row2, ...
+// Adding cells to _allWordSpans in that same order keeps karaoke
+// alignment correct.
 window.mirror.renderText = function(structuredText) {
   if (typeof structuredText !== "string" || !structuredText) return;
 
@@ -238,12 +308,83 @@ window.mirror.renderText = function(structuredText) {
   _allWordSpans.length = 0;
   _taggedThrough = 0;
 
-  // Strip \x1e segment markers — they're earcon position cues, not
-  // visible structure. Paragraph and sentence delimiters survive.
-  const cleaned = structuredText.split(SENTINEL_SEG).join("");
-  const sentences = cleaned.split(SENTINEL_SENT);
+  // Strip \x1e segment markers — they're earcon position cues from
+  // preprocess.py, not visible structure (the new \x15/\x16 code-block
+  // markers carry that role now). Other sentinels survive for parsing.
+  const text = structuredText.split(SENTINEL_SEG).join("");
 
-  let currentP = null;
+  let i = 0;
+  let currentP = null;  // most recent <p> for prose accumulation
+
+  while (i < text.length) {
+    const ch = text.charAt(i);
+
+    if (ch === SENTINEL_TABLE_START) {
+      currentP = null;  // tables stand alone, not inside a <p>
+      const end = text.indexOf(SENTINEL_TABLE_END, i);
+      const body = end < 0 ? text.substring(i + 1) : text.substring(i + 1, end);
+      _renderTable(body);
+      i = (end < 0 ? text.length : end + 1);
+      continue;
+    }
+
+    if (ch === SENTINEL_CODE_START) {
+      currentP = null;  // pre stands alone
+      const end = text.indexOf(SENTINEL_CODE_END, i);
+      const body = end < 0 ? text.substring(i + 1) : text.substring(i + 1, end);
+      _renderCode(body);
+      i = (end < 0 ? text.length : end + 1);
+      continue;
+    }
+
+    // Prose run: collect everything up to the next structural marker
+    // (or end of input), then render it through the existing
+    // sentence/paragraph splitter.
+    let nextStruct = text.length;
+    const i11 = text.indexOf(SENTINEL_TABLE_START, i);
+    const i15 = text.indexOf(SENTINEL_CODE_START, i);
+    if (i11 >= 0) nextStruct = Math.min(nextStruct, i11);
+    if (i15 >= 0) nextStruct = Math.min(nextStruct, i15);
+    const proseRun = text.substring(i, nextStruct);
+    currentP = _renderProse(proseRun, currentP);
+    i = nextStruct;
+  }
+
+  if (_allWordSpans.length > 0) {
+    document.body.classList.add("has-content");
+  }
+};
+
+
+// Append words from a single text chunk to a container element. Splits
+// on whitespace, creates word spans, registers each in _allWordSpans
+// (so appendWords' tag cursor advances over them), inserts spaces
+// between consecutive words. Returns the count of words added.
+function _appendWordsToContainer(container, chunk) {
+  const words = chunk.split(/\s+/).filter(function(w) { return w.length > 0; });
+  for (let j = 0; j < words.length; j++) {
+    const span = document.createElement("span");
+    span.className = "word";
+    span.textContent = words[j];
+    container.appendChild(span);
+    _allWordSpans.push(span);
+    if (j < words.length - 1) {
+      container.appendChild(document.createTextNode(" "));
+    }
+  }
+  return words.length;
+}
+
+
+// Render a chunk of prose (no table or code-block markers; may contain
+// \x1c paragraph-start prefixes and \x1d sentence delimiters). Returns
+// the most recent <p> element so a subsequent prose run can continue
+// appending to it (when the user has prose → table → prose, the trailing
+// prose may not start a new paragraph; the leading \x1c carries that
+// signal).
+function _renderProse(chunk, currentP) {
+  if (!chunk) return currentP;
+  const sentences = chunk.split(SENTINEL_SENT);
   for (let i = 0; i < sentences.length; i++) {
     let s = sentences[i];
     if (!s) continue;
@@ -254,33 +395,59 @@ window.mirror.renderText = function(structuredText) {
 
     if (startsParagraph || !currentP) {
       currentP = document.createElement("p");
-      // Paragraph spacing comes via CSS margin on <p>. Don't add inline
-      // <br>s — they'd stack in unpredictable ways with the <p> margin.
       _transcript.appendChild(currentP);
     }
-
-    // Word split: collapse any remaining whitespace runs to single spaces.
-    const words = s.split(/\s+/).filter(function(w) { return w.length > 0; });
-    for (let j = 0; j < words.length; j++) {
-      const span = document.createElement("span");
-      span.className = "word";
-      span.textContent = words[j];
-      currentP.appendChild(span);
-      _allWordSpans.push(span);
-      if (j < words.length - 1) {
-        currentP.appendChild(document.createTextNode(" "));
-      }
-    }
-    // Inter-sentence space within the same paragraph.
-    if (currentP) {
+    const added = _appendWordsToContainer(currentP, s);
+    if (added > 0) {
       currentP.appendChild(document.createTextNode(" "));
     }
   }
+  return currentP;
+}
 
-  if (_allWordSpans.length > 0) {
-    document.body.classList.add("has-content");
+
+// Render a table from its cells/rows body (the slice between
+// SENTINEL_TABLE_START and SENTINEL_TABLE_END). Cells are split on
+// SENTINEL_CELL_SEP, rows on SENTINEL_ROW_SEP. Each cell's words are
+// appended to _allWordSpans in reading order — the same order the
+// audio side reads them after marker translation, so the sidecar
+// word stream and the rendered cells stay aligned for karaoke.
+function _renderTable(body) {
+  const tableEl = document.createElement("table");
+  const rows = body.split(SENTINEL_ROW_SEP);
+  for (let r = 0; r < rows.length; r++) {
+    const rowText = rows[r];
+    if (!rowText) continue;  // empty row from leading/trailing markers
+    const tr = document.createElement("tr");
+    const cells = rowText.split(SENTINEL_CELL_SEP);
+    let nonEmptyCells = 0;
+    for (let c = 0; c < cells.length; c++) {
+      const cellText = cells[c].trim();
+      if (!cellText) continue;
+      const td = document.createElement("td");
+      _appendWordsToContainer(td, cellText);
+      tr.appendChild(td);
+      nonEmptyCells++;
+    }
+    if (nonEmptyCells > 0) {
+      tableEl.appendChild(tr);
+    }
   }
-};
+  if (tableEl.firstChild) {
+    _transcript.appendChild(tableEl);
+  }
+}
+
+
+// Render a code block as a <pre>. Content is shown verbatim; no word
+// spans are added because the audio side skipped this content (only
+// an earcon played in its place), so there are no sidecar timings to
+// align to.
+function _renderCode(body) {
+  const pre = document.createElement("pre");
+  pre.textContent = body;
+  _transcript.appendChild(pre);
+}
 
 // ── Tag pre-rendered spans (or stream-append) for a buffer ───────────
 //
