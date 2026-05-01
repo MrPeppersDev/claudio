@@ -361,11 +361,12 @@ function M.show(opts)
     -- backfill sidecars — sidecars in v2 mode just tag pre-rendered
     -- spans; if no text was cached, the v1 streaming-append fallback
     -- kicks in inside the JS).
+    -- Base64 transport: see comment on M.feedText below for why.
     if _structuredText then
-      local ok_enc, json_str = pcall(hs.json.encode, _structuredText)
-      if ok_enc and json_str then
-        _webview:evaluateJavaScript(
-          "window.mirror.renderText(" .. json_str .. ")")
+      local b64 = hs.base64.encode(_structuredText)
+      if b64 and b64 ~= "" then
+        _webview:evaluateJavaScript(string.format(
+          "window.mirror.renderText(__claudio_b64decode(%q))", b64))
       end
     end
 
@@ -408,18 +409,28 @@ end
 -- into <p> blocks and per-word <span>s. Subsequent feedSidecar calls
 -- TAG those spans with data-buf / data-idx; the streaming-append v1
 -- behavior is the fallback when feedText was never called.
+--
+-- Transport via base64: hs.json.encode rejects strings with embedded
+-- control bytes (\x1c / \x1d / \x1e), and we specifically need those
+-- bytes to survive into the webview where renderText splits on them.
+-- Base64 round-trips them losslessly through the JSON expression that
+-- evaluateJavaScript parses. JS-side atob + decodeURIComponent
+-- reconstructs the original UTF-8 byte sequence.
 function M.feedText(text)
   if not text or text == "" then return end
   _structuredText = text
   diagLog(string.format("feedText: %d bytes (paragraphs cached for render)",
                         #text))
   if not _webview then return end
-  local ok_enc, json_str = pcall(hs.json.encode, text)
-  if not ok_enc or not json_str then
-    diagLog("feedText: json encode FAILED")
+  local b64 = hs.base64.encode(text)
+  if not b64 or b64 == "" then
+    diagLog("feedText: base64 encode FAILED")
     return
   end
-  local js = "window.mirror.renderText(" .. json_str .. ")"
+  -- The base64 alphabet is JS-safe (A-Z / a-z / 0-9 / + / / / =), so
+  -- inlining as a quoted string literal is fine.
+  local js = string.format(
+    "window.mirror.renderText(__claudio_b64decode(%q))", b64)
   _webview:evaluateJavaScript(js)
 end
 

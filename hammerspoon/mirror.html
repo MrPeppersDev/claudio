@@ -191,6 +191,25 @@ const SENTINEL_PARA = String.fromCharCode(0x1c);
 const SENTINEL_SENT = String.fromCharCode(0x1d);
 const SENTINEL_SEG  = String.fromCharCode(0x1e);
 
+// Base64 → original UTF-8 string. The Lua side encodes
+// _structuredText via hs.base64 and inlines the result into a
+// JS expression evaluated by hs.webview:evaluateJavaScript. Direct
+// JSON encoding doesn't work because hs.json.encode rejects strings
+// with embedded \x1c / \x1d / \x1e control bytes — and we
+// specifically need those bytes to survive into renderText so it can
+// split paragraphs. Base64 round-trips them losslessly through
+// JSON's quoted-string syntax. atob produces a "binary string" whose
+// charCodes are raw bytes; escape + decodeURIComponent reconstructs
+// UTF-8. More reliable than TextDecoder on older WebKit builds.
+function __claudio_b64decode(b64) {
+  try {
+    var binary = atob(b64);
+    return decodeURIComponent(escape(binary));
+  } catch (e) {
+    return "";
+  }
+}
+
 window.mirror = window.mirror || {};
 
 // ── Pre-render structured text ────────────────────────────────────────
