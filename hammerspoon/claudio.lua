@@ -452,6 +452,19 @@ local function processStderrLine(line)
     rsvp.endOfStream()
     return
   end
+  -- Drop the urllib3 NotOpenSSLWarning that Python 3.9's bundled urllib3
+  -- emits once per invocation when the runtime's OpenSSL is LibreSSL. It's
+  -- harmless (we don't make HTTPS calls from preprocess.py / play-stream.py;
+  -- the local kokoro-server is plain HTTP on loopback), but it spammed
+  -- every play after #157's fallthrough started logging it. Two-line
+  -- pattern: the warning preamble + a `  warnings.warn(` follow-up that
+  -- Python writes to stderr. Match each independently so an unrelated
+  -- `warnings.warn(` would still surface.
+  if line:find("NotOpenSSLWarning", 1, true)
+     or line:find("urllib3 v2 only supports OpenSSL", 1, true)
+     or line:match("^%s*warnings%.warn%(%s*$") then
+    return
+  end
   -- Anything else on stderr is unstructured output (e.g. bash error messages,
   -- python tracebacks). Surface it so we don't lose visibility into spawn or
   -- script failures — without this, a `set -u` death or mkdir error in the
