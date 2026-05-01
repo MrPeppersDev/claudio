@@ -82,16 +82,15 @@ def test_table_rows_survive_clean_web_artifacts() -> None:
         "Next paragraph.\n"
     )
     after_md = strip_markdown(md)
-    _assert("Q1, 100" in after_md,
-            "Q1, 100 present after strip_markdown")
-    _assert("Q2, 150" in after_md,
-            "Q2, 150 present after strip_markdown")
+    # After Phase 1 of #163 PR 4 follow-up, table rows are marker-wrapped
+    # rather than linearized inline. The cell *contents* must still be
+    # present (audio side translates the markers back to commas in Phase 2).
+    for cell in ("Quarter", "Sales", "Q1", "100", "Q2", "150"):
+        _assert(cell in after_md, f"{cell!r} present after strip_markdown")
 
     after_web = clean_web_artifacts(after_md)
-    _assert("Q1, 100" in after_web,
-            "Q1, 100 survives clean_web_artifacts")
-    _assert("Q2, 150" in after_web,
-            "Q2, 150 survives clean_web_artifacts")
+    for cell in ("Quarter", "Sales", "Q1", "100", "Q2", "150"):
+        _assert(cell in after_web, f"{cell!r} survives clean_web_artifacts")
 
 
 def test_actual_nav_still_filtered() -> None:
