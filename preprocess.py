@@ -107,17 +107,122 @@ def maybe_extract_article(text: str) -> str:
 # e.g. fenced code must go before anything that might see inside it, and
 # images must go before links (image syntax is a superset of link syntax).
 
-# Sentinel for structural elisions. kokoro-tts.sh splits on this and plays
-# an earcon at each boundary, so the listener hears "...prose, THOK, prose..."
-# where a code block used to be. ASCII 0x1E (record separator) — guaranteed
-# not to appear in normal text; survives shell pipes and JSON encoding fine.
+# Sentinel codepoints. ASCII control bytes (0x11-0x1E) — guaranteed
+# not to appear in normal text; survive shell pipes and JSON encoding fine.
+#
+# Existing sentinels (kept):
+#   \x1c — paragraph-start prefix on the first sentence of a new paragraph
+#   \x1d — sentence separator (kokoro-tts.sh splits on this for cache granularity)
+#   \x1e — segment / earcon-position marker (kokoro-tts.sh splits on this for
+#          inter-segment EARCON; also written by code-block-strip and adjacent-
+#          sentinel collapse paths historically)
+#
+# New in Phase 1 of #163 PR 4 follow-up (structural rendering for the mirror
+# webview). Audio side translates these back to today's behavior; mirror.html
+# parses them into <pre> / <table> DOM (Phases 2 + 3).
+#
+#   \x11 — TABLE_START   (open `<table>`, audio: dropped)
+#   \x12 — CELL_SEP      (next `<td>` in the same row, audio: ", ")
+#   \x13 — ROW_SEP       (next `<tr>`, audio: ". " — sentence-end pause between rows)
+#   \x14 — TABLE_END     (close `</table>`, audio: dropped)
+#   \x15 — CODE_BLOCK_START (open `<pre>`, audio: drop content + emit earcon)
+#   \x16 — CODE_BLOCK_END   (close `</pre>`, audio: marker that earcon already played)
 EARCON_SENTINEL = "\x1e"
+TABLE_START   = "\x11"
+CELL_SEP      = "\x12"
+ROW_SEP       = "\x13"
+TABLE_END     = "\x14"
+CODE_START    = "\x15"
+CODE_END      = "\x16"
+
+
+def _wrap_code_block(match: "re.Match[str]") -> str:
+    """Wrap fenced-code content with CODE_START / CODE_END markers, preserving
+    the inner text (with trailing newline trimmed). Audio side will drop the
+    content + emit an earcon; mirror.html will render as <pre>.
+    """
+    raw = match.group(0)
+    # Strip the leading and trailing fence (```...``` or ~~~...~~~). The
+    # exact length of the fence isn't fixed (>= 3 chars) but for our regex
+    # it's always exactly 3 since we matched ``` or ~~~. Slice and trim.
+    if raw.startswith("```") and raw.endswith("```"):
+        inner = raw[3:-3]
+    elif raw.startswith("~~~") and raw.endswith("~~~"):
+        inner = raw[3:-3]
+    else:
+        inner = raw
+    # Drop a leading language tag line ("```python\n…") so the rendered
+    # <pre> doesn't start with "python" on its own line.
+    if "\n" in inner:
+        first_line, rest = inner.split("\n", 1)
+        # Heuristic: a language tag is a single short alpha token on the
+        # opening line. Anything with whitespace or > 20 chars is treated
+        # as actual content.
+        if first_line.strip() and " " not in first_line.strip() \
+           and len(first_line.strip()) <= 20:
+            inner = rest
+    return CODE_START + inner.strip("\n") + CODE_END
+
+
+# Pre-compiled markdown table-row pattern: a line that starts and ends with
+# "|" and isn't a separator row (which already gets stripped above). Matches
+# a single row; consecutive rows are stitched into a TABLE_START..TABLE_END
+# block by _wrap_table after the per-row substitution.
+_TABLE_ROW_RE = re.compile(
+    r"(?m)^[ \t]*\|([^\n]+)\|[ \t]*$"
+)
+
+
+def _row_to_cells(match: "re.Match[str]") -> str:
+    """Replace a markdown table row with CELL_SEP-separated cells,
+    surrounded by ROW_SEP at both ends. _wrap_table_blocks then collapses
+    runs of these into TABLE_START / TABLE_END boundaries.
+    """
+    raw = match.group(1)
+    cells = [c.strip() for c in raw.split("|") if c.strip()]
+    if not cells:
+        return ""
+    return ROW_SEP + CELL_SEP.join(cells) + ROW_SEP
+
+
+def _wrap_table_blocks(text: str) -> str:
+    """After _row_to_cells has substituted each row, runs of consecutive
+    rows look like "ROW_SEP cells ROW_SEP ROW_SEP cells ROW_SEP …".
+    Collapse the doubled ROW_SEPs and add TABLE_START / TABLE_END at the
+    ends. The result is a single sentinel-bracketed structure that
+    downstream consumers can split on cleanly.
+    """
+    if ROW_SEP not in text:
+        return text
+    # Collapse adjacent ROW_SEPs (interior boundaries between rows) so we
+    # have ROW_SEP only between rows, not at the ends of each row.
+    text = re.sub(r"\x13[ \t\n]*\x13", ROW_SEP, text)
+    # Find runs that start and end with ROW_SEP and contain no blank line
+    # (a blank line breaks a table). Wrap each run in TABLE_START..TABLE_END.
+    # Use a callback so adjacent unrelated text (e.g. the row before a
+    # paragraph break) doesn't get folded in.
+    def wrap(m: "re.Match[str]") -> str:
+        body = m.group(0).strip("\x13").strip()
+        if not body:
+            return ""
+        # body looks like: cells ROW_SEP cells ROW_SEP cells
+        return TABLE_START + body + TABLE_END
+    # The full run: ROW_SEP, then anything that doesn't include two
+    # consecutive newlines (paragraph break), ending with ROW_SEP.
+    return re.sub(
+        r"\x13[^\n]*(?:\n[^\n]+)*\x13",
+        wrap,
+        text,
+    )
+
 
 _MD_TRANSFORMS = [
-    # Fenced code blocks — dropped with an earcon sentinel. Users who
-    # actually want code read aloud can pass it through selection.
-    (re.compile(r"```.*?```", re.DOTALL), EARCON_SENTINEL),
-    (re.compile(r"~~~.*?~~~", re.DOTALL), EARCON_SENTINEL),
+    # Fenced code blocks — wrap content with CODE_START / CODE_END markers.
+    # Audio side strips the wrapper + content and emits an earcon
+    # (preserving today's "code block → THOK" audible behavior). The
+    # mirror webview parses these markers into <pre> blocks.
+    (re.compile(r"```.*?```", re.DOTALL), _wrap_code_block),
+    (re.compile(r"~~~.*?~~~", re.DOTALL), _wrap_code_block),
 
     # Images — drop (alt text is usually redundant with surrounding prose).
     (re.compile(r"!\[[^\]]*\]\([^)]*\)"), ""),
@@ -149,11 +254,13 @@ _MD_TRANSFORMS = [
 
     # Table separator rows (|---|---|) — strip.
     (re.compile(r"(?m)^[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*$"), ""),
-    # Table cell rows — join cells with ", " so the row reads naturally.
-    (
-        re.compile(r"(?m)^[ \t]*\|([^\n]+)\|[ \t]*$"),
-        lambda m: ", ".join(c.strip() for c in m.group(1).split("|") if c.strip()),
-    ),
+    # Table cell rows — substitute each row with CELL_SEP-joined cells
+    # surrounded by ROW_SEP markers. _wrap_table_blocks (run after the
+    # _MD_TRANSFORMS loop in strip_markdown) folds consecutive rows into
+    # a TABLE_START / TABLE_END block. Audio side replaces CELL_SEP with
+    # ", " and ROW_SEP with ". " (matching today's prose rendering);
+    # mirror.html parses the markers into a <table> with <tr>/<td>.
+    (_TABLE_ROW_RE, _row_to_cells),
 
     # Headings (# … ######) — strip the marker, append period so TTS
     # pauses between the heading and the body. Trailing `#`s (closed-atx
@@ -188,6 +295,10 @@ _MD_TRANSFORMS = [
 def strip_markdown(text: str) -> str:
     for pattern, repl in _MD_TRANSFORMS:
         text = pattern.sub(repl, text)
+    # After per-row CELL_SEP/ROW_SEP substitution, fold consecutive rows
+    # into a single TABLE_START / TABLE_END block so downstream consumers
+    # see one structural unit per markdown table.
+    text = _wrap_table_blocks(text)
     return text
 
 
@@ -218,6 +329,25 @@ _SHORT_LINE_MAX_CHARS = 20
 _ALLCAPS_LINE_MAX_CHARS = 25
 
 
+# Lines that contain ANY structural sentinel (earcon, table, code block)
+# are content — chrome heuristics must not eat them. A markered line
+# typically has only short cell tokens between sentinel bytes (e.g.
+# "\x11A\x12B\x14") which would otherwise look like nav-chrome AND
+# all-caps to the heuristics that follow.
+_STRUCTURAL_SENTINELS = (
+    EARCON_SENTINEL,    # \x1e
+    TABLE_START, CELL_SEP, ROW_SEP, TABLE_END,  # \x11-\x14
+    CODE_START, CODE_END,                        # \x15-\x16
+)
+
+
+def _has_structural_sentinel(s: str) -> bool:
+    for sentinel in _STRUCTURAL_SENTINELS:
+        if sentinel in s:
+            return True
+    return False
+
+
 def _is_short_chrome_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped or len(stripped) > _SHORT_LINE_MAX_CHARS:
@@ -225,7 +355,7 @@ def _is_short_chrome_line(line: str) -> bool:
     if _SENTENCE_PUNCT.search(stripped):
         return False
     # Structural sentinels from strip_markdown aren't chrome — leave alone.
-    if EARCON_SENTINEL in stripped:
+    if _has_structural_sentinel(stripped):
         return False
     return True
 
@@ -234,7 +364,7 @@ def _is_all_caps_micro_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped or len(stripped) > _ALLCAPS_LINE_MAX_CHARS:
         return False
-    if EARCON_SENTINEL in stripped:
+    if _has_structural_sentinel(stripped):
         return False
     # Sentence punctuation (comma/period/semicolon/etc.) signals content,
     # not a navigation tag. Without this check, table data rows like

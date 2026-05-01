@@ -146,7 +146,19 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG_FILE"; }
 #           into the WAV" — defense-in-depth against any residual leading
 #           silence.
 #       v3 WAVs have leak baked in — bump to re-synth and re-sidecar.
-SYNTH_VERSION=4
+#   5 — Phase 1 of #163 PR 4 follow-up structural rendering: preprocess.py
+#       now wraps tables in \x11...\x14 and code blocks in \x15...\x16,
+#       and kokoro-tts.sh translates those back to today's audible
+#       behavior (commas + periods inline, earcon for code) before
+#       segment-splitting on \x1e. Identical synthesized samples for
+#       prose-only text; selections containing tables or code blocks
+#       produce the same audio they did pre-Phase-1 but go through a
+#       new transformation path. Bumping just to be safe — cached
+#       sentence WAVs from version 4 are still semantically correct
+#       but the cache key already excludes the markers (post-strip),
+#       so most cache entries should still hit. Bump cost: one cold
+#       synth per stale entry.
+SYNTH_VERSION=5
 sentence_hash() {
   local text="$1"
   local pad="$2"
@@ -198,11 +210,14 @@ if [ -z "$TEXT" ]; then
 fi
 
 # Stash the post-preprocess text for the structure-mirror webview
-# (#163 PR 4). \x1c (paragraph-start) and \x1d (sentence) delimiters are
-# preserved so Hammerspoon's mirror.lua can render paragraphs upfront
-# and tag word positions for karaoke when sidecars arrive. The file is
-# announced on stderr like SIDECAR so claudio.lua's processStderrLine
-# picks it up at a deterministic moment.
+# (#163 PR 4). All structural sentinels — \x1c (paragraph-start),
+# \x1d (sentence), \x1e (segment / earcon), and the new structural-
+# rendering family \x11-\x16 (table open / cell-sep / row-sep / table
+# close / code open / code close) — are preserved here so the mirror
+# can render <table> / <pre> structure. The audio-side translation
+# happens AFTER this stash, so the file always contains the
+# fully-marked-up text regardless of how kokoro-tts.sh chooses to
+# render structure for audio.
 MIRROR_TEXT_PATH="$STATE_DIR/last_text.dat"
 # Atomic write: tmp file + rename so claudio.lua's reader never observes
 # a partially-written file. Without atomicity, a rapid double-F13 (or
@@ -218,6 +233,54 @@ MIRROR_TEXT_TMP="$(mktemp "$STATE_DIR/last_text.XXXXXX")" || {
 printf '%s' "$TEXT" > "$MIRROR_TEXT_TMP"
 mv "$MIRROR_TEXT_TMP" "$MIRROR_TEXT_PATH"
 printf 'MIRROR_TEXT %s\n' "$MIRROR_TEXT_PATH" >&2
+
+# Translate the new structural-rendering sentinels to today's audible
+# behavior (#163 PR 4 follow-up Phase 1):
+#   \x15...\x16 (code block) → \x1e (existing earcon sentinel)
+#   \x11 (TABLE_START), \x14 (TABLE_END) → drop entirely
+#   \x12 (CELL_SEP) → ", " (matches the regex linearization that
+#                          preprocess.py used to do inline)
+#   \x13 (ROW_SEP)  → ". " (sentence-end pause between rows; longer
+#                          than CELL_SEP, audibly distinct)
+#
+# Done with bash parameter expansion (no external process). Order
+# matters: code-block strip first so we don't translate \x12/\x13
+# inside code-block content. The existing \x1c/\x1d/\x1e behavior
+# downstream is unchanged — we just rewrite the new sentinels into
+# the equivalent of the old preprocess-side substitutions.
+_strip_structural_markers() {
+  # $1: the text to translate. Echoes the result.
+  local s="$1"
+  # Code blocks: replace each \x15...\x16 with the EARCON sentinel
+  # so the segment loop below processes a code block as exactly one
+  # earcon-bounded segment, identical to the old behavior.
+  #
+  # The condition `*\x15*\x16*` requires both bytes in order, so
+  # unpaired \x15 (e.g. truncated input from a kill mid-emit) doesn't
+  # enter the loop. Belt-and-braces: track string length each iteration
+  # and break if it didn't shrink — protects against bash globbing
+  # behaviors I haven't anticipated, where the loop could otherwise
+  # hang indefinitely while holding the job lock.
+  local prev_len=0
+  while [[ "$s" == *$'\x15'*$'\x16'* ]]; do
+    prev_len=${#s}
+    local pre="${s%%$'\x15'*}"
+    local rest="${s#*$'\x15'}"
+    local post="${rest#*$'\x16'}"
+    s="${pre}"$'\x1e'"${post}"
+    if [ ${#s} -ge "$prev_len" ]; then
+      log "WARN: _strip_structural_markers non-shrinking iteration; aborting"
+      break
+    fi
+  done
+  # Tables: drop TABLE_START / TABLE_END, swap separators for prose.
+  s="${s//$'\x11'/}"
+  s="${s//$'\x14'/}"
+  s="${s//$'\x12'/, }"
+  s="${s//$'\x13'/. }"
+  printf '%s' "$s"
+}
+TEXT="$(_strip_structural_markers "$TEXT")"
 
 # Split the target speed between the model and play-stream. Pushing Kokoro
 # to its 2.0x cap forces the model to compress phonemes and syllables muddle;
