@@ -14,6 +14,44 @@ local M = {}
 
 local rsvp = require("rsvp")
 
+-- Structure-mirror webview (#163 PR 4 v1, two-bubble fallback for non-AX
+-- apps). Default OFF — opt-in until the v1 plumbing is validated against
+-- real selections. When disabled, all mirror.* calls below are no-ops,
+-- so the production rsvp-only path is unchanged.
+--
+-- Two ways to enable, evaluated at this require time (module load /
+-- hs.reload picks up changes — no full Hammerspoon restart needed):
+--   1. State file: `touch ~/.claude/claudio/mirror.enabled` (preferred —
+--      reload-friendly, no env-var-at-launch dance)
+--   2. Env var: KOKORO_MIRROR=1 (legacy; only takes effect on full
+--      Hammerspoon launch since launchd captures env at process start)
+local mirror
+local _mirror_state_dir = os.getenv("CLAUDIO_STATE_DIR")
+                          or (os.getenv("HOME") .. "/.claude/claudio")
+local _mirror_flag_file = io.open(_mirror_state_dir .. "/mirror.enabled", "r")
+local _mirror_enabled = false
+if _mirror_flag_file then
+  _mirror_flag_file:close()
+  _mirror_enabled = true
+elseif os.getenv("KOKORO_MIRROR") == "1" then
+  _mirror_enabled = true
+end
+if _mirror_enabled then
+  -- Drop any cached mirror module from a previous load so reload picks
+  -- up edits without needing a full Hammerspoon restart.
+  package.loaded.mirror = nil
+  mirror = require("mirror")
+else
+  mirror = {
+    show        = function() end,
+    hide        = function() end,
+    feedSidecar = function() end,
+    feedText    = function() end,
+    onPos       = function() end,
+    endOfStream = function() end,
+  }
+end
+
 -- RSVP wiring state. Reset on every runPlayScript spawn.
 --   controlFifoPath: path to the command FIFO advertised by kokoro-tts.sh via
 --     its "CTRL <path>" stderr line. Lives only for the duration of one play
@@ -393,7 +431,10 @@ local function processStderrLine(line)
   if prefix == "POS " then
     local ms_s, id_s = line:match("^POS (%d+) (%d+)$")
     if ms_s and id_s then
-      rsvp.onPos(tonumber(ms_s), tonumber(id_s))
+      local ms = tonumber(ms_s)
+      local bid = tonumber(id_s)
+      rsvp.onPos(ms, bid)
+      mirror.onPos(ms, bid)
     end
     return
   end
@@ -411,6 +452,7 @@ local function processStderrLine(line)
         diagLog(string.format("SIDECAR accepted: id=%s bytes=%d path=%s",
                               id_s, #json, path))
         rsvp.feedSidecar(tonumber(id_s), json)
+        mirror.feedSidecar(tonumber(id_s), json)
       else
         -- Sidecar was announced but not readable. Common causes: server
         -- ran without a patched model (no timings produced), permission
@@ -439,6 +481,38 @@ local function processStderrLine(line)
     end
     return
   end
+  -- MIRROR_TEXT: kokoro-tts.sh announces the post-preprocess input file
+  -- so the structure-mirror webview can render paragraphs upfront with
+  -- karaoke alignment (#163 PR 4). Path is confined to STATE_DIR with
+  -- basename "last_text.dat" to prevent stderr-injection arbitrary-file
+  -- reads, mirroring the SIDECAR / CTRL guards.
+  if line:sub(1, 12) == "MIRROR_TEXT " then
+    local path = line:match("^MIRROR_TEXT (.+)$")
+    if path then
+      local basename = path:match("([^/]+)$") or ""
+      if not pathInsideDir(path, STATE_DIR) or basename ~= "last_text.dat" then
+        diagLog(string.format(
+          "MIRROR_TEXT rejected (outside STATE_DIR=%s, basename=%s): %s",
+          STATE_DIR, basename, path))
+        hs.printf("[claudio] rejecting MIRROR_TEXT path: %s", path)
+        return
+      end
+      local f = io.open(path, "r")
+      if f then
+        local content = f:read("*a")
+        f:close()
+        if content and #content > 0 then
+          diagLog(string.format("MIRROR_TEXT accepted: %d bytes", #content))
+          mirror.feedText(content)
+        else
+          diagLog("MIRROR_TEXT empty file: " .. path)
+        end
+      else
+        diagLog("MIRROR_TEXT unreadable: " .. path)
+      end
+    end
+    return
+  end
   -- DRAIN_DONE: play-stream emits this on stderr after the last sample of
   -- the last buffer is delivered to the audio device. We trigger the linger-
   -- fade now rather than waiting on the bash task to exit, because the bash
@@ -450,6 +524,7 @@ local function processStderrLine(line)
   if line == "DRAIN_DONE" then
     diagLog("DRAIN_DONE → endOfStream (linger-fade)")
     rsvp.endOfStream()
+    mirror.endOfStream()
     return
   end
   -- Drop the urllib3 NotOpenSSLWarning that Python 3.9's bundled urllib3
@@ -558,12 +633,14 @@ local function runPlayScript(args)
             "task exit: code=%s wasUserStop=%s userStop=%s → endOfStream",
             tostring(code), tostring(wasUserStop), tostring(userStop)))
           rsvp.endOfStream()
+          mirror.endOfStream()
         end
       else
         diagLog(string.format(
           "task exit: code=%s wasUserStop=%s userStop=%s → hide+alert",
           tostring(code), tostring(wasUserStop), tostring(userStop)))
         rsvp.hide()
+        mirror.hide()
         hs.alert.show("Claudio error (exit " .. code .. ")")
       end
     end,
@@ -841,8 +918,9 @@ local function stopPlayback(reason)
   -- Stop kills play-stream abruptly — POS events halt and rsvp would sit
   -- on its last word forever waiting for the linger timer that never
   -- arms (the linger trigger only fires when POS crosses last_word.end_ms).
-  diagLog("stopPlayback: calling rsvp.hide()")
+  diagLog("stopPlayback: calling rsvp.hide() / mirror.hide()")
   rsvp.hide()
+  mirror.hide()
   return true
 end
 
@@ -869,6 +947,7 @@ function M.toggle()
         -- Delaying this until after the first SIDECAR would leave F13 with
         -- no visible response for ~500ms-2s of synth time.
         rsvp.show(nil, { anchor = anchor })
+        mirror.show({ anchor = anchor })
         runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
       end
     elseif hint and hint.pdfPath then
@@ -893,6 +972,7 @@ function M.toggle()
               f:write(stdout)
               f:close()
               rsvp.show(nil, { anchor = anchor })
+              mirror.show({ anchor = anchor })
               runPlayScript({ PLAY_SCRIPT, "--text-file", tmp })
             else
               os.remove(tmp)
@@ -1231,6 +1311,7 @@ function M.start()
       -- No job running — just dismiss the balloon (it can be on screen
       -- during the post-playback linger window).
       rsvp.hide()
+      mirror.hide()
     end
   end
 

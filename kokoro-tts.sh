@@ -197,6 +197,16 @@ if [ -z "$TEXT" ]; then
   exit 3
 fi
 
+# Stash the post-preprocess text for the structure-mirror webview
+# (#163 PR 4). \x1c (paragraph-start) and \x1d (sentence) delimiters are
+# preserved so Hammerspoon's mirror.lua can render paragraphs upfront
+# and tag word positions for karaoke when sidecars arrive. The file is
+# announced on stderr like SIDECAR so claudio.lua's processStderrLine
+# picks it up at a deterministic moment.
+MIRROR_TEXT_PATH="$STATE_DIR/last_text.dat"
+printf '%s' "$TEXT" > "$MIRROR_TEXT_PATH"
+printf 'MIRROR_TEXT %s\n' "$MIRROR_TEXT_PATH" >&2
+
 # Split the target speed between the model and play-stream. Pushing Kokoro
 # to its 2.0x cap forces the model to compress phonemes and syllables muddle;
 # a gentler synth rate keeps prosody clean, and play-stream's pitch-preserving
