@@ -857,7 +857,13 @@ def main() -> None:
     else:
         lead_s = 0.050  # 50 ms default; #124 + Q2 of #163 design pass.
 
-    _STREAM_OUTPUT_LATENCY_S = auto_latency_s + lead_s
+    # Cap the sum at 200 ms. Either component is individually clamped to
+    # [0, 0.2] above, so the worst case is 0.4 — well outside the
+    # asymmetric temporal binding window for speech-image sync (~100 ms
+    # before audio leads visual becomes user-perceptible as desync).
+    # 200 ms keeps audio comfortably ahead of visual without straying
+    # into "looks like the words are out of order" territory.
+    _STREAM_OUTPUT_LATENCY_S = min(0.2, auto_latency_s + lead_s)
 
     # Start the player thread as daemon so it exits when main() returns.
     # Also expose at module scope so _shutdown() can join it.

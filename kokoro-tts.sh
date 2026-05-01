@@ -204,7 +204,19 @@ fi
 # announced on stderr like SIDECAR so claudio.lua's processStderrLine
 # picks it up at a deterministic moment.
 MIRROR_TEXT_PATH="$STATE_DIR/last_text.dat"
-printf '%s' "$TEXT" > "$MIRROR_TEXT_PATH"
+# Atomic write: tmp file + rename so claudio.lua's reader never observes
+# a partially-written file. Without atomicity, a rapid double-F13 (or
+# any hs.task callback firing while bash is still writing) could read
+# truncated or mixed-content text and feed garbage into the mirror.
+# `mktemp` template is inside STATE_DIR so the rename stays on the
+# same filesystem (rename(2) is atomic only when src and dst share a
+# device).
+MIRROR_TEXT_TMP="$(mktemp "$STATE_DIR/last_text.XXXXXX")" || {
+  log "ERROR: mktemp failed for MIRROR_TEXT staging"
+  exit 1
+}
+printf '%s' "$TEXT" > "$MIRROR_TEXT_TMP"
+mv "$MIRROR_TEXT_TMP" "$MIRROR_TEXT_PATH"
 printf 'MIRROR_TEXT %s\n' "$MIRROR_TEXT_PATH" >&2
 
 # Split the target speed between the model and play-stream. Pushing Kokoro
