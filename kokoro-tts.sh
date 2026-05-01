@@ -254,11 +254,24 @@ _strip_structural_markers() {
   # Code blocks: replace each \x15...\x16 with the EARCON sentinel
   # so the segment loop below processes a code block as exactly one
   # earcon-bounded segment, identical to the old behavior.
+  #
+  # The condition `*\x15*\x16*` requires both bytes in order, so
+  # unpaired \x15 (e.g. truncated input from a kill mid-emit) doesn't
+  # enter the loop. Belt-and-braces: track string length each iteration
+  # and break if it didn't shrink — protects against bash globbing
+  # behaviors I haven't anticipated, where the loop could otherwise
+  # hang indefinitely while holding the job lock.
+  local prev_len=0
   while [[ "$s" == *$'\x15'*$'\x16'* ]]; do
+    prev_len=${#s}
     local pre="${s%%$'\x15'*}"
     local rest="${s#*$'\x15'}"
     local post="${rest#*$'\x16'}"
     s="${pre}"$'\x1e'"${post}"
+    if [ ${#s} -ge "$prev_len" ]; then
+      log "WARN: _strip_structural_markers non-shrinking iteration; aborting"
+      break
+    fi
   done
   # Tables: drop TABLE_START / TABLE_END, swap separators for prose.
   s="${s//$'\x11'/}"
