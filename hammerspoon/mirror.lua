@@ -161,20 +161,38 @@ local function defaultFrame(anchor)
   }
 end
 
--- JS call wrapper — returns nil silently on errors. Mirrors rsvp.lua's
--- jsCall pattern (we don't need the result, just fire-and-forget).
+-- JS call wrapper. We need to inject string arguments into a JS expression
+-- that hs.webview:evaluateJavaScript will parse. Lua's string.format("%q", s)
+-- emits Lua's quoted-string syntax (backslash-escapes, octal \ddd, etc.) —
+-- which is NOT valid JavaScript. A JSON blob containing a literal '"' or
+-- '\n' inside a word's text field would break the outer JS string literal,
+-- producing a silent JS syntax error and the mirror would just stop
+-- karaoke-tracking with no visible signal.
+--
+-- The fix mirrors rsvp.lua's escape pattern: backslash, double-quote, then
+-- newline / carriage return — sufficient for arbitrary UTF-8 text and for
+-- JSON blobs (which only contain printable ASCII + UTF-8).
 local function jsCall(funcName, ...)
   if not _webview then return end
   local args = {...}
   local jsArgs = {}
   for _, a in ipairs(args) do
     if type(a) == "string" then
-      table.insert(jsArgs, string.format("%q", a))
+      local escaped = a
+        :gsub("\\", "\\\\")
+        :gsub('"',  '\\"')
+        :gsub("\n", "\\n")
+        :gsub("\r", "\\r")
+      table.insert(jsArgs, '"' .. escaped .. '"')
+    elseif type(a) == "number" then
+      table.insert(jsArgs, tostring(a))
+    elseif a == nil then
+      table.insert(jsArgs, "null")
     else
       table.insert(jsArgs, tostring(a))
     end
   end
-  local js = string.format("%s(%s)", funcName, table.concat(jsArgs, ","))
+  local js = funcName .. "(" .. table.concat(jsArgs, ", ") .. ")"
   _webview:evaluateJavaScript(js)
 end
 
