@@ -198,13 +198,24 @@ const SENTINEL_SEG  = String.fromCharCode(0x1e);
 // with embedded \x1c / \x1d / \x1e control bytes — and we
 // specifically need those bytes to survive into renderText so it can
 // split paragraphs. Base64 round-trips them losslessly through
-// JSON's quoted-string syntax. atob produces a "binary string" whose
-// charCodes are raw bytes; escape + decodeURIComponent reconstructs
-// UTF-8. More reliable than TextDecoder on older WebKit builds.
+// JSON's quoted-string syntax.
+//
+// Decoding via TextDecoder rather than `decodeURIComponent(escape(atob(b64)))`:
+// the escape+decodeURIComponent dance throws URIError on lone surrogate
+// bytes that occur naturally inside multi-byte UTF-8 sequences (anything
+// outside basic ASCII — accented characters, emoji, CJK, ...). The
+// try/catch silently swallows the error and returns "", which means the
+// mirror webview drops the entire transcript on any non-ASCII input.
+// TextDecoder handles the bytes correctly. Available in every WebKit that
+// ships with macOS Big Sur and later (Hammerspoon's minimum target).
 function __claudio_b64decode(b64) {
   try {
     var binary = atob(b64);
-    return decodeURIComponent(escape(binary));
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new TextDecoder("utf-8").decode(bytes);
   } catch (e) {
     return "";
   }

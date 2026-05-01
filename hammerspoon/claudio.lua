@@ -497,6 +497,23 @@ local function processStderrLine(line)
         hs.printf("[claudio] rejecting MIRROR_TEXT path: %s", path)
         return
       end
+      -- Symlink-bypass guard: pathInsideDir checks the path lexically.
+      -- A child process could pre-create $STATE_DIR/last_text.dat as a
+      -- symlink pointing at an arbitrary file (e.g. /etc/passwd or a
+      -- secret in $HOME), and the lexical check would still pass. We
+      -- use hs.fs.symlinkAttributes (lstat) — does NOT follow links —
+      -- to verify the named file is a regular file before opening it.
+      -- Same-user-only attack surface (the child runs under the user's
+      -- UID) but still tightening: matches the symlink-aware guards
+      -- the rest of the codebase uses for shell-controlled paths.
+      local lstat_attrs = hs.fs.symlinkAttributes(path)
+      if not lstat_attrs or lstat_attrs.mode ~= "file" then
+        diagLog(string.format(
+          "MIRROR_TEXT rejected (not a regular file: mode=%s): %s",
+          tostring(lstat_attrs and lstat_attrs.mode or "missing"),
+          path))
+        return
+      end
       local f = io.open(path, "r")
       if f then
         local content = f:read("*a")

@@ -584,6 +584,13 @@ local function destroyWebview()
   _activeSidecar = nil
   _activeBufferId = nil
   _bufferSidecars = {}
+  -- Reset the watchdog phase flag so the next M.show starts in
+  -- INITIAL_HANG_SECS mode (long-text cold-cache synth budget) rather
+  -- than the post-first-POS HANG_SECS=8 mode. Without this, a stop
+  -- → cold-cache play sequence would inherit _firstPosSeen=true from
+  -- the previous session and falsely trip the hang watchdog within
+  -- 8 seconds of the new synth starting.
+  _firstPosSeen = false
 end
 
 -- Begin the fade-out animation then destroy.
