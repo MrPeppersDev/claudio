@@ -28,6 +28,18 @@ set -euo pipefail
 # CLAUDIO_STATE_DIR so the repo can be checked out elsewhere (e.g. a test
 # worktree) without state leaking into it.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Hammerspoon-launched processes inherit a minimal PATH (typically
+# /usr/bin:/bin:/usr/sbin:/sbin), which doesn't include Homebrew's bin dirs.
+# Without this, downstream subprocesses (sox in play-stream.py, etc.) silently
+# fall through to fail-open paths and the user gets degraded audio with no
+# obvious cause. See issue #172.
+case ":$PATH:" in
+  *":/opt/homebrew/bin:"*) ;;
+  *) PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" ;;
+esac
+export PATH
+
 STATE_DIR="${CLAUDIO_STATE_DIR:-$HOME/.claude/claudio}"
 LOCK_FILE="$STATE_DIR/job.pid"
 STATE_FILE="$STATE_DIR/state"

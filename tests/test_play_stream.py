@@ -390,6 +390,44 @@ def _has_audio_device() -> bool:
         return False
 
 
+class TestSoxResolver:
+    """Resolver picks sox out of three sources so subprocess.run gets an
+    absolute path. Regression guard for #172 — Hammerspoon's minimal PATH
+    used to make sox unreachable and audio silently played at synth-cap
+    speed only."""
+
+    def test_env_override_wins_when_executable(self, tmp_path):
+        fake = tmp_path / "sox"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        with patch.dict(os.environ, {"KOKORO_SOX_BIN": str(fake)}, clear=False):
+            assert _ps._resolve_sox_bin() == str(fake)
+
+    def test_env_override_falls_through_when_not_executable(self, tmp_path):
+        bogus = tmp_path / "does-not-exist"
+        with patch.dict(os.environ, {"KOKORO_SOX_BIN": str(bogus)}, clear=False):
+            # Should fall through to which()/known paths, not raise.
+            resolved = _ps._resolve_sox_bin()
+            assert resolved != str(bogus)
+
+    def test_falls_back_to_known_path_under_minimal_PATH(self, tmp_path):
+        # Simulate Hammerspoon's stripped PATH; the homebrew dir is excluded
+        # so shutil.which("sox") returns None and the fallback list kicks in.
+        new_env = {k: v for k, v in os.environ.items() if k != "KOKORO_SOX_BIN"}
+        new_env["PATH"] = "/usr/bin:/bin"
+        with patch.dict(os.environ, new_env, clear=True):
+            resolved = _ps._resolve_sox_bin()
+            # On a dev machine with brew sox installed, this should hit the
+            # /opt/homebrew/bin or /usr/local/bin fallback. On a stripped CI
+            # box with no sox at all, the resolver returns None and the test
+            # is a no-op assertion — both outcomes are acceptable.
+            if resolved is not None:
+                assert resolved in (
+                    "/opt/homebrew/bin/sox",
+                    "/usr/local/bin/sox",
+                )
+
+
 @pytest.mark.skipif(
     not _has_audio_device(),
     reason="No audio output device available (CI environment)"

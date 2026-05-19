@@ -64,6 +64,7 @@ import io
 import os
 import queue
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -96,6 +97,39 @@ EDGE_FADE_MS = 3      # linear fade-in/out applied to every PLAY/EARCON buffer
                       # 3 ms on each side is inaudible as a pause but
                       # eliminates the discontinuity.
 POS_CADENCE_S = 0.020  # ~20 ms between POS emissions while playing
+
+
+def _resolve_sox_bin() -> Optional[str]:
+    """Find the sox executable as an absolute path, so subprocess.run works
+    regardless of PATH inheritance.
+
+    Hammerspoon-launched processes inherit a minimal PATH (typically
+    /usr/bin:/bin:/usr/sbin:/sbin), which doesn't include Homebrew's bin
+    dirs. Without resolution, sox FileNotFoundError silently fails open in
+    _stretch — audio plays at synth-cap speed only (~1.3x) regardless of
+    KOKORO_SPEED. See issue #172.
+
+    Resolution order:
+      1. KOKORO_SOX_BIN — explicit override, no validation beyond existence.
+      2. shutil.which("sox") — picks up whatever PATH provides.
+      3. Known Homebrew install locations (Apple Silicon, then Intel).
+
+    Returns None only if all three fail; callers should fall through to the
+    existing fail-open path.
+    """
+    override = os.environ.get("KOKORO_SOX_BIN", "").strip()
+    if override and os.path.isfile(override) and os.access(override, os.X_OK):
+        return override
+    found = shutil.which("sox")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/sox", "/usr/local/bin/sox"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+_SOX_BIN: Optional[str] = _resolve_sox_bin()
 
 # Audio-leads-visual compensation (Kim et al. 2024, AJSLP).
 # When the player loop writes a chunk, POS is naturally emitted against the
@@ -237,20 +271,24 @@ def _stretch(samples: np.ndarray, rate: float) -> np.ndarray:
     """
     if abs(rate - 1.0) < 1e-6:
         return samples
+    if _SOX_BIN is None:
+        print("play-stream: sox not installed, skipping stretch "
+              "(checked $KOKORO_SOX_BIN, PATH, /opt/homebrew/bin, /usr/local/bin)",
+              file=sys.stderr)
+        return samples
     buf = io.BytesIO()
     sf.write(buf, samples, SAMPLE_RATE, format="WAV", subtype="PCM_16")
     try:
         proc = subprocess.run(
-            ["sox", "-t", "wav", "-", "-t", "wav", "-", "tempo", "-s", f"{rate:.6f}"],
+            [_SOX_BIN, "-t", "wav", "-", "-t", "wav", "-", "tempo", "-s", f"{rate:.6f}"],
             input=buf.getvalue(),
             capture_output=True,
             check=True,
         )
     except FileNotFoundError as exc:
-        # Sox not installed — play at 1.0x rather than corrupt pitch.
-        # Distinct from CalledProcessError so a post-mortem can tell
-        # "system never had sox" from "sox failed on this specific buffer".
-        print(f"play-stream: sox not installed, skipping stretch: {exc}",
+        # Sox was resolved at import but disappeared between then and now
+        # (uninstall mid-session). Play unstretched rather than corrupt pitch.
+        print(f"play-stream: sox vanished after resolution, skipping stretch: {exc}",
               file=sys.stderr)
         return samples
     except subprocess.CalledProcessError as exc:
