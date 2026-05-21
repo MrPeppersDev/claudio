@@ -11,6 +11,16 @@
 
 set -euo pipefail
 
+# Hammerspoon-launched processes inherit a minimal PATH (typically
+# /usr/bin:/bin:/usr/sbin:/sbin), which doesn't include Homebrew's bin dirs.
+# Mirror the play-last.sh fix here so direct kokoro-server.sh invocations
+# (cron, manual start, install scripts) also see Homebrew tooling. See #172.
+case ":$PATH:" in
+  *":/opt/homebrew/bin:"*) ;;
+  *) PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" ;;
+esac
+export PATH
+
 # Split state (pid, log) from repo (venv, server.py). The repo can live
 # anywhere — we derive KOKORO_DIR from this script's own location — while
 # state defaults to ~/.claude/claudio and can be moved via CLAUDIO_STATE_DIR.
@@ -118,6 +128,16 @@ cmd_start() {
       log "start: clearing stale pid file (pid=$old_pid not alive)"
       rm -f "$PID_FILE"
     fi
+  fi
+
+  # Sox canary: play-stream.py shells out to sox for pitch-preserving time
+  # stretch. Missing-sox silently degrades effective speed to KOKORO_SYNTH_CAP
+  # (typically 1.3x) — the user hears slow audio with no obvious failure.
+  # Warn loudly at start time, when the log is being watched, rather than
+  # spamming a "sox not installed" line per playback buffer (#172).
+  if ! command -v sox >/dev/null 2>&1; then
+    log "start: WARNING sox not on PATH ($PATH) — playback will degrade to synth-cap speed"
+    echo "[kokoro] WARNING: sox not found on PATH — install with 'brew install sox'" >&2
   fi
 
   log "start: launching server"
